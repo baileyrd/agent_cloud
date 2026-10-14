@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" width="1200" height="900" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .t { font-size: 13px; font-weight: 600; fill: #0f172a; }
+      .s { font-size: 11px; fill: #475569; }
+      .h { font-size: 12px; font-weight: 700; fill: #334155; letter-spacing: 0.06em; }
+      .lbl { font-size: 11px; fill: #1e293b; font-style: italic; }
+      .ln { stroke: #334155; stroke-width: 1.6; fill: none; marker-end: url(#arr); }
+      .ln2 { stroke: #334155; stroke-width: 1.6; fill: none; marker-end: url(#arr); marker-start: url(#arr); }
+      .dash { stroke-dasharray: 6 4; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="900" fill="#ffffff"/>
+  <text x="20" y="34" font-size="20" font-weight="700" fill="#0f172a">Home-server agent cloud: per-agent computer on Kata + KVM</text>
+  <text x="20" y="54" class="s">Fedora host · control plane · one Kata microVM per agent (shell container + desktop container) · watch and take over via one WSS</text>
+
+  <!-- CLIENT -->
+  <rect x="10" y="100" width="140" height="210" rx="10" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+  <text x="22" y="122" class="h">CLIENT</text>
+  <rect x="22" y="136" width="116" height="62" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="32" y="160" class="t">Browser viewer</text>
+  <text x="32" y="178" class="s">watch + take over</text>
+  <rect x="22" y="212" width="116" height="62" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="32" y="236" class="t">API client / CLI</text>
+  <text x="32" y="254" class="s">prompts, sessions</text>
+  <text x="22" y="296" class="s">any device on tailnet</text>
+
+  <!-- HOST -->
+  <rect x="225" y="64" width="775" height="712" rx="14" fill="#fafafa" stroke="#334155" stroke-width="2"/>
+  <text x="240" y="82" class="h">FEDORA HOME SERVER</text>
+
+  <!-- CONTROL PLANE -->
+  <rect x="240" y="92" width="230" height="528" rx="10" fill="#eff6ff" stroke="#4a6fa5" stroke-width="1.5"/>
+  <text x="252" y="110" class="h">CONTROL PLANE</text>
+
+  <rect x="250" y="125" width="210" height="60" rx="8" fill="#ffffff" stroke="#4a6fa5"/>
+  <text x="262" y="148" class="t">API gateway</text>
+  <text x="262" y="166" class="s">HTTPS proxy · bearer token · 1 WSS</text>
+
+  <rect x="250" y="205" width="210" height="60" rx="8" fill="#ffffff" stroke="#4a6fa5"/>
+  <text x="262" y="228" class="t">PostgreSQL</text>
+  <text x="262" y="246" class="s">session history · events · TLS</text>
+
+  <rect x="250" y="285" width="210" height="60" rx="8" fill="#ffffff" stroke="#4a6fa5"/>
+  <text x="262" y="308" class="t">Spawner</text>
+  <text x="262" y="326" class="s">create / pause / destroy agents</text>
+
+  <rect x="250" y="365" width="210" height="60" rx="8" fill="#ffffff" stroke="#4a6fa5"/>
+  <text x="262" y="388" class="t">Workspace volumes</text>
+  <text x="262" y="406" class="s">one per agent · quota-limited</text>
+
+  <rect x="250" y="445" width="210" height="60" rx="8" fill="#ffffff" stroke="#4a6fa5"/>
+  <text x="262" y="468" class="t">Secrets</text>
+  <text x="262" y="486" class="s">0600 env files · out of agent reach</text>
+
+  <rect x="250" y="525" width="210" height="60" rx="8" fill="#ffffff" stroke="#4a6fa5"/>
+  <text x="262" y="548" class="t">Egress allowlist proxy</text>
+  <text x="262" y="566" class="s">model APIs + Git only</text>
+
+  <!-- control plane internal arrows -->
+  <path class="ln2" d="M355,185 V205"/>
+  <path class="ln" d="M355,345 V365"/>
+  <text x="362" y="359" class="lbl">provision</text>
+
+  <!-- AGENT 1 MICROVM -->
+  <rect x="510" y="100" width="470" height="500" rx="12" fill="#f0fdfa" stroke="#0f766e" stroke-width="2"/>
+  <text x="525" y="121" class="h">AGENT 1 · KATA MICROVM (own guest kernel, KVM)</text>
+
+  <!-- shell container -->
+  <rect x="525" y="140" width="215" height="270" rx="10" fill="#ffffff" stroke="#0f766e"/>
+  <text x="537" y="158" class="h">SHELL CONTAINER</text>
+  <rect x="537" y="168" width="191" height="46" rx="7" fill="#f0fdfa" stroke="#5eead4"/>
+  <text x="547" y="187" class="t">Agent harness</text>
+  <text x="547" y="204" class="s">Codex / Claude Code / Pi</text>
+  <rect x="537" y="224" width="191" height="46" rx="7" fill="#f0fdfa" stroke="#5eead4"/>
+  <text x="547" y="243" class="t">Unprivileged user</text>
+  <text x="547" y="260" class="s">no sudo · disk quota</text>
+  <rect x="537" y="280" width="191" height="46" rx="7" fill="#f0fdfa" stroke="#5eead4"/>
+  <text x="547" y="299" class="t">Command guard</text>
+  <text x="547" y="316" class="s">blocks destructive commands</text>
+  <rect x="537" y="336" width="191" height="62" rx="7" fill="#f0fdfa" stroke="#5eead4"/>
+  <text x="547" y="355" class="t">Agent API (loopback)</text>
+  <text x="547" y="372" class="s">sessions · prompts · events</text>
+  <text x="547" y="388" class="s">model login stays here</text>
+
+  <!-- desktop container -->
+  <rect x="760" y="140" width="205" height="270" rx="10" fill="#ffffff" stroke="#7c3aed"/>
+  <text x="772" y="158" class="h">DESKTOP CONTAINER</text>
+  <rect x="772" y="168" width="181" height="46" rx="7" fill="#f5f3ff" stroke="#c4b5fd"/>
+  <text x="782" y="187" class="t">Xorg + dummy driver :0</text>
+  <text x="782" y="204" class="s">1364x1024 · xrandr resize</text>
+  <rect x="772" y="224" width="181" height="46" rx="7" fill="#f5f3ff" stroke="#c4b5fd"/>
+  <text x="782" y="243" class="t">Xfce (xfwm4)</text>
+  <text x="782" y="260" class="s">desktop session</text>
+  <rect x="772" y="280" width="181" height="46" rx="7" fill="#f5f3ff" stroke="#c4b5fd"/>
+  <text x="782" y="299" class="t">Chromium</text>
+  <text x="782" y="316" class="s">managed policy · DevTools off</text>
+  <rect x="772" y="336" width="181" height="62" rx="7" fill="#f5f3ff" stroke="#c4b5fd"/>
+  <text x="782" y="355" class="t">Capture + encode</text>
+  <text x="782" y="372" class="s">stream to gateway (WSS)</text>
+  <text x="782" y="388" class="s">input events back</text>
+
+  <!-- shell <-> desktop -->
+  <path class="ln2" d="M740,255 H760"/>
+
+  <!-- shared volume -->
+  <rect x="525" y="425" width="440" height="52" rx="8" fill="#ecfeff" stroke="#0891b2"/>
+  <text x="537" y="447" class="t">Shared workspace volume (/code)</text>
+  <text x="537" y="465" class="s">agent files · browser profile · survives restarts of the agent</text>
+
+  <!-- guest kernel -->
+  <rect x="525" y="495" width="440" height="90" rx="8" fill="#ccfbf1" stroke="#0f766e"/>
+  <text x="537" y="517" class="t">Guest runtime</text>
+  <text x="537" y="537" class="s">own Linux kernel · cgroup v2 · ext4 rootfs (DAX / pmem)</text>
+  <text x="537" y="555" class="s">kata-agent as guest init helper · vsock / virtio devices</text>
+  <text x="537" y="573" class="s">no shared host kernel</text>
+
+  <!-- AGENT N stub -->
+  <rect x="510" y="615" width="470" height="62" rx="12" fill="#f8fafc" stroke="#0f766e" stroke-width="1.5" class="dash"/>
+  <text x="525" y="640" class="t">Agent 2 ... N</text>
+  <text x="525" y="658" class="s">same layout · each in its own Kata microVM and workspace volume</text>
+
+  <!-- HOST BASE -->
+  <rect x="240" y="700" width="745" height="56" rx="8" fill="#1e293b" stroke="#0f172a"/>
+  <text x="256" y="723" font-size="13" font-weight="700" fill="#f8fafc">Fedora Server host</text>
+  <text x="256" y="742" font-size="11" fill="#cbd5e1">KVM (/dev/kvm) · containerd + Kata runtime class · SELinux enforcing · cgroup v2 · Tailscale</text>
+
+  <!-- cross-boundary arrows -->
+  <path class="ln2" d="M150,155 H250"/>
+  <text x="156" y="146" class="lbl">WSS + token</text>
+  <text x="156" y="172" class="lbl">via Tailscale</text>
+
+  <path class="ln2" d="M460,155 H510"/>
+  <text x="466" y="147" class="lbl">prompts</text>
+  <text x="466" y="172" class="lbl">+ stream</text>
+
+  <path class="ln" d="M460,315 H510"/>
+  <text x="464" y="307" class="lbl">create</text>
+
+  <path class="ln2" d="M460,395 H510"/>
+  <text x="464" y="387" class="lbl">mount</text>
+
+  <path class="ln" d="M510,555 H460"/>
+  <text x="464" y="547" class="lbl">egress</text>
+
+  <!-- EXTERNAL -->
+  <rect x="240" y="792" width="560" height="92" rx="12" fill="#fffbeb" stroke="#b45309" stroke-width="1.5" class="dash"/>
+  <text x="252" y="810" class="h">INTERNET (allowlisted egress only)</text>
+  <rect x="252" y="820" width="300" height="52" rx="8" fill="#ffffff" stroke="#d97706"/>
+  <text x="264" y="842" class="t">Model APIs</text>
+  <text x="264" y="860" class="s">OpenAI / Anthropic · agent-user logins</text>
+  <rect x="566" y="820" width="222" height="52" rx="8" fill="#ffffff" stroke="#d97706"/>
+  <text x="578" y="842" class="t">Git remotes</text>
+  <text x="578" y="860" class="s">GitHub · pull and push</text>
+  <path class="ln" d="M250,555 H200 V838 H240"/>
+  <text x="140" y="700" class="lbl" transform="rotate(-90 140 700)" text-anchor="middle">allowlisted egress</text>
+
+  <!-- RIGHT SIDE: OPTION + LEGEND -->
+  <rect x="1020" y="100" width="170" height="190" rx="10" fill="#ffffff" stroke="#94a3b8" class="dash"/>
+  <text x="1032" y="120" class="h">OPTION</text>
+  <text x="1032" y="142" class="s">Cloudroom core as the</text>
+  <text x="1032" y="157" class="s">runtime + history layer,</text>
+  <text x="1032" y="172" class="s">in a full VM per agent</text>
+  <text x="1032" y="187" class="s">instead of a container.</text>
+  <text x="1032" y="209" class="s">Needs systemd, ext4</text>
+  <text x="1032" y="224" class="s">quotas, Ubuntu 24.04.</text>
+  <text x="1032" y="246" class="s">Not run on Kata as is.</text>
+
+  <rect x="1020" y="310" width="170" height="190" rx="10" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="1032" y="330" class="h">LEGEND</text>
+  <path class="ln" d="M1032,352 H1082"/>
+  <text x="1092" y="356" class="s">one-way flow</text>
+  <path class="ln2" d="M1032,376 H1082"/>
+  <text x="1092" y="380" class="s">two-way flow</text>
+  <rect x="1032" y="394" width="50" height="16" rx="4" fill="#eff6ff" stroke="#4a6fa5"/>
+  <text x="1092" y="407" class="s">control plane</text>
+  <rect x="1032" y="418" width="50" height="16" rx="4" fill="#f0fdfa" stroke="#0f766e"/>
+  <text x="1092" y="431" class="s">agent microVM</text>
+  <rect x="1032" y="442" width="50" height="16" rx="4" fill="#f5f3ff" stroke="#7c3aed"/>
+  <text x="1092" y="455" class="s">desktop stack</text>
+  <rect x="1032" y="466" width="50" height="16" rx="4" fill="#fffbeb" stroke="#b45309" class="dash"/>
+  <text x="1092" y="479" class="s">external</text>
+</svg>

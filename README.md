@@ -1,0 +1,66 @@
+# agent-cloud
+
+Self-hosted "cloud computers" for AI agents on a single Fedora home server.
+Each agent gets its own isolated machine (a Kata Containers microVM on KVM) with a
+shell, a desktop and a browser. You can watch it work and take over, from any
+device on your tailnet. Nothing runs in a third-party cloud except the model
+calls the agents themselves make.
+
+> Status: **design stage.** Nothing here has been built or tested yet. Claims that
+> are unverified are marked **[unverified]**. See [docs/research-notes.md](docs/research-notes.md)
+> for what the design is based on and what is still unknown.
+
+## What you get
+
+- One isolated microVM per agent, with its own guest kernel (hardware isolation, not just namespaces).
+- A shell environment for the agent harness (Codex, Claude Code, Pi or similar).
+- A virtual desktop (Xorg dummy display, Xfce, policy-locked Chromium) the agent can drive.
+- A single authenticated WebSocket for watching and taking over the desktop.
+- Persistent workspace volumes and Postgres-backed session history.
+- Allowlisted egress: agents reach model APIs and Git hosts only.
+
+## What this is not
+
+- Not multi-tenant hosting. It assumes one trusted owner.
+- Not offline. Agents call hosted model APIs unless you configure a local model.
+- Not a fork of Cloudroom core. Cloudroom informed the design but needs a full Ubuntu VM
+  per agent (systemd, ext4 quotas). See [ADR-003](docs/decisions.md).
+
+## Architecture at a glance
+
+![architecture](docs/architecture.svg)
+
+| Layer | Component |
+|---|---|
+| Host | Fedora Server, KVM, containerd + Kata runtime, SELinux enforcing, cgroup v2, Tailscale |
+| Control plane | API gateway, spawner, PostgreSQL, workspace volumes, secrets, egress allowlist proxy |
+| Per-agent microVM | Shell container (agent harness) + desktop container (Xorg dummy, Xfce, Chromium, streamer) |
+| External | Model APIs, Git remotes (allowlisted) |
+
+Details: [docs/architecture.md](docs/architecture.md).
+
+## Quick start
+
+1. Confirm KVM works on the host: [docs/install.md, Phase 0](docs/install.md).
+2. Install containerd and Kata, then run the isolation smoke test (Phases 1-3).
+3. Build the agent image (Phase 4), start one agent by hand, open its desktop.
+4. Only then build the control plane (Phase 6).
+
+## Documentation
+
+| Doc | Purpose |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Components, data flows, trust boundaries |
+| [docs/install.md](docs/install.md) | Phased install runbook with checkpoints |
+| [docs/security.md](docs/security.md) | Threat model and hardening checklist |
+| [docs/sizing.md](docs/sizing.md) | Hardware and per-agent capacity estimates |
+| [docs/decisions.md](docs/decisions.md) | Architecture decision records |
+| [docs/research-notes.md](docs/research-notes.md) | Evidence behind the design and open unknowns |
+| [docs/roadmap.md](docs/roadmap.md) | Milestones and open questions |
+
+## Engineering conventions
+
+Modular, typed and tested: explicit over implicit, type hints on all Python, flat
+control flow, small single-purpose functions, domain logic free of I/O, minimal
+dependencies, no secrets in repo or logs, external input validated at the boundary.
+Tests cover happy path and failure cases for all non-trivial logic.

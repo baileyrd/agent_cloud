@@ -35,12 +35,13 @@ and history layer instead. Keep one Cloudroom-in-a-full-VM instance as an option
 **Revisit when:** you need to restart or upgrade the desktop independently of the shell.
 
 ## ADR-005: Control-plane deployment shape
-**Status:** open.
-**Options:** one modular process (gateway, spawner, session store as modules with explicit
-interfaces) versus separate services from the start.
-**Leaning:** modular single process, extracting a service only for a concrete forcing
-function (independent scaling, language boundary, fault isolation). Revisit if the
-owner's microservices preference should override this default.
+**Status:** accepted.
+**Decision:** One modular Rust process, built as a Cargo workspace: `ac-domain` (pure logic),
+`ac-ports` (traits), then adapter crates (spawner, store, gateway). Extract a separate service
+only for a concrete forcing function (independent scaling, language boundary, fault isolation).
+**Why Rust:** single static binary on the host, lifecycle and allowlist rules as types, and
+reuse of ports-and-adapters patterns from the owner's existing Rust tooling.
+**Consequences:** Sync ports first; async (tokio) enters only with the gateway's WebSocket proxy.
 
 ## ADR-006: Desktop streaming layer
 **Status:** open.

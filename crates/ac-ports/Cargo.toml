@@ -1,0 +1,12 @@
+[package]
+name = "ac-ports"
+description = "Port traits between agent-cloud domain logic and its adapters."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ac-domain = { path = "../ac-domain" }
+
+[lints]
+workspace = true

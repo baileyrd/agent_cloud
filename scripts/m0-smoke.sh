@@ -5,7 +5,7 @@ set -u
 fail=0
 ok()   { printf 'ok    %s\n' "$1"; }
 bad()  { printf 'FAIL  %s\n' "$1"; fail=1; }
-check() { if "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+check() { desc=$1; shift; if "$@" >/dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi; }
 
 check "CPU virtualization flags (vmx/svm)" grep -qE 'vmx|svm' /proc/cpuinfo
 check "/dev/kvm present"                    test -c /dev/kvm

@@ -45,7 +45,11 @@ Details: [docs/architecture.md](docs/architecture.md).
 1. Confirm KVM works on the host: [docs/install.md, Phase 0](docs/install.md).
 2. Install containerd and Kata, then run the isolation smoke test (Phases 1-3).
 3. Build the agent image (Phase 4), start one agent by hand, open its desktop.
-4. Only then build the control plane (Phase 6).
+4. Drive it with the CLI (needs root for containerd):
+   `cargo build --release -p ac-ctl`, then
+   `sudo target/release/ac-ctl --image agent:latest create a1` (also `pause`, `resume`, `destroy`, `status`).
+   Defaults: data in `/var/lib/agent-cloud`, containerd namespace `agents`. **[unverified]** on a real host.
+5. Only then build the gateway (Phase 6).
 
 ## Documentation
 

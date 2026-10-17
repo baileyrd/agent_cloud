@@ -57,6 +57,11 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         Self { runtime, store }
     }
 
+    /// Current state of an agent, `None` if unknown.
+    pub fn state(&self, id: &AgentId) -> Result<Option<State>, FleetError> {
+        Ok(self.store.state(id)?)
+    }
+
     /// Provision a new agent. A runtime failure leaves it `Creating`
     /// (visible and destroyable) rather than silently forgotten.
     pub fn create(&self, id: &AgentId) -> Result<State, FleetError> {
@@ -173,6 +178,15 @@ mod tests {
         assert!(matches!(fleet.resume(&id()), Ok(State::Running)));
         assert!(matches!(fleet.destroy(&id()), Ok(State::Destroyed)));
         assert_eq!(*rt.calls.borrow(), ["create", "pause", "resume", "destroy"]);
+    }
+
+    #[test]
+    fn state_reports_unknown_then_current() {
+        let rt = FakeRuntime::default();
+        let fleet = Fleet::new(&rt, FakeStore::default());
+        assert!(matches!(fleet.state(&id()), Ok(None)));
+        let _ = fleet.create(&id());
+        assert!(matches!(fleet.state(&id()), Ok(Some(State::Running))));
     }
 
     #[test]

@@ -18,7 +18,7 @@ Builds (Rust in particular) are the spike.
 
 ## Capacity
 
-Reserve about 2 cores and 8 GiB for the host, Postgres and the control plane. RAM caps you
+Reserve about 2 cores and 8 GiB for the host and the control plane. RAM caps you
 first; CPU can be overcommitted 2-4x because most agents wait on model calls.
 
 | Server | Specs | Active at once | Provisioned, mostly idle |
@@ -30,7 +30,7 @@ first; CPU can be overcommitted 2-4x because most agents wait on model calls.
 ## Requirements that matter more than size
 
 - KVM on bare metal (nested works but costs performance and adds complexity).
-- NVMe storage; builds saturate SATA first. Keep Postgres on fast storage.
+- NVMe storage; builds saturate SATA first. Keep the data directory on fast storage.
 - No GPU unless you add local models.
 - ECC RAM is nice for an always-on box, not required.
 

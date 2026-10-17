@@ -7,7 +7,7 @@ What the design is based on, and what is still unknown. Observations were made o
 
 - Open-source Rust service, Apache-2.0, **pre-release**; "one Rust service per machine".
 - HTTP API with sessions, prompts, SSE event streams; bearer token; listens on loopback.
-- Agents run as a separate unprivileged Linux user; Postgres stores history.
+- Agents run as a separate unprivileged Linux user; history is stored by the control plane (originally Postgres; see ADR-009).
 - Setup guide targets Ubuntu 24.04 with systemd, cgroup v2, ext4 and filesystem quotas;
   default limit of 2 open harness sessions; a restart interrupts running work.
 - Setup guide documents Codex and Pi; README also lists Claude Code and Cursor. Not

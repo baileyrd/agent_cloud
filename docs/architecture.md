@@ -25,7 +25,7 @@ Built as one deployable with clear module boundaries (see [ADR-005](decisions.md
 |---|---|
 | Gateway | HTTPS entry point, bearer-token auth, proxies one WSS per viewer and the agent API |
 | Spawner | Creates, pauses and destroys agents; provisions workspace volumes |
-| Session store | PostgreSQL schema for sessions and events, TLS to the database |
+| Session store | Embedded registry on `rusty_multimodal_db_engine` (agents, lifecycle state) plus an append-only segment log per agent for events ([ADR-009](decisions.md)) |
 | Workspace volumes | One quota-limited volume per agent |
 | Secrets | Root-owned 0600 env files; never readable by the agent user |
 | Egress proxy | Allowlist for model APIs and Git hosts; everything else dropped |
@@ -50,7 +50,7 @@ Built as one deployable with clear module boundaries (see [ADR-005](decisions.md
 | 1 | Prompt | Client, gateway (token), agent API in the shell container |
 | 2 | Watch / take over | Client, gateway (single WSS), capture/encode in the desktop container; input events return the same way |
 | 3 | Model calls | Harness, egress proxy, model API |
-| 4 | History | Agent API events, gateway, PostgreSQL |
+| 4 | History | Agent API events, gateway, per-agent segment log |
 | 5 | Lifecycle | Gateway, spawner, containerd (Kata runtime class), workspace volume mount |
 
 ## Trust boundaries

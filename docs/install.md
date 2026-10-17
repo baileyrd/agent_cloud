@@ -123,8 +123,6 @@ supervisor (supervisord or s6). Move to two containers in one pod only if you ne
 ## Phase 6: Control plane
 
 ```bash
-sudo dnf install -y postgresql-server postgresql-contrib
-sudo postgresql-setup --initdb && sudo systemctl enable --now postgresql
 curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
 ```
 

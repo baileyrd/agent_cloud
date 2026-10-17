@@ -6,7 +6,8 @@ shell, a desktop and a browser. You can watch it work and take over, from any
 device on your tailnet. Nothing runs in a third-party cloud except the model
 calls the agents themselves make.
 
-> Status: **design stage.** Nothing here has been built or tested yet. Claims that
+> Status: **early build.** The Rust domain, fleet, `ctr`/Kata adapter, registry and
+> event-log crates have unit tests; nothing has run on real KVM yet. Claims that
 > are unverified are marked **[unverified]**. See [docs/research-notes.md](docs/research-notes.md)
 > for what the design is based on and what is still unknown.
 
@@ -16,7 +17,7 @@ calls the agents themselves make.
 - A shell environment for the agent harness (Codex, Claude Code, Pi or similar).
 - A virtual desktop (Xorg dummy display, Xfce, policy-locked Chromium) the agent can drive.
 - A single authenticated WebSocket for watching and taking over the desktop.
-- Persistent workspace volumes and Postgres-backed session history.
+- Persistent workspace volumes, an embedded agent registry and append-only per-agent event history (no database server).
 - Allowlisted egress: agents reach model APIs and Git hosts only.
 
 ## What this is not
@@ -33,7 +34,7 @@ calls the agents themselves make.
 | Layer | Component |
 |---|---|
 | Host | Fedora Server, KVM, containerd + Kata runtime, SELinux enforcing, cgroup v2, Tailscale |
-| Control plane | API gateway, spawner, PostgreSQL, workspace volumes, secrets, egress allowlist proxy |
+| Control plane | One Rust binary: gateway, fleet/spawner, embedded registry + event log, workspace volumes, secrets, egress allowlist proxy |
 | Per-agent microVM | Shell container (agent harness) + desktop container (Xorg dummy, Xfce, Chromium, streamer) |
 | External | Model APIs, Git remotes (allowlisted) |
 

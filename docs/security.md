@@ -28,8 +28,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] Secrets in 0600 root-owned files; never in images, repo, prompts or logs
 - [ ] Agent user has no sudo and no access to the containerd socket
 - [ ] No git remotes with embedded tokens in workspaces
-- [ ] Postgres: TLS, dedicated database, credentials server-side only
-- [ ] Backups for Postgres and workspace volumes, with a tested restore
+- [ ] Data directory (registry + event logs) owned by the control-plane user, mode 0700; one process per directory is enforced by a lock
+- [ ] Backups for the data directory and workspace volumes, with a tested restore
 - [ ] Production desktop image: Chromium managed policy applied; DevTools policy decided
 
 ## Credentials for model access

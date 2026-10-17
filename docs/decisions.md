@@ -20,7 +20,7 @@ installer cannot be used directly.
 ## ADR-003: Do not run Cloudroom core as-is
 **Status:** proposed.
 **Context:** cloudroom-core is a pre-release Rust service (Apache-2.0) for running coding
-harnesses with Postgres-backed history. Its installer assumes Ubuntu 24.04, systemd, ext4
+harnesses with Postgres-backed history (we use an embedded store instead; ADR-009). Its installer assumes Ubuntu 24.04, systemd, ext4
 filesystem quotas and `/etc/fstab`, and its docs put containers out of scope. Its README
 claims Codex, Claude Code, Pi and Cursor; the setup guide documents Codex and Pi.
 **Decision:** Borrow its API shape, session model and security ideas; build a thin runtime
@@ -57,3 +57,22 @@ authenticated WSS. Note it brings its own X server; the dummy-driver Xorg design
 **Status:** proposed.
 **Decision:** Agents have no direct internet route; all traffic goes through an allowlist
 proxy plus nftables rules on the host.
+
+## ADR-008: Reuse rusty_mill crates via a pinned git dependency
+**Status:** accepted.
+**Decision:** Depend on `Rusty-Mill/rusty_mill` crates by `git` + `rev` in `[workspace.dependencies]`
+(all are `publish = false`). Used today: `platform`, `platform-mock` (process spawning and its test
+double), `rusty_multimodal_db_engine`. Planned: `rusty_serve`, `rusty_agui`, `rusty_sandbox`.
+**Consequences:** No vendoring; bumping the rev is a deliberate commit. Cargo fetches the monorepo.
+
+## ADR-009: Embedded storage instead of Postgres
+**Status:** accepted (supersedes the Postgres lines in the original design).
+**Context:** One trusted owner, one host. The engine keeps whole records in RAM, so it suits a small
+registry but not unbounded event history ([ADR-0138 proposal](https://github.com/Rusty-Mill/rusty_mill/pull/773)).
+**Decision:** The registry (agents, lifecycle state) lives in `rusty_multimodal_db_engine` behind
+`SessionStore` (`ac-store`). Events go to an append-only, size-rotated segment log per agent
+(`ac-history`) with retention by pruning old segments.
+**Consequences:** No database service to install, secure or back up; no ad hoc SQL (an `ac-ctl`
+inspect command is needed); record layout changes need a schema-tag bump and migration.
+**Revisit when:** a second consumer needs the same segment log (hoist it as its own crate) or the
+registry outgrows RAM.

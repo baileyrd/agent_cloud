@@ -17,7 +17,8 @@
 ## M3: Control plane
 - [ ] Spawner: create, pause, destroy, workspace volume lifecycle
 - [ ] Gateway with token auth over Tailscale HTTPS
-- [ ] Session store schema in PostgreSQL
+- [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
+- [x] Fleet lifecycle and `ctr`/Kata adapter against fakes (`ac-fleet`, `ac-ctr`); real-host run pending M0
 
 ## M4: Safe to leave running
 - [ ] Egress allowlist proxy and nftables rules

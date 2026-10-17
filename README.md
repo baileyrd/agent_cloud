@@ -49,7 +49,11 @@ Details: [docs/architecture.md](docs/architecture.md).
    `cargo build --release -p ac-ctl`, then
    `sudo target/release/ac-ctl --image agent:latest create a1` (also `pause`, `resume`, `destroy`, `status`).
    Defaults: data in `/var/lib/agent-cloud`, containerd namespace `agents`. **[unverified]** on a real host.
-5. Only then build the gateway (Phase 6).
+5. Run `sudo scripts/m0-smoke.sh` first on a new host: it checks KVM, containerd, Kata and the
+   kernel-differs isolation test (runbook Phases 0-3).
+6. Gateway: `ac-gateway` serves `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
+   with a bearer token. Env: `AC_TOKEN_FILE` (mode 0600), `AC_IMAGE`, `AC_BIND` (private addresses
+   only; default `127.0.0.1:8780`), `AC_DATA`. Not yet: the agent API (AG-UI) and desktop viewer.
 
 ## Documentation
 

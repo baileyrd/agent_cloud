@@ -16,7 +16,8 @@
 
 ## M3: Control plane
 - [ ] Spawner: create, pause, destroy, workspace volume lifecycle
-- [ ] Gateway with token auth over Tailscale HTTPS
+- [x] Gateway lifecycle API with bearer auth, private-bind check (`ac-gateway`); TLS via Tailscale still pending
+- [ ] Agent API (AG-UI via `rusty_agui`) and WebSocket viewer proxy
 - [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
 - [x] Fleet lifecycle and `ctr`/Kata adapter against fakes (`ac-fleet`, `ac-ctr`); real-host run pending M0
 

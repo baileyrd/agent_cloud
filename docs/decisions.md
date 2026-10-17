@@ -68,7 +68,7 @@ double), `rusty_multimodal_db_engine`. Planned: `rusty_serve`, `rusty_agui`, `ru
 ## ADR-009: Embedded storage instead of Postgres
 **Status:** accepted (supersedes the Postgres lines in the original design).
 **Context:** One trusted owner, one host. The engine keeps whole records in RAM, so it suits a small
-registry but not unbounded event history ([ADR-0138 proposal](https://github.com/Rusty-Mill/rusty_mill/pull/773)).
+registry but not unbounded event history ([issue 774](https://github.com/Rusty-Mill/rusty_mill/issues/774)).
 **Decision:** The registry (agents, lifecycle state) lives in `rusty_multimodal_db_engine` behind
 `SessionStore` (`ac-store`). Events go to an append-only, size-rotated segment log per agent
 (`ac-history`) with retention by pruning old segments.

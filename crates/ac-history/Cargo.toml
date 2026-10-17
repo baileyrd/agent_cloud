@@ -1,0 +1,9 @@
+[package]
+name = "ac-history"
+description = "Append-only, size-rotated segment log for unbounded per-agent event history. std only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

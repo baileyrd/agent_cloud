@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ac-domain", "crates/ac-ports"]
+members = ["crates/ac-domain", "crates/ac-ports", "crates/ac-fleet", "crates/ac-ctr", "crates/ac-history"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,3 +14,9 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+# First-party reuse from rusty_mill, pinned (ADR-008). Bump the rev deliberately.
+[workspace.dependencies]
+platform = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+platform-linux = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+platform-mock = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }

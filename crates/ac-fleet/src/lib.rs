@@ -62,10 +62,11 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         Ok(self.store.state(id)?)
     }
 
-    /// Provision a new agent. A runtime failure leaves it `Creating`
+    /// Provision a new agent, or re-create a destroyed one. A runtime failure leaves it `Creating`
     /// (visible and destroyable) rather than silently forgotten.
     pub fn create(&self, id: &AgentId) -> Result<State, FleetError> {
-        if self.store.state(id)?.is_some() {
+        // A destroyed agent's id may be reused; any live state means it already exists.
+        if matches!(self.store.state(id)?, Some(state) if state != State::Destroyed) {
             return Err(FleetError::AlreadyExists(id.clone()));
         }
         self.store.set_state(id, State::Creating)?;
@@ -199,6 +200,16 @@ mod tests {
             Err(FleetError::AlreadyExists(_))
         ));
         assert_eq!(rt.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn destroyed_id_can_be_recreated() {
+        let rt = FakeRuntime::default();
+        let fleet = Fleet::new(&rt, FakeStore::default());
+        let _ = fleet.create(&id());
+        let _ = fleet.destroy(&id());
+        assert!(matches!(fleet.create(&id()), Ok(State::Running)));
+        assert_eq!(*rt.calls.borrow(), ["create", "destroy", "create"]);
     }
 
     #[test]

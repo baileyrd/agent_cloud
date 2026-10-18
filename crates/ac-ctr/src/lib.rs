@@ -8,10 +8,11 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ac_domain::AgentId;
 use ac_ports::{PortError, Runtime};
-use platform::process::{Command, EnvSpec, Spawner, Stdio};
+use platform::process::{Command, EnvSpec, ExitStatus, Spawner, Stdio};
 
 const KATA: &str = "io.containerd.kata.v2";
 const WORKSPACE_MOUNT: &str = "/workspace";
@@ -94,6 +95,11 @@ pub struct CtrConfig {
     pub workspace_owner: Option<(u32, u32)>,
     /// Network for agents. `None`: no network.
     pub network: Option<Network>,
+    /// Kill any external command (`ctr`, `ip`, the CNI plugin) that runs longer than this, via
+    /// coreutils `timeout`. `None`: wait forever.
+    pub command_timeout: Option<Duration>,
+    /// Print each external command to stderr before running it.
+    pub trace: bool,
 }
 
 /// Runs each agent as a detached Kata container with a bind-mounted workspace.
@@ -112,43 +118,45 @@ impl<S: Spawner> CtrRuntime<S> {
         self.cfg.workspace_root.join(id.as_str())
     }
 
-    /// Run a program to completion; a non-zero exit carries stderr in the error.
+    /// Run a program to completion; a non-zero exit carries stderr in the error. Stdin is the
+    /// null device: anything a program must read comes from a file argument or its environment.
     fn run(
         &self,
         op: &'static str,
         program: &OsStr,
         args: &[OsString],
         env: Option<BTreeMap<OsString, OsString>>,
-        stdin: Option<&[u8]>,
     ) -> Result<(), PortError> {
         let fail = |cause: String| PortError { op, cause };
-        let mut cmd = Command::new(program, "/").args(args);
+        let mut argv: Vec<OsString> = Vec::new();
+        let mut exe = program.to_owned();
+        if let Some(limit) = self.cfg.command_timeout {
+            argv.extend([
+                OsString::from("--kill-after=5"),
+                OsString::from(limit.as_secs().to_string()),
+                program.to_owned(),
+            ]);
+            exe = OsString::from("timeout");
+        }
+        argv.extend_from_slice(args);
+        if self.cfg.trace {
+            let line: Vec<String> = std::iter::once(&exe)
+                .chain(argv.iter())
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            eprintln!("ac-ctr: {op}: {}", line.join(" "));
+        }
+        let mut cmd = Command::new(&exe, "/").args(&argv);
         if let Some(env) = env {
             cmd = cmd.env(EnvSpec::Explicit(env));
         }
+        cmd.stdin = Stdio::Null;
         cmd.stdout = Stdio::Null;
         cmd.stderr = Stdio::Pipe;
-        if stdin.is_some() {
-            cmd.stdin = Stdio::Pipe;
-        }
         let mut child = self
             .spawner
             .spawn(&cmd)
-            .map_err(|e| fail(format!("spawn {}: {e:?}", program.to_string_lossy())))?;
-        if let Some(mut bytes) = stdin {
-            let mut pipe = child
-                .take_stdin()
-                .ok_or_else(|| fail("no stdin pipe".into()))?;
-            while !bytes.is_empty() {
-                let n = pipe
-                    .write(bytes)
-                    .map_err(|e| fail(format!("write: {e:?}")))?;
-                if n == 0 {
-                    return Err(fail("stdin closed early".into()));
-                }
-                bytes = &bytes[n..];
-            }
-        }
+            .map_err(|e| fail(format!("spawn {}: {e:?}", exe.to_string_lossy())))?;
         let stderr = match child.take_stderr() {
             Some(mut pipe) => read_all(pipe.as_mut()).map_err(|e| fail(format!("read: {e:?}")))?,
             None => Vec::new(),
@@ -157,8 +165,13 @@ impl<S: Spawner> CtrRuntime<S> {
         if status.success() {
             return Ok(());
         }
+        let hint = if matches!(status, ExitStatus::Code(124 | 137)) {
+            " (timed out)"
+        } else {
+            ""
+        };
         Err(fail(format!(
-            "{status:?}: {}",
+            "{status:?}{hint}: {}",
             String::from_utf8_lossy(&stderr).trim()
         )))
     }
@@ -167,7 +180,7 @@ impl<S: Spawner> CtrRuntime<S> {
     fn ctr(&self, op: &'static str, args: &[OsString]) -> Result<(), PortError> {
         let mut full = os(&["-n", &self.cfg.namespace]);
         full.extend_from_slice(args);
-        self.run(op, OsStr::new(&self.cfg.ctr_bin), &full, None, None)
+        self.run(op, OsStr::new(&self.cfg.ctr_bin), &full, None)
     }
 
     /// Like [`Self::ctr`], but a "not found" failure is success.
@@ -186,10 +199,12 @@ impl<S: Spawner> CtrRuntime<S> {
         verb: &str,
         id: &AgentId,
     ) -> Result<(), PortError> {
-        let config = std::fs::read(&net.config).map_err(|e| PortError {
-            op,
-            cause: format!("read {}: {e}", net.config.display()),
-        })?;
+        if !net.config.is_file() {
+            return Err(PortError {
+                op,
+                cause: format!("missing CNI config {}", net.config.display()),
+            });
+        }
         let plugin_dir = net.plugin.parent().unwrap_or(Path::new("/"));
         let env = BTreeMap::from(
             [
@@ -202,7 +217,15 @@ impl<S: Spawner> CtrRuntime<S> {
             ]
             .map(|(k, v)| (OsString::from(k), OsString::from(v))),
         );
-        self.run(op, net.plugin.as_os_str(), &[], Some(env), Some(&config))
+        // The plugin reads its config from stdin until EOF. A file redirect guarantees the EOF;
+        // a pipe held open by the child would deadlock.
+        let args = [
+            OsString::from("-c"),
+            OsString::from(r#"exec "$0" <"$1""#),
+            net.plugin.clone().into_os_string(),
+            net.config.clone().into_os_string(),
+        ];
+        self.run(op, OsStr::new("sh"), &args, Some(env))
     }
 
     fn netns_cmd(
@@ -218,7 +241,6 @@ impl<S: Spawner> CtrRuntime<S> {
             op,
             OsStr::new("ip"),
             &[OsString::from("netns"), OsString::from(verb), name],
-            None,
             None,
         )
     }
@@ -380,7 +402,8 @@ mod tests {
         let spawner = MockSpawner::new()
             .script("ctr", ctr)
             .script("ip", ExitStatus::Code(0))
-            .script(PLUGIN, plugin);
+            .script("sh", plugin)
+            .script("timeout", ExitStatus::Code(0));
         let log = Arc::clone(&spawner.spawned);
         let cfg = CtrConfig {
             ctr_bin: "ctr".into(),
@@ -389,6 +412,8 @@ mod tests {
             workspace_root: root.clone(),
             workspace_owner: None,
             network: None,
+            command_timeout: None,
+            trace: false,
         };
         (CtrRuntime::new(spawner, cfg), log, root)
     }
@@ -472,7 +497,10 @@ mod tests {
     fn network_create_makes_namespace_attaches_cni_then_starts_in_it() {
         let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
         assert!(rt.create(&id()).is_ok());
-        assert_eq!(programs(&log), ["ip", PLUGIN, "ctr"]);
+        assert_eq!(programs(&log), ["ip", "sh", "ctr"]);
+        let cni_args = &argv(&log)[1];
+        assert_eq!(cni_args[2], PLUGIN);
+        assert!(cni_args[3].ends_with("cni-agents.json"));
         assert_eq!(argv(&log)[0], ["netns", "add", "ac-a1"]);
         assert_eq!(env_of(&log, 1, "CNI_COMMAND").as_deref(), Some("ADD"));
         assert_eq!(env_of(&log, 1, "CNI_CONTAINERID").as_deref(), Some("a1"));
@@ -503,7 +531,7 @@ mod tests {
         assert_eq!(err.map(|e| e.op), Some("create"));
         // namespace added, plugin failed; the namespace file was never created by the mock,
         // so cleanup has nothing to detach and the container is not started.
-        assert_eq!(programs(&log), ["ip", PLUGIN]);
+        assert_eq!(programs(&log), ["ip", "sh"]);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -512,7 +540,7 @@ mod tests {
         let (rt, log, root) = rt_net(ExitStatus::Code(1), ExitStatus::Code(0));
         let _ = std::fs::write(root.join("netns/ac-a1"), "");
         assert!(rt.create(&id()).is_err());
-        assert_eq!(programs(&log), ["ip", PLUGIN, "ctr", PLUGIN, "ip"]);
+        assert_eq!(programs(&log), ["ip", "sh", "ctr", "sh", "ip"]);
         assert_eq!(env_of(&log, 3, "CNI_COMMAND").as_deref(), Some("DEL"));
         assert_eq!(argv(&log)[4], ["netns", "del", "ac-a1"]);
         let _ = std::fs::remove_dir_all(root);
@@ -563,7 +591,7 @@ mod tests {
         let _ = std::fs::create_dir_all(root.join("a1"));
         let _ = std::fs::write(root.join("netns/ac-a1"), "");
         assert!(rt.destroy(&id()).is_ok());
-        assert_eq!(programs(&log), ["ctr", "ctr", PLUGIN, "ip"]);
+        assert_eq!(programs(&log), ["ctr", "ctr", "sh", "ip"]);
         assert_eq!(env_of(&log, 2, "CNI_COMMAND").as_deref(), Some("DEL"));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -575,6 +603,37 @@ mod tests {
         assert!(rt.destroy(&id()).is_ok());
         assert_eq!(programs(&log), ["ctr", "ctr"]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commands_are_wrapped_in_timeout_when_configured() {
+        let (mut rt, log, _) = rt(ExitStatus::Code(0));
+        rt.cfg.command_timeout = Some(Duration::from_secs(30));
+        assert!(rt.pause(&id()).is_ok());
+        assert_eq!(programs(&log), ["timeout"]);
+        assert_eq!(
+            argv(&log)[0],
+            [
+                "--kill-after=5",
+                "30",
+                "ctr",
+                "-n",
+                "agents",
+                "task",
+                "pause",
+                "a1"
+            ]
+        );
+    }
+
+    #[test]
+    fn timeout_exit_is_reported_as_a_timeout() {
+        let (mut rt, _, _) = rt(ExitStatus::Code(0));
+        rt.cfg.command_timeout = Some(Duration::from_secs(1));
+        let spawner = MockSpawner::new().script("timeout", ExitStatus::Code(124));
+        let slow = CtrRuntime::new(spawner, rt.cfg.clone());
+        let err = slow.pause(&id()).err().map(|e| e.cause).unwrap_or_default();
+        assert!(err.contains("timed out"), "{err}");
     }
 
     #[test]

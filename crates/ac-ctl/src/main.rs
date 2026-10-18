@@ -27,6 +27,8 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             workspace_root: cli.workspaces.clone(),
             workspace_owner: Some((cli.uid, cli.uid)),
             network,
+            command_timeout: Some(std::time::Duration::from_secs(120)),
+            trace: std::env::var_os("AC_TRACE").is_some(),
         },
     );
     let fleet = Fleet::new(runtime, EngineStore::open(&cli.data)?);

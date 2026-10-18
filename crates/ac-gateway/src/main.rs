@@ -82,6 +82,8 @@ fn run() -> Result<(), String> {
             workspace_root: data.join("workspaces"),
             workspace_owner: Some((uid, uid)),
             network,
+            command_timeout: Some(std::time::Duration::from_secs(120)),
+            trace: std::env::var_os("AC_TRACE").is_some(),
         },
     );
     let store = EngineStore::open(&data).map_err(|e| e.to_string())?;

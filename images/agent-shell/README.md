@@ -39,6 +39,8 @@ network after the VM has booted, so the guest never gets an interface. With `--n
 creates a network namespace (`ip netns add ac-<id>`), attaches it with the CNI `bridge` plugin, then starts the
 container inside it (`ctr run --with-ns network:/run/netns/ac-<id>`). Destroying the agent detaches and removes it.
 Pass `--network` on `destroy` too, or the namespace is left behind.
+Every external command (`ctr`, `ip`, the CNI plugin) is killed after 120 s. To see each command as it runs,
+set `AC_TRACE=1` (with sudo: `sudo env AC_TRACE=1 ac-ctl ...`).
 
 ```
 sudo dnf install -y containernetworking-plugins      # provides /usr/libexec/cni/bridge

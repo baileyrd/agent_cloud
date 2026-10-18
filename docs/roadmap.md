@@ -1,14 +1,15 @@
 # Roadmap
 
 ## M0: Host ready
-- [ ] KVM verified on the Fedora server (`/dev/kvm`, `virt-host-validate`)
-- [ ] containerd and Kata installed; kernel-differs smoke test passes
-- [ ] SELinux denials, if any, resolved without disabling it
+- [x] KVM verified on the Fedora server (BaileyServ: VT-x enabled in BIOS, `/dev/kvm` present)
+- [x] containerd and Kata installed; VM smoke test passes (`scripts/m0-smoke.sh`)
+- [x] SELinux stays enforcing; no Kata-related denials seen
 
 ## M1: One agent, by hand
 - [ ] Desktop image: Xorg dummy (or chosen streamer), Xfce, policy-locked Chromium
 - [ ] Shell image: unprivileged user, harness, toolchains
-- [ ] Start one agent under Kata, open its desktop, run a task end to end
+- [x] Start one container under Kata via `ac-ctl` (create/pause/resume/destroy verified with `nginx:alpine`)
+- [ ] Start one real agent image (shell + desktop), open its desktop, run a task end to end
 
 ## M2: Viewer
 - [ ] Decide streaming layer (ADR-006)

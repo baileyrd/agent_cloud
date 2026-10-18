@@ -147,3 +147,32 @@ user, backups.
 
 Phases 0-3: an hour or two if KVM cooperates. Images and spawner: most of a weekend for a
 first version. Phases 7-8 are what make it safe to leave running.
+
+## Fedora 44 notes (verified on BaileyServ, i5-3550, 2026-10-18)
+
+Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smoke.sh` is the check.
+
+1. **Enable VT-x in firmware.** Symptom: no `vmx` flag, no `/dev/kvm`. On the Gigabyte UEFI BIOS it is
+   BIOS Features, Intel Virtualization Technology = Enabled; then cold-boot.
+2. **Install Kata from Fedora:** `sudo dnf install -y kata-containers containerd`, then
+   `sudo systemctl enable --now containerd`. Persist the vhost modules (one per line; `modprobe a b c`
+   treats `b` and `c` as parameters, not modules):
+   `printf 'vhost\nvhost_net\nvhost_vsock\n' | sudo tee /etc/modules-load.d/kata.conf`.
+   Run `sudo kata-runtime check` (needs root).
+3. **Cap guest memory on old CPUs.** Symptom: `qemu-system-x86_64: Address space limit ... phys-bits too low (36)`.
+   Ivy Bridge CPUs address only 36 bits (64 GiB); Kata's default `default_maxmemory = 0` (all host RAM, plus
+   hotplug room) overflows it. Copy the packaged config and cap it (it also bounds any one agent's growth):
+   ```
+   sudo mkdir -p /etc/kata-containers
+   sudo cp /usr/share/kata-containers/defaults/configuration.toml /etc/kata-containers/configuration.toml
+   sudo sed -i 's/^#\?default_maxmemory *=.*/default_maxmemory = 8192/' /etc/kata-containers/configuration.toml
+   ```
+4. **Repair the guest initrd.** Symptom: `timed out connecting to vsock`; booting the initrd by hand shows
+   `kata-agent: error while loading shared libraries: libseccomp.so.2`. Run `sudo scripts/fix-kata-initrd.sh`
+   and re-run it after any kernel update that regenerates the initrd.
+5. **The guest kernel equals the host kernel.** Fedora's package boots the host's own kernel image as the guest
+   kernel, so `uname -r` matches. Proof of a VM is the `hypervisor` CPU flag and a fresh uptime, which the
+   smoke test checks.
+
+Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
+(do not pipe the console through `sudo ... | tail`; the output is lost).

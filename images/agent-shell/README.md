@@ -60,5 +60,9 @@ sudo nft add chain inet agentfw forward '{ type filter hook forward priority -10
 sudo nft add rule inet agentfw forward iifname "acbr0" ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }' drop
 ```
 
+`--network` also gives each agent a `resolv.conf` (public resolvers 1.1.1.1 and 9.9.9.9, written to
+`<data>/resolv.conf` on first use), because a VM cannot use the host's loopback resolver stub.
+Queries go straight out until the egress proxy owns DNS.
+
 This is not persistent and not a security boundary yet. Agents on the same bridge can still reach each other,
 and DNS may need a nameserver set inside the guest. Do not leave agents running unattended on this setup.

@@ -13,6 +13,11 @@ use args::{Action, Cli, USAGE};
 use platform_linux::LinuxSpawner;
 
 fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
+    let resolv_conf = if cli.network {
+        Some(ac_ctr::default_resolv_conf(&cli.data)?)
+    } else {
+        None
+    };
     let runtime = CtrRuntime::new(
         LinuxSpawner,
         CtrConfig {
@@ -22,6 +27,7 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             workspace_root: cli.workspaces.clone(),
             workspace_owner: Some((cli.uid, cli.uid)),
             network: cli.network,
+            resolv_conf,
         },
     );
     let fleet = Fleet::new(runtime, EngineStore::open(&cli.data)?);

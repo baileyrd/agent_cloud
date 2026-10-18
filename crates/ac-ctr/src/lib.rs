@@ -30,6 +30,26 @@ pub struct CtrConfig {
     pub workspace_owner: Option<(u32, u32)>,
     /// Attach the container to the CNI network (`ctr run --cni`). Off by default: no network.
     pub network: bool,
+    /// Host file bind-mounted read-only as the guest's `/etc/resolv.conf`. A VM cannot use the
+    /// host's loopback resolver stub, so networked agents need one of their own.
+    pub resolv_conf: Option<PathBuf>,
+}
+
+/// Public resolvers used for agents until the egress proxy owns DNS (ADR-007).
+const DEFAULT_RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 9.9.9.9\n";
+
+/// Path of the default guest `resolv.conf` under `dir`, written first if absent.
+pub fn default_resolv_conf(dir: &std::path::Path) -> Result<PathBuf, PortError> {
+    let fail = |e: std::io::Error| PortError {
+        op: "resolv.conf",
+        cause: e.to_string(),
+    };
+    std::fs::create_dir_all(dir).map_err(fail)?;
+    let path = dir.join("resolv.conf");
+    if !path.exists() {
+        std::fs::write(&path, DEFAULT_RESOLV_CONF).map_err(fail)?;
+    }
+    Ok(path)
 }
 
 /// Runs each agent as a detached Kata container with a bind-mounted workspace.
@@ -112,7 +132,17 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
         if self.cfg.network {
             args.push("--cni");
         }
-        args.extend(["--mount", &mount, &self.cfg.image, id.as_str()]);
+        args.extend(["--mount", &mount]);
+        let resolv_mount = self.cfg.resolv_conf.as_ref().map(|p| {
+            format!(
+                "type=bind,src={},dst=/etc/resolv.conf,options=rbind:ro",
+                p.display()
+            )
+        });
+        if let Some(m) = &resolv_mount {
+            args.extend(["--mount", m]);
+        }
+        args.extend([self.cfg.image.as_str(), id.as_str()]);
         self.ctr("create", &os(&args))
     }
 
@@ -161,6 +191,7 @@ mod tests {
             workspace_root: root.clone(),
             workspace_owner: None,
             network: false,
+            resolv_conf: None,
         };
         (CtrRuntime::new(spawner, cfg), log, root)
     }
@@ -207,6 +238,34 @@ mod tests {
         assert!(rt.create(&id()).is_ok());
         assert!(argv(&log)[0].iter().any(|a| a == "--cni"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolv_conf_is_mounted_read_only() {
+        let (mut rt, log, root) = rt(ExitStatus::Code(0));
+        rt.cfg.resolv_conf = Some(PathBuf::from("/etc/agent-cloud/resolv.conf"));
+        assert!(rt.create(&id()).is_ok());
+        let call = &argv(&log)[0];
+        assert!(call
+            .iter()
+            .any(|a| a.contains("dst=/etc/resolv.conf,options=rbind:ro")));
+        assert_eq!(call.last().map(String::as_str), Some("a1"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_resolv_conf_is_written_once() {
+        let dir = std::env::temp_dir().join(format!("ac-ctr-resolv-{}", std::process::id()));
+        let path = default_resolv_conf(&dir).unwrap_or_else(|e| panic!("{e}"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("nameserver 1.1.1.1"));
+        let _ = std::fs::write(&path, "nameserver 10.0.0.1\n");
+        let again = default_resolv_conf(&dir).unwrap_or_else(|e| panic!("{e}"));
+        assert!(std::fs::read_to_string(again)
+            .unwrap_or_default()
+            .contains("10.0.0.1"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

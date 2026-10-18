@@ -68,6 +68,12 @@ fn run() -> Result<(), String> {
     let uid: u32 = env("AC_UID", "1000")
         .parse()
         .map_err(|e| format!("AC_UID: {e}"))?;
+    let network = env("AC_NETWORK", "") == "1";
+    let resolv_conf = if network {
+        Some(ac_ctr::default_resolv_conf(&data).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     let runtime = CtrRuntime::new(
         LinuxSpawner,
         CtrConfig {
@@ -76,7 +82,8 @@ fn run() -> Result<(), String> {
             image,
             workspace_root: data.join("workspaces"),
             workspace_owner: Some((uid, uid)),
-            network: env("AC_NETWORK", "") == "1",
+            network,
+            resolv_conf,
         },
     );
     let store = EngineStore::open(&data).map_err(|e| e.to_string())?;

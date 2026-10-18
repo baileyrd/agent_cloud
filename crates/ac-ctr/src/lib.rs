@@ -170,6 +170,14 @@ impl<S: Spawner> CtrRuntime<S> {
         self.run(op, OsStr::new(&self.cfg.ctr_bin), &full, None, None)
     }
 
+    /// Like [`Self::ctr`], but a "not found" failure is success.
+    fn ctr_gone_ok(&self, op: &'static str, args: &[OsString]) -> Result<(), PortError> {
+        match self.ctr(op, args) {
+            Err(e) if is_already_gone(&e.cause) => Ok(()),
+            other => other,
+        }
+    }
+
     /// Run the CNI plugin (`ADD` or `DEL`) against the agent's namespace.
     fn cni(
         &self,
@@ -243,6 +251,11 @@ impl<S: Spawner> CtrRuntime<S> {
     }
 }
 
+/// Whether a `ctr` failure says the thing it was asked to remove no longer exists.
+fn is_already_gone(cause: &str) -> bool {
+    cause.contains("not found")
+}
+
 fn read_all(file: &mut dyn platform::fs::File) -> platform::error::Result<Vec<u8>> {
     let (mut out, mut buf) = (Vec::new(), [0u8; 4096]);
     loop {
@@ -291,8 +304,9 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
     }
 
     fn destroy(&self, id: &AgentId) -> Result<(), PortError> {
-        self.ctr("destroy", &os(&["task", "delete", "--force", id.as_str()]))?;
-        self.ctr("destroy", &os(&["container", "delete", id.as_str()]))?;
+        // Already gone counts as done, so destroy can be retried after a crash or reboot.
+        self.ctr_gone_ok("destroy", &os(&["task", "delete", "--force", id.as_str()]))?;
+        self.ctr_gone_ok("destroy", &os(&["container", "delete", id.as_str()]))?;
         if let Some(net) = &self.cfg.network {
             self.network_down(net, id)?;
         }
@@ -561,6 +575,17 @@ mod tests {
         assert!(rt.destroy(&id()).is_ok());
         assert_eq!(programs(&log), ["ctr", "ctr"]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn already_gone_is_recognised() {
+        assert!(is_already_gone(
+            "Code(1): ctr: no running task found: task a1 not found"
+        ));
+        assert!(is_already_gone(
+            r#"Code(1): container "a1" in namespace "agents": not found"#
+        ));
+        assert!(!is_already_gone("Code(1): permission denied"));
     }
 
     #[test]

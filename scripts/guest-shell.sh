@@ -3,9 +3,17 @@
 # virtio NIC, to see what the guest can load. Exit QEMU with Ctrl-a x.
 set -euo pipefail
 ver=$(uname -r)
-kernel=/usr/lib/modules/$ver/vmlinuz
-initrd=/var/cache/kata-containers/osbuilder-images/$ver/kata-containers-initrd.img
-[ -r "$kernel" ] && [ -r "$initrd" ] || { echo "missing kernel/initrd for $ver" >&2; exit 1; }
+first() { for f in "$@"; do [ -r "$f" ] && { echo "$f"; return; }; done; }
+kernel=$(first "/usr/lib/modules/$ver/vmlinuz" "/boot/vmlinuz-$ver" || true)
+initrd=$(first /var/cache/kata-containers/osbuilder-images/"$ver"/*.initrd \
+  /var/cache/kata-containers/osbuilder-images/"$ver"/kata-containers-initrd.img \
+  /var/cache/kata-containers/osbuilder-images/*/kata-containers-initrd.img || true)
+if [ -z "$kernel" ] || [ -z "$initrd" ]; then
+  echo "missing kernel='$kernel' initrd='$initrd' for $ver" >&2
+  ls -l /usr/lib/modules/*/vmlinuz /boot/vmlinuz-* /var/cache/kata-containers/osbuilder-images/*/ 2>&1 >&2
+  exit 1
+fi
+echo "kernel=$kernel initrd=$initrd"
 cat <<'TXT'
 In the guest shell try:
   mount -t proc proc /proc; mount -t sysfs sys /sys

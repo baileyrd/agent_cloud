@@ -6,15 +6,15 @@ mod args;
 
 use std::process::ExitCode;
 
-use ac_ctr::{CtrConfig, CtrRuntime};
+use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_fleet::{Fleet, FleetError};
 use ac_store::EngineStore;
 use args::{Action, Cli, USAGE};
 use platform_linux::LinuxSpawner;
 
 fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
-    let resolv_conf = if cli.network {
-        Some(ac_ctr::default_resolv_conf(&cli.data)?)
+    let network = if cli.network {
+        Some(Network::defaults(&cli.data)?)
     } else {
         None
     };
@@ -26,8 +26,7 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             image: cli.image.clone(),
             workspace_root: cli.workspaces.clone(),
             workspace_owner: Some((cli.uid, cli.uid)),
-            network: cli.network,
-            resolv_conf,
+            network,
         },
     );
     let fleet = Fleet::new(runtime, EngineStore::open(&cli.data)?);

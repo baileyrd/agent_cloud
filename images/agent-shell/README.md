@@ -34,23 +34,20 @@ Logins live in the agent's home, inside the VM, and go away with `destroy`.
 
 ## Networking (needed for Claude Code to reach its API) **[unverified]**
 
-Plain `ctr run` containers have no network. `ac-ctl --network` adds `ctr run --cni`, which needs:
+Plain `ctr run` containers have no network, and `ctr run --cni` does not work with Kata: it attaches the
+network after the VM has booted, so the guest never gets an interface. With `--network`, `ac-ctl` instead
+creates a network namespace (`ip netns add ac-<id>`), attaches it with the CNI `bridge` plugin, then starts the
+container inside it (`ctr run --with-ns network:/run/netns/ac-<id>`). Destroying the agent detaches and removes it.
+Pass `--network` on `destroy` too, or the namespace is left behind.
 
 ```
-sudo dnf install -y containernetworking-plugins
-sudo mkdir -p /opt/cni /etc/cni/net.d && sudo ln -sfn /usr/libexec/cni /opt/cni/bin
-sudo tee /etc/cni/net.d/10-agents.conflist >/dev/null <<'EOF'
-{
-  "cniVersion": "1.0.0",
-  "name": "agents",
-  "plugins": [
-    { "type": "bridge", "bridge": "acbr0", "isGateway": true, "ipMasq": true,
-      "ipam": { "type": "host-local", "ranges": [[{ "subnet": "10.89.0.0/16" }]],
-                "routes": [{ "dst": "0.0.0.0/0" }] } }
-  ]
-}
-EOF
+sudo dnf install -y containernetworking-plugins      # provides /usr/libexec/cni/bridge
 ```
+
+On first use `--network` writes two files under the data directory, which you can edit:
+- `cni-agents.json`: a NAT bridge `acbr0`, subnet 10.89.0.0/16.
+- `resolv.conf`: public resolvers 1.1.1.1 and 9.9.9.9. A VM cannot use the host's loopback resolver stub.
+  Queries go straight out until the egress proxy owns DNS.
 
 Until the egress allowlist exists (ADR-007), keep agents off your LAN with a drop rule for private ranges:
 
@@ -60,9 +57,6 @@ sudo nft add chain inet agentfw forward '{ type filter hook forward priority -10
 sudo nft add rule inet agentfw forward iifname "acbr0" ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }' drop
 ```
 
-`--network` also gives each agent a `resolv.conf` (public resolvers 1.1.1.1 and 9.9.9.9, written to
-`<data>/resolv.conf` on first use), because a VM cannot use the host's loopback resolver stub.
-Queries go straight out until the egress proxy owns DNS.
-
 This is not persistent and not a security boundary yet. Agents on the same bridge can still reach each other,
-and DNS may need a nameserver set inside the guest. Do not leave agents running unattended on this setup.
+and firewalld on Fedora Workstation may need adjusting for forwarding. Do not leave agents running unattended
+on this setup.

@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use ac_ctr::{CtrConfig, CtrRuntime};
+use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_fleet::Fleet;
 use ac_gateway::{bind, Api};
 use ac_store::EngineStore;
@@ -68,9 +68,8 @@ fn run() -> Result<(), String> {
     let uid: u32 = env("AC_UID", "1000")
         .parse()
         .map_err(|e| format!("AC_UID: {e}"))?;
-    let network = env("AC_NETWORK", "") == "1";
-    let resolv_conf = if network {
-        Some(ac_ctr::default_resolv_conf(&data).map_err(|e| e.to_string())?)
+    let network = if env("AC_NETWORK", "") == "1" {
+        Some(Network::defaults(&data).map_err(|e| e.to_string())?)
     } else {
         None
     };
@@ -83,7 +82,6 @@ fn run() -> Result<(), String> {
             workspace_root: data.join("workspaces"),
             workspace_owner: Some((uid, uid)),
             network,
-            resolv_conf,
         },
     );
     let store = EngineStore::open(&data).map_err(|e| e.to_string())?;

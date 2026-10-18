@@ -166,6 +166,7 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    sudo mkdir -p /etc/kata-containers
    sudo cp /usr/share/kata-containers/defaults/configuration.toml /etc/kata-containers/configuration.toml
    sudo sed -i 's/^#\?default_maxmemory *=.*/default_maxmemory = 8192/' /etc/kata-containers/configuration.toml
+   sudo sed -i 's/^#\?default_memory *=.*/default_memory = 4096/' /etc/kata-containers/configuration.toml   # Claude Code needs >= 4 GB
    ```
 4. **Repair the guest initrd.** Symptom: `timed out connecting to vsock`; booting the initrd by hand shows
    `kata-agent: error while loading shared libraries: libseccomp.so.2`. Run `sudo scripts/fix-kata-initrd.sh`

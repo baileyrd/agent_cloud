@@ -25,6 +25,11 @@ pub struct CtrConfig {
     pub image: String,
     /// Parent directory of per-agent workspace volumes.
     pub workspace_root: PathBuf,
+    /// Owner (uid, gid) given to each new workspace so the unprivileged agent user can write.
+    /// `None` leaves the directory owned by whoever runs the adapter.
+    pub workspace_owner: Option<(u32, u32)>,
+    /// Attach the container to the CNI network (`ctr run --cni`). Off by default: no network.
+    pub network: bool,
 }
 
 /// Runs each agent as a detached Kata container with a bind-mounted workspace.
@@ -93,23 +98,22 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
             op: "create",
             cause: format!("mkdir {}: {e}", dir.display()),
         })?;
+        if let Some((uid, gid)) = self.cfg.workspace_owner {
+            std::os::unix::fs::chown(&dir, Some(uid), Some(gid)).map_err(|e| PortError {
+                op: "create",
+                cause: format!("chown {}: {e}", dir.display()),
+            })?;
+        }
         let mount = format!(
             "type=bind,src={},dst={WORKSPACE_MOUNT},options=rbind:rw",
             dir.display()
         );
-        self.ctr(
-            "create",
-            &os(&[
-                "run",
-                "-d",
-                "--runtime",
-                KATA,
-                "--mount",
-                &mount,
-                &self.cfg.image,
-                id.as_str(),
-            ]),
-        )
+        let mut args = vec!["run", "-d", "--runtime", KATA];
+        if self.cfg.network {
+            args.push("--cni");
+        }
+        args.extend(["--mount", &mount, &self.cfg.image, id.as_str()]);
+        self.ctr("create", &os(&args))
     }
 
     fn pause(&self, id: &AgentId) -> Result<(), PortError> {
@@ -155,6 +159,8 @@ mod tests {
             namespace: "agents".into(),
             image: "agent:latest".into(),
             workspace_root: root.clone(),
+            workspace_owner: None,
+            network: false,
         };
         (CtrRuntime::new(spawner, cfg), log, root)
     }
@@ -187,6 +193,27 @@ mod tests {
         assert!(calls[0].iter().any(|a| a.contains("dst=/workspace")));
         assert_eq!(calls[0].last().map(String::as_str), Some("a1"));
         assert!(root.join("a1").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn network_flag_adds_cni_and_owner_is_applied() {
+        use std::os::unix::fs::MetadataExt;
+        let (mut rt, log, root) = rt(ExitStatus::Code(0));
+        let _ = std::fs::create_dir_all(&root);
+        let meta = std::fs::metadata(&root).unwrap_or_else(|e| panic!("{e}"));
+        rt.cfg.network = true;
+        rt.cfg.workspace_owner = Some((meta.uid(), meta.gid()));
+        assert!(rt.create(&id()).is_ok());
+        assert!(argv(&log)[0].iter().any(|a| a == "--cni"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_cni_by_default() {
+        let (rt, log, root) = rt(ExitStatus::Code(0));
+        assert!(rt.create(&id()).is_ok());
+        assert!(!argv(&log)[0].iter().any(|a| a == "--cni"));
         let _ = std::fs::remove_dir_all(root);
     }
 

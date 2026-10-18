@@ -20,6 +20,8 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             namespace: cli.namespace.clone(),
             image: cli.image.clone(),
             workspace_root: cli.workspaces.clone(),
+            workspace_owner: Some((cli.uid, cli.uid)),
+            network: cli.network,
         },
     );
     let fleet = Fleet::new(runtime, EngineStore::open(&cli.data)?);

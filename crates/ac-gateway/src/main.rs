@@ -3,6 +3,7 @@
 //! Env: `AC_TOKEN_FILE` (file holding the bearer token; refused if group/world
 //! readable), `AC_BIND` (default 127.0.0.1:8780), `AC_IMAGE` (required),
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
+//! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
 //! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check.
 
 use std::net::SocketAddr;
@@ -64,6 +65,9 @@ fn run() -> Result<(), String> {
         return Err(format!("refusing to bind {addr}: not a private address (set AC_ALLOW_PUBLIC_BIND=1 to override)"));
     }
     let data = PathBuf::from(env("AC_DATA", "/var/lib/agent-cloud"));
+    let uid: u32 = env("AC_UID", "1000")
+        .parse()
+        .map_err(|e| format!("AC_UID: {e}"))?;
     let runtime = CtrRuntime::new(
         LinuxSpawner,
         CtrConfig {
@@ -71,6 +75,8 @@ fn run() -> Result<(), String> {
             namespace: env("AC_NAMESPACE", "agents"),
             image,
             workspace_root: data.join("workspaces"),
+            workspace_owner: Some((uid, uid)),
+            network: env("AC_NETWORK", "") == "1",
         },
     );
     let store = EngineStore::open(&data).map_err(|e| e.to_string())?;

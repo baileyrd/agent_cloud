@@ -7,7 +7,7 @@ use ac_domain::{AgentId, IdError};
 
 /// Usage text.
 pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces DIR] [--ctr PATH] \
-[--namespace NS] <create|pause|resume|destroy|status> <agent-id>";
+[--namespace NS] [--uid N] [--network] <create|pause|resume|destroy|status> <agent-id>";
 
 /// What to do to the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub struct Cli {
     pub namespace: String,
     /// Agent image.
     pub image: String,
+    /// Workspace owner uid/gid (the unprivileged agent user in the image).
+    pub uid: u32,
+    /// Attach agents to the CNI network.
+    pub network: bool,
     /// Requested action.
     pub action: Action,
     /// Target agent.
@@ -58,6 +62,8 @@ pub enum ArgError {
     Extra(String),
     /// Agent id rejected.
     BadId(IdError),
+    /// `--uid` was not a number.
+    BadUid(String),
 }
 
 impl fmt::Display for ArgError {
@@ -69,6 +75,7 @@ impl fmt::Display for ArgError {
             Self::UnknownAction(a) => write!(f, "unknown action {a}"),
             Self::Extra(a) => write!(f, "unexpected argument {a}"),
             Self::BadId(e) => e.fmt(f),
+            Self::BadUid(v) => write!(f, "--uid must be a number, got {v}"),
         }
     }
 }
@@ -90,6 +97,7 @@ fn action(word: &str) -> Result<Action, ArgError> {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
     let (mut data, mut workspaces) = (PathBuf::from("/var/lib/agent-cloud"), None::<PathBuf>);
     let (mut ctr, mut namespace, mut image) = ("ctr".to_owned(), "agents".to_owned(), None);
+    let (mut uid, mut network) = (1000u32, false);
     let mut positional = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -104,6 +112,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
             "--ctr" => ctr = value()?,
             "--namespace" => namespace = value()?,
             "--image" => image = Some(value()?),
+            "--uid" => {
+                let v = value()?;
+                uid = v.parse().map_err(|_| ArgError::BadUid(v))?;
+            }
+            "--network" => network = true,
             _ => return Err(ArgError::UnknownFlag(arg)),
         }
     }
@@ -120,6 +133,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
         ctr,
         namespace,
         image: image.ok_or(ArgError::Missing("--image"))?,
+        uid,
+        network,
         action,
         id,
     })
@@ -146,6 +161,18 @@ mod tests {
             (cli.ctr.as_str(), cli.namespace.as_str()),
             ("ctr", "agents")
         );
+    }
+
+    #[test]
+    fn uid_and_network_flags() {
+        let cli = p("--image i --uid 1234 --network status a1").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((cli.uid, cli.network), (1234, true));
+        let cli = p("--image i status a1").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((cli.uid, cli.network), (1000, false));
+        assert!(matches!(
+            p("--image i --uid x status a1"),
+            Err(ArgError::BadUid(_))
+        ));
     }
 
     #[test]

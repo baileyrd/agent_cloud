@@ -26,11 +26,16 @@ NS=ac-smoke
 IMG=docker.io/library/busybox:latest
 ctr -n "$NS" image pull "$IMG" >/dev/null 2>&1 || { bad "pull $IMG"; exit 1; }
 host=$(uname -r)
-guest=$(ctr -n "$NS" run --rm --runtime io.containerd.kata.v2 "$IMG" ac-smoke-1 uname -r 2>/dev/null)
+err=$(mktemp)
+guest=$(ctr -n "$NS" run --rm --runtime io.containerd.kata.v2 "$IMG" ac-smoke-1 uname -r 2>"$err")
 if [ -z "$guest" ]; then
     bad "kata run (see: ausearch -m avc -ts recent; do not disable SELinux first)"
+    echo "---- ctr stderr ----"; cat "$err"; rm -f "$err"
+    echo "---- recent SELinux denials ----"; ausearch -m avc -ts recent 2>/dev/null | tail -n 15
+    echo "---- containerd log ----"; journalctl -u containerd -n 20 --no-pager 2>/dev/null
     exit 1
 fi
+rm -f "$err"
 if [ "$guest" != "$host" ]; then
     ok "isolation: guest kernel $guest differs from host $host"
 else

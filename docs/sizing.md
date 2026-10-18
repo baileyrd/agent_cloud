@@ -43,3 +43,18 @@ first; CPU can be overcommitted 2-4x because most agents wait on model calls.
 ## Recommendation
 
 Start on 16 cores and 64 GB. Measure RAM and CPU for a week on a few agents, then resize.
+
+## Reference host: BaileyServ (measured with `scripts/capacity.sh`)
+
+| Item | Value |
+|---|---|
+| CPU | Intel Core i5-3550 (Ivy Bridge, 4 cores / 4 threads, 3.3-3.7 GHz); VT-x and EPT supported per Intel ARK |
+| RAM | 24 GiB DDR3-1600 (2x4 + 2x8), all four slots used; CPU maximum is 32 GiB, so upgrade means 4x8 |
+| Disk | One 1 TB 2.5" rotational drive (`ST1000LM024`), ~910 GB free; no SSD |
+| OS | Fedora 44 Workstation, SELinux enforcing, bare metal (`systemd-detect-virt` = none) |
+| Blocker | `/dev/kvm` absent: VT-x disabled in firmware (`vmx` flag count 0) |
+
+Estimate from the per-agent numbers above (host reserve 3 GiB and 1 core): **4 active / 9 provisioned**, limited by RAM.
+Practical plan, adjusted for 4 non-hyperthreaded cores and the spinning disk: **2-3 active, 6-9 provisioned**.
+The disk, not RAM, is the first thing to fix: put `/var/lib/containerd` and the data directory on an SSD.
+Treat this box as a proof-of-concept host. **[unverified]**: nothing has been run on it under Kata yet.

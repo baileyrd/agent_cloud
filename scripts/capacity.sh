@@ -15,6 +15,10 @@ dmidecode -t memory 2>/dev/null | grep -E 'Size:|Type:|Speed:|Maximum Capacity|N
 echo "== Storage"
 lsblk -d -o NAME,SIZE,ROTA,TRAN,MODEL
 df -h "$WS" | tail -1
+src=$(df --output=source "$WS" | tail -1)
+if [ "$(lsblk -no ROTA "$src" 2>/dev/null | head -1 | tr -d ' ')" = "1" ]; then
+    echo "WARNING: $WS is on a rotational disk ($src). Expect slow VM boots and builds; use an SSD for /var/lib/containerd and the data dir."
+fi
 echo "== System"
 printf 'kernel %s | virt: %s | selinux: %s | /dev/kvm: %s\n' "$(uname -r)" "$(systemd-detect-virt)" \
     "$(getenforce 2>/dev/null || echo n/a)" "$([ -c /dev/kvm ] && echo yes || echo NO)"

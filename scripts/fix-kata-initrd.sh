@@ -5,6 +5,7 @@
 # This adds every library the agent needs from the host into the initrd. It also adds the
 # guest network driver (virtio_net and its dependencies, loadable modules on Fedora) so a VM
 # with a network card can configure eth0; without it the shim retries update_interface forever.
+# The module is also added to the initrd's boot-time load list (kata-modules.conf).
 # Idempotent; the original is kept as <initrd>.orig. Re-run after a kernel update regenerates it.
 # Run as root. [verified once: BaileyServ, Fedora 44]
 set -eu
@@ -36,6 +37,18 @@ for m in virtio_net net_failover failover; do
     cp -L "$src" "usr/lib/modules/$KVER/$rel"
     changed=1
 done
+# The initrd loads modules listed in this file at boot; nothing else loads virtio_net
+# (udev does not start in the guest). Without it the guest has no eth0.
+conf=etc/modules-load.d/kata-modules.conf
+mkdir -p etc/modules-load.d
+[ -f "$conf" ] && sed -i -e '$a\' "$conf"
+if ! grep -qx virtio_net "$conf" 2>/dev/null; then
+    echo "modules-load: adding virtio_net to $conf"
+    echo virtio_net >> "$conf"
+    changed=1
+else
+    echo "modules-load: virtio_net already listed"
+fi
 if [ "$changed" -eq 1 ]; then
     command -v depmod >/dev/null || { echo "depmod not found (install kmod)" >&2; exit 1; }
     depmod -b "$W" "$KVER"

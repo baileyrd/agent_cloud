@@ -26,8 +26,16 @@ NS=ac-smoke
 IMG=docker.io/library/busybox:latest
 ctr -n "$NS" image pull "$IMG" >/dev/null 2>&1 || { bad "pull $IMG"; exit 1; }
 host=$(uname -r)
+id="ac-smoke-$$"
 err=$(mktemp)
-guest=$(ctr -n "$NS" run --rm --runtime io.containerd.kata.v2 "$IMG" ac-smoke-1 uname -r 2>"$err")
+# Fedora's Kata package boots the host's own kernel image as the guest kernel, so
+# the versions can match. A VM is proven by the "hypervisor" CPU flag and a fresh uptime.
+out=$(ctr -n "$NS" run --rm --runtime io.containerd.kata.v2 "$IMG" "$id" \
+    sh -c 'uname -r; grep -c hypervisor /proc/cpuinfo; cut -d. -f1 /proc/uptime' 2>"$err")
+guest=$(echo "$out" | sed -n 1p)
+hv=$(echo "$out" | sed -n 2p)
+guest_up=$(echo "$out" | sed -n 3p)
+host_up=$(cut -d. -f1 /proc/uptime)
 if [ -z "$guest" ]; then
     bad "kata run (see: ausearch -m avc -ts recent; do not disable SELinux first)"
     echo "---- ctr stderr ----"; cat "$err"; rm -f "$err"
@@ -36,9 +44,9 @@ if [ -z "$guest" ]; then
     exit 1
 fi
 rm -f "$err"
-if [ "$guest" != "$host" ]; then
-    ok "isolation: guest kernel $guest differs from host $host"
+if [ "${hv:-0}" -gt 0 ] && [ "${guest_up:-999999}" -lt "$host_up" ]; then
+    ok "runs in a VM: hypervisor flag set, guest up ${guest_up}s vs host ${host_up}s (guest kernel $guest, host $host)"
 else
-    bad "guest kernel equals host kernel ($host): not running under Kata"
+    bad "does not look like a VM (hypervisor flag count '${hv:-?}', guest up '${guest_up:-?}'s, host up ${host_up}s)"
 fi
 exit "$fail"

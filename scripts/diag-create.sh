@@ -29,7 +29,7 @@ import os, socket, sys, time
 p, log = f"/run/vc/vm/{sys.argv[1]}/console.sock", sys.argv[2]
 t = time.time()
 while not os.path.exists(p) and time.time() - t < 90:
-    time.sleep(0.05)
+    time.sleep(0.002)
 s = socket.socket(socket.AF_UNIX)
 s.settimeout(120)
 try:

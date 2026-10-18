@@ -63,10 +63,12 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     }
 
     /// Provision a new agent, or re-create a destroyed one. A runtime failure leaves it `Creating`
+    /// (retry with `create`, or clear it with `destroy`)
     /// (visible and destroyable) rather than silently forgotten.
     pub fn create(&self, id: &AgentId) -> Result<State, FleetError> {
-        // A destroyed agent's id may be reused; any live state means it already exists.
-        if matches!(self.store.state(id)?, Some(state) if state != State::Destroyed) {
+        // Only a running or paused agent blocks the id. A destroyed one can be reused, and one
+        // stuck in `Creating` (a previous create failed) is retried.
+        if matches!(self.store.state(id)?, Some(State::Running | State::Paused)) {
             return Err(FleetError::AlreadyExists(id.clone()));
         }
         self.store.set_state(id, State::Creating)?;
@@ -200,6 +202,20 @@ mod tests {
             Err(FleetError::AlreadyExists(_))
         ));
         assert_eq!(rt.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn failed_create_can_be_retried() {
+        let failing = FakeRuntime {
+            fail: true,
+            ..Default::default()
+        };
+        let store = FakeStore::default();
+        let first = Fleet::new(&failing, store);
+        assert!(matches!(first.create(&id()), Err(FleetError::Port(_))));
+        let working = FakeRuntime::default();
+        let retry = Fleet::new(&working, first.store);
+        assert!(matches!(retry.create(&id()), Ok(State::Running)));
     }
 
     #[test]

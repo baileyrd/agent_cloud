@@ -58,3 +58,17 @@ Estimate from the per-agent numbers above (host reserve 3 GiB and 1 core): **4 a
 Practical plan, adjusted for 4 non-hyperthreaded cores and the spinning disk: **2-3 active, 6-9 provisioned**.
 The disk, not RAM, is the first thing to fix: put `/var/lib/containerd` and the data directory on an SSD.
 Treat this box as a proof-of-concept host. **[unverified]**: nothing has been run on it under Kata yet.
+
+## Reference host: Proxmox (MS-01 class, measured)
+
+| Item | Value |
+|---|---|
+| CPU | Intel Core i9-12900H (6P + 8E cores, 20 threads); VT-x; nested KVM enabled (`kvm_intel nested = Y`) |
+| RAM | 31 GiB total; about 14 GiB used and 16 GiB available with the current guests |
+| Disk | 1 TB NVMe (Kingston); a 23.6 TB external HDD (bulk storage only) |
+| Guests | VMs: opnsense (8 GiB), homeassistant (4 GiB). LXC: samba, plex, arrstack, traefik, headscale, remindme, agentos |
+
+Option: a Fedora VM here with CPU type `host` can run Kata (nested). RAM is the limit: a 12 GiB VM gives roughly
+1-2 active / 4 provisioned agents with these per-agent numbers, each noticeably faster than on BaileyServ
+(NVMe, modern cores), minus the nested-virtualization overhead **[unverified, not measured]**.
+Do not run Kata in an LXC container (shared host kernel, no supported path).

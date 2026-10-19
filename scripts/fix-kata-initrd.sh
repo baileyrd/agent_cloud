@@ -68,7 +68,7 @@ for m in failover net_failover virtio_net; do
         *)     cp -L "$src" "$KO/$m.ko" ;;
     esac
     # "-": an already-loaded module (EEXIST) must not stop the agent.
-    echo "ExecStartPre=-/usr/bin/insmod /usr/lib/kata-net/$m.ko" >> "$dropin"
+    echo "ExecStartPre=-/usr/bin/busybox insmod /usr/lib/kata-net/$m.ko" >> "$dropin"
 done
 echo "load drop-in:"; cat "$dropin"
 

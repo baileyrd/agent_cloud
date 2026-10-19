@@ -38,8 +38,8 @@ Each agent uses its own login (for example a Codex or Claude Code login under th
 user), as Cloudroom core does. Claude Code's login is kept on the agent's workspace
 (`CLAUDE_CONFIG_DIR=/workspace/.claude`) so it survives pause and resume. On the host that
 is `/var/lib/agent-cloud/workspaces/<id>/.claude`, owned by `AC_UID` (default 1000), so a
-host user with that uid can read every agent's login. Use an otherwise unused uid on shared
-hosts. Do not put inference credentials in control-plane
+host user with that uid can read every agent's login. `AC_UID` must equal the image's agent
+uid, so on a shared host rebuild the image with an otherwise unused uid and set `AC_UID` to it. Do not put inference credentials in control-plane
 environment files. A request flow that asks the owner for a secret through a form, not
 chat, is worth building (Cloudroom's `cloud-secrets` skill is a reference).
 

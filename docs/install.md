@@ -175,5 +175,11 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    kernel, so `uname -r` matches. Proof of a VM is the `hypervisor` CPU flag and a fresh uptime, which the
    smoke test checks.
 
+6. **Networked agents** need `sudo dnf install -y containernetworking-plugins` and the LAN-drop rule in
+   [images/agent-shell/README.md](../images/agent-shell/README.md#networking-needed-for-claude-code-to-reach-its-api).
+   That rule is not persistent; re-add it after every reboot. Forwarding and NAT come from the CNI bridge plugin.
+7. **Developing on the host:** Fedora's `cargo` does not include clippy or rustfmt:
+   `sudo dnf install -y clippy rustfmt`.
+
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).

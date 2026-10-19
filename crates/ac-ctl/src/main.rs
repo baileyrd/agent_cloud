@@ -27,6 +27,7 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             workspace_root: cli.workspaces.clone(),
             workspace_owner: Some((cli.uid, cli.uid)),
             network,
+            vc_root: "/run/vc".into(),
             command_timeout: Some(std::time::Duration::from_secs(120)),
             trace: std::env::var_os("AC_TRACE").is_some(),
         },

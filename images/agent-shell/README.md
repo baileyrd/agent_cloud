@@ -29,10 +29,24 @@ sudo ctr -n agents task exec -t --exec-id sh1 a1 bash
 whoami; pwd                                                        # expect: agent, /workspace
 ```
 
-Then run `claude` inside; it prints a login URL to open in your own browser (or export `ANTHROPIC_API_KEY`).
-Logins live in the agent's home, inside the VM, and go away with `destroy`.
+Then run `claude` inside (or in one step: `sudo ctr -n agents task exec --tty --exec-id t2 a1 sh -c 'cd /workspace && claude'`;
+without `--tty` it has no terminal). First run asks for a theme, then "Select login method"; option 1 (Claude
+subscription) prints a login URL to open in your own browser. Or export `ANTHROPIC_API_KEY`.
+Logins live in the agent's home, inside the VM, and go away with `destroy`. Verified with Claude Code 2.1.302:
+the VM reports 3.9 GB total with `default_memory = 4096`, and 1 vCPU by default.
 
-## Networking (needed for Claude Code to reach its API) **[unverified]**
+A create that fails or times out cleans up after itself: it kills the sandbox's QEMU, shim and virtiofsd,
+removes `/run/vc/{vm,sbs}/<id>`, the container, its snapshot and the network. Each create also first removes
+a stale container and snapshot left under its id (the cause of `snapshot <id>: already exists`).
+
+## Networking (needed for Claude Code to reach its API)
+
+Verified on BaileyServ (2026-10-18): eth0 up, DNS resolves, `curl -I https://api.anthropic.com` answers, LAN
+blocked by the rule below. Check an agent with:
+
+```
+sudo ctr -n agents task exec --exec-id t1 a1 sh -c 'cat /proc/net/dev; cat /etc/resolv.conf; getent hosts api.anthropic.com; curl -sS -m 8 -I https://api.anthropic.com | head -3'
+```
 
 Plain `ctr run` containers have no network, and `ctr run --cni` does not work with Kata: it attaches the
 network after the VM has booted, so the guest never gets an interface. With `--network`, `ac-ctl` instead
@@ -59,6 +73,9 @@ sudo nft add chain inet agentfw forward '{ type filter hook forward priority -10
 sudo nft add rule inet agentfw forward iifname "acbr0" ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }' drop
 ```
 
-This is not persistent and not a security boundary yet. Agents on the same bridge can still reach each other,
+This is not persistent: after a reboot it is gone and agents can reach the LAN again (found that way: an
+agent got HTTP 301 from the LAN router until the rule was re-added). Check it before starting agents with
+`sudo nft list table inet agentfw`. The CNI bridge plugin turns on `net.ipv4.ip_forward` and adds the per-agent
+masquerade itself (`ipMasq`), so nothing else is needed for egress. The rule is not a security boundary yet. Agents on the same bridge can still reach each other,
 and firewalld on Fedora Workstation may need adjusting for forwarding. Do not leave agents running unattended
 on this setup.

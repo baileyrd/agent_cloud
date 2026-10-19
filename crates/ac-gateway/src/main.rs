@@ -82,6 +82,7 @@ fn run() -> Result<(), String> {
             workspace_root: data.join("workspaces"),
             workspace_owner: Some((uid, uid)),
             network,
+            vc_root: "/run/vc".into(),
             command_timeout: Some(std::time::Duration::from_secs(120)),
             trace: std::env::var_os("AC_TRACE").is_some(),
         },

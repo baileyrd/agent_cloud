@@ -1,0 +1,12 @@
+#!/usr/sbin/nft -f
+# Keep agents (bridge acbr0) off the LAN until the egress allowlist exists (ADR-007).
+# Idempotent: declaring then deleting the table makes a reload replace it in one transaction.
+table inet agentfw
+delete table inet agentfw
+
+table inet agentfw {
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+		iifname "acbr0" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop
+	}
+}

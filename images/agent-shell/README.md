@@ -65,7 +65,8 @@ On first use `--network` writes two files under the data directory, which you ca
 - `resolv.conf`: public resolvers 1.1.1.1 and 9.9.9.9. A VM cannot use the host's loopback resolver stub.
   Queries go straight out until the egress proxy owns DNS.
 
-Until the egress allowlist exists (ADR-007), keep agents off your LAN with a drop rule for private ranges:
+Until the egress allowlist exists (ADR-007), keep agents off your LAN with a drop rule for private ranges.
+Install it as a boot-time unit ([docs/install.md, Host services](../../docs/install.md#host-services)); by hand it is:
 
 ```
 sudo nft add table inet agentfw
@@ -73,9 +74,8 @@ sudo nft add chain inet agentfw forward '{ type filter hook forward priority -10
 sudo nft add rule inet agentfw forward iifname "acbr0" ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }' drop
 ```
 
-This is not persistent: after a reboot it is gone and agents can reach the LAN again (found that way: an
-agent got HTTP 301 from the LAN router until the rule was re-added). Check it before starting agents with
-`sudo nft list table inet agentfw`. The CNI bridge plugin turns on `net.ipv4.ip_forward` and adds the per-agent
+Added by hand it does not survive a reboot, and agents can then reach the LAN again (that is how it was found:
+an agent got HTTP 301 from the LAN router until the rule was re-added). Check with `sudo nft list table inet agentfw`. The CNI bridge plugin turns on `net.ipv4.ip_forward` and adds the per-agent
 masquerade itself (`ipMasq`), so nothing else is needed for egress. The rule is not a security boundary yet. Agents on the same bridge can still reach each other,
 and firewalld on Fedora Workstation may need adjusting for forwarding. Do not leave agents running unattended
 on this setup.

@@ -175,11 +175,43 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    kernel, so `uname -r` matches. Proof of a VM is the `hypervisor` CPU flag and a fresh uptime, which the
    smoke test checks.
 
-6. **Networked agents** need `sudo dnf install -y containernetworking-plugins` and the LAN-drop rule in
-   [images/agent-shell/README.md](../images/agent-shell/README.md#networking-needed-for-claude-code-to-reach-its-api).
-   That rule is not persistent; re-add it after every reboot. Forwarding and NAT come from the CNI bridge plugin.
+6. **Networked agents** need `sudo dnf install -y containernetworking-plugins` and the LAN-drop rule, installed
+   as a boot-time unit in [Host services](#host-services). Forwarding and NAT come from the CNI bridge plugin.
 7. **Developing on the host:** Fedora's `cargo` does not include clippy or rustfmt:
    `sudo dnf install -y clippy rustfmt`.
+
+## Host services
+
+Unit files and the rule live in [`deploy/`](../deploy). Install from the repo root.
+
+**LAN-drop rule** (`ac-agentfw.service`): drops anything from the agent bridge `acbr0` to 10/8, 172.16/12,
+192.168/16, 169.254/16 and 100.64/10 (the tailnet). It loads before containerd. It has no `ExecStop`, so
+stopping the unit leaves the rule in place, and `restart` swaps it in a single transaction.
+
+```bash
+sudo install -D -m 0644 deploy/agentfw.nft /etc/agent-cloud/agentfw.nft
+sudo install -m 0644 deploy/ac-agentfw.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ac-agentfw
+sudo nft list table inet agentfw          # expect the iifname "acbr0" ... drop rule
+```
+
+**Gateway** (`ac-gateway.service`): runs as root and reads its settings from `/etc/agent-cloud/gateway.env`.
+`AC_BIND` must be loopback, RFC 1918 or a tailnet address. The unit strips `AC_ALLOW_PUBLIC_BIND`, so a
+public bind is refused, and `IPAddressDeny`/`IPAddressAllow` drop traffic to or from public addresses as well.
+
+```bash
+cargo build --release -p ac-gateway
+sudo install -m 0755 target/release/ac-gateway /usr/local/bin/
+sudo install -m 0600 deploy/gateway.env /etc/agent-cloud/gateway.env      # edit AC_BIND / AC_IMAGE
+sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /etc/agent-cloud/gateway.token'
+sudo install -m 0644 deploy/ac-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ac-gateway
+TOKEN=$(sudo cat /etc/agent-cloud/gateway.token)
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1
+```
+
+The gateway locks the data directory (`/var/lib/agent-cloud`), so stop it (`sudo systemctl stop ac-gateway`)
+before running `ac-ctl` against the same directory. Stopping the gateway leaves its agents running.
 
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).

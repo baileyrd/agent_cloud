@@ -55,6 +55,7 @@ Details: [docs/architecture.md](docs/architecture.md).
 6. Gateway: `ac-gateway` serves `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
    with a bearer token. Env: `AC_TOKEN_FILE` (mode 0600), `AC_IMAGE`, `AC_BIND` (private addresses
    only; default `127.0.0.1:8780`), `AC_DATA`. Not yet: the agent API (AG-UI) and desktop viewer.
+   systemd units for the gateway and the agent LAN-drop rule: [docs/install.md, Host services](docs/install.md#host-services).
 
 ## Documentation
 

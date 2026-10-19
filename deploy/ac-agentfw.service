@@ -1,0 +1,14 @@
+# Loads deploy/agentfw.nft before containerd starts any agent.
+# No ExecStop: stopping the unit never removes the rule; `restart` replaces it atomically.
+[Unit]
+Description=agent-cloud: drop agent traffic to private networks
+Before=containerd.service ac-gateway.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/agent-cloud/agentfw.nft
+ExecReload=/usr/sbin/nft -f /etc/agent-cloud/agentfw.nft
+
+[Install]
+WantedBy=multi-user.target containerd.service

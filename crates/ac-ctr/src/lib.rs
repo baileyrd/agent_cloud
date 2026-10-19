@@ -463,6 +463,8 @@ impl<S: Spawner> CtrRuntime<S> {
             KATA.to_owned(),
             "--mount".to_owned(),
             workspace,
+            "--hostname".to_owned(),
+            id.to_string(),
         ];
         if let Some(net) = net {
             args.extend([
@@ -649,6 +651,7 @@ mod tests {
         );
         assert!(calls[2].iter().any(|a| a.contains("dst=/workspace")));
         assert!(!calls[2].iter().any(|a| a == "--with-ns"));
+        assert!(calls[2].windows(2).any(|w| w == ["--hostname", "a1"]));
         assert_eq!(calls[2].last().map(String::as_str), Some("a1"));
         assert!(root.join("a1").is_dir());
         let _ = std::fs::remove_dir_all(root);

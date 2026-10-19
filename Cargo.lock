@@ -28,6 +28,15 @@ name = "ac-domain"
 version = "0.1.0"
 
 [[package]]
+name = "ac-egress"
+version = "0.1.0"
+dependencies = [
+ "ac-domain",
+ "platform",
+ "platform-linux",
+]
+
+[[package]]
 name = "ac-fleet"
 version = "0.1.0"
 dependencies = [

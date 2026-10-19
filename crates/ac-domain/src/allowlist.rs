@@ -50,7 +50,9 @@ impl Allowlist {
     }
 }
 
-fn valid_host(h: &str) -> bool {
+/// Whether `h` is a syntactically valid DNS hostname: dot-separated labels of letters, digits
+/// and inner hyphens, at most 63 bytes each and 253 in all. No trailing dot.
+pub fn valid_host(h: &str) -> bool {
     !h.is_empty()
         && h.len() <= 253
         && h.split('.').all(|l| {

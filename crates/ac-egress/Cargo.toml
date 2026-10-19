@@ -1,0 +1,22 @@
+[package]
+name = "ac-egress"
+description = "Allowlist forward proxy: the agents' only route to the internet (ADR-007)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ac_egress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ac-egress"
+path = "src/main.rs"
+
+[dependencies]
+ac-domain = { path = "../ac-domain" }
+platform.workspace = true
+platform-linux.workspace = true
+
+[lints]
+workspace = true

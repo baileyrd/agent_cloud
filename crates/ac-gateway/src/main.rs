@@ -62,7 +62,11 @@ fn run() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("AC_BIND: {e}"))?;
     if !bind::is_private(&addr) && env("AC_ALLOW_PUBLIC_BIND", "") != "1" {
-        return Err(format!("refusing to bind {addr}: not a private address (set AC_ALLOW_PUBLIC_BIND=1 to override)"));
+        return Err(format!(
+            "refusing to bind {addr}: not loopback, RFC 1918 or tailnet. Set AC_BIND to one of \
+             those. (AC_ALLOW_PUBLIC_BIND=1 overrides this when run by hand; ac-gateway.service \
+             unsets it.)"
+        ));
     }
     let data = PathBuf::from(env("AC_DATA", "/var/lib/agent-cloud"));
     let uid: u32 = env("AC_UID", "1000")

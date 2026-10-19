@@ -18,7 +18,7 @@ calls the agents themselves make.
 - A virtual desktop (Xorg dummy display, Xfce, policy-locked Chromium) the agent can drive.
 - A single authenticated WebSocket for watching and taking over the desktop.
 - Persistent workspace volumes, an embedded agent registry and append-only per-agent event history (no database server).
-- Allowlisted egress: agents reach model APIs and Git hosts only.
+- Allowlisted egress: agents reach model APIs and Git hosts only, through `ac-egress` (ADR-007).
 
 ## What this is not
 
@@ -58,7 +58,7 @@ Details: [docs/architecture.md](docs/architecture.md).
 6. Gateway: `ac-gateway` serves `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
    with a bearer token. `DELETE` keeps the workspace; `DELETE ...?purge=true` removes it. Env: `AC_TOKEN_FILE` (mode 0600), `AC_IMAGE`, `AC_BIND` (private addresses
    only; default `127.0.0.1:8780`), `AC_DATA`. Not yet: the agent API (AG-UI) and desktop viewer.
-   systemd units for the gateway and the agent LAN-drop rule: [docs/install.md, Host services](docs/install.md#host-services).
+   systemd units for the gateway, the agent firewall and the egress proxy (`ac-egress`, ADR-007): [docs/install.md, Host services](docs/install.md#host-services).
 
 ## Documentation
 

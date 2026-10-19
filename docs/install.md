@@ -176,8 +176,8 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    kernel, so `uname -r` matches. Proof of a VM is the `hypervisor` CPU flag and a fresh uptime, which the
    smoke test checks.
 
-6. **Networked agents** need `sudo dnf install -y containernetworking-plugins` and the LAN-drop rule, installed
-   as a boot-time unit in [Host services](#host-services). Forwarding and NAT come from the CNI bridge plugin.
+6. **Networked agents** need `sudo dnf install -y containernetworking-plugins`, the agent firewall and the
+   egress proxy, both installed as boot-time units in [Host services](#host-services).
 7. **Developing on the host:** Fedora's `cargo` does not include clippy or rustfmt:
    `sudo dnf install -y clippy rustfmt`.
 
@@ -185,16 +185,40 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
 
 Unit files and the rule live in [`deploy/`](../deploy). Install from the repo root.
 
-**LAN-drop rule** (`ac-agentfw.service`): drops anything from the agent bridge `acbr0` to 10/8, 172.16/12,
-192.168/16, 169.254/16 and 100.64/10 (the tailnet). It loads before containerd. It has no `ExecStop`, so
-stopping the unit leaves the rule in place, and `restart` swaps it in a single transaction.
+**Agent firewall** (`ac-agentfw.service`, ADR-007): from the agent bridge `acbr0`, the host accepts only TCP to
+the egress proxy (10.89.0.1:3128); everything else is rejected, and nothing is forwarded to or from the bridge.
+Private ranges (10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10) are also dropped explicitly. The input chain
+runs before firewalld, whose default zone would also let agents reach host ports 1025-65535. It loads before
+containerd, has no `ExecStop` (stopping the unit leaves the rules in place), and `reload`/`restart` replace the
+table in one transaction, so reloading never duplicates rules.
 
 ```bash
 sudo install -D -m 0644 deploy/agentfw.nft /etc/agent-cloud/agentfw.nft
 sudo install -m 0644 deploy/ac-agentfw.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ac-agentfw
-sudo nft list table inet agentfw          # expect the iifname "acbr0" ... drop rule
+sudo nft list table inet agentfw          # expect input: ... tcp dport 3128 accept, then reject
 ```
+
+**Egress proxy** (`ac-egress.service`, ADR-007): the agents' only way out. It allows hostnames on
+`/etc/agent-cloud/egress-allow.txt` (root, 0600) on ports 443 and 80, resolves them on the host and refuses any
+that resolve to a non-public address. It binds the bridge address, which exists only after the first agent's CNI
+ADD creates `acbr0`, so until then it logs `10.89.0.1 not up yet` and retries every 2 s. That avoids ordering it
+after an agent. The list is re-read when the file changes or on `systemctl reload ac-egress`.
+
+```bash
+cargo build --release -p ac-egress
+sudo install -m 0755 target/release/ac-egress /usr/local/bin/
+sudo install -m 0600 deploy/egress-allow.txt /etc/agent-cloud/egress-allow.txt
+sudo install -m 0644 deploy/ac-egress.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ac-egress
+journalctl -u ac-egress -f                # one line per decision: allow|deny <agent ip> host:port [reason]
+```
+
+Hosts set up before ADR-007 keep the old `cni-agents.json` (NAT on) and `resolv.conf` (public resolvers) under
+`/var/lib/agent-cloud`, since both are written only once. With every agent paused, set `"ipMasq": false` and
+replace `resolv.conf` with a single comment line, then resume. Pausing first matters: a CNI DEL under the new
+config would leave the old masquerade rules behind. Agents pick up the image's proxy variables when they boot
+again (resume or create).
 
 **Gateway** (`ac-gateway.service`): runs as root and reads its settings from `/etc/agent-cloud/gateway.env`.
 `AC_BIND` must be loopback, RFC 1918 or a tailnet address. The unit strips `AC_ALLOW_PUBLIC_BIND`, so a

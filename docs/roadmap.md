@@ -27,7 +27,8 @@
 - [x] Fleet lifecycle and `ctr`/Kata adapter (`ac-fleet`, `ac-ctr`), tested against fakes and on the host
 
 ## M4: Safe to leave running
-- [ ] Egress allowlist proxy and nftables rules
+- [x] Egress allowlist proxy and nftables rules (`ac-egress`, `deploy/agentfw.nft`; ADR-007), verified from an agent
+  2026-10-19
 - [ ] Per-agent CPU, memory and disk limits
 - [ ] Backups with a tested restore
 - [ ] Five-agent load test; update [sizing.md](sizing.md) with real numbers

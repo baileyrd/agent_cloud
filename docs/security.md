@@ -9,7 +9,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 |---|---|
 | Agent escapes to host | Kata microVM (own guest kernel, KVM); no sudo; no containerd socket |
 | Agent reads other agents' data | Separate microVMs and separate workspace volumes |
-| Agent exfiltrates data | Egress allowlist (model APIs, Git hosts only) |
+| Agent exfiltrates data | Egress allowlist proxy (`ac-egress`), firewall makes it the only route; limits destinations, not content (ADR-007) |
 | Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
 | Network attacker reaches the API | Gateway on tailnet only, bearer token, TLS; no public port |
@@ -21,8 +21,11 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] `/dev/kvm` present; every agent runs under the Kata runtime class, never plain runc
 - [ ] SELinux enforcing; denials reviewed instead of disabling it
 - [ ] Gateway reachable only over Tailscale with HTTPS and a bearer token
-- [ ] nftables egress rules: agents reach only the egress proxy
-- [ ] Proxy allowlist limited to the model APIs and Git hosts actually in use
+- [x] nftables egress rules: agents reach only the egress proxy (verified 2026-10-19 from a1:
+  direct connections to the internet, the LAN, 169.254.169.254 and other host ports refused;
+  no DNS)
+- [x] Proxy allowlist limited to the model APIs and Git hosts actually in use (measured
+  2026-10-19: `api.anthropic.com`, `platform.claude.com` for token refresh, GitHub)
 - [ ] Per-agent memory and CPU limits; cap on concurrent builds
 - [ ] Per-agent disk quota on the workspace volume
 - [ ] Secrets in 0600 root-owned files; never in images, repo, prompts or logs
@@ -48,5 +51,8 @@ chat, is worth building (Cloudroom's `cloud-secrets` skill is a reference).
 - A container-in-VM boundary is only as strong as the hypervisor and guest kernel config.
   Keep Kata and the host kernel patched.
 - The command guard only blocks known-bad patterns.
+- Egress control limits destinations, not content: an agent can still send data to an allowed
+  host (a GitHub gist, a model API request). TLS is not inspected, so domain fronting on shared
+  CDN addresses is possible. Agents on the same bridge can reach each other. See ADR-007.
 - Screen streaming exposes whatever the agent's browser shows, including anything a logged-in
   session reveals. Treat viewer access as equivalent to agent access.

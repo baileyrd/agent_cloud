@@ -54,9 +54,38 @@ gateway (most control, most work).
 authenticated WSS. Note it brings its own X server; the dummy-driver Xorg design may be replaced.
 
 ## ADR-007: Egress control
-**Status:** proposed.
-**Decision:** Agents have no direct internet route; all traffic goes through an allowlist
-proxy plus nftables rules on the host.
+**Status:** accepted (2026-10-19; verified on BaileyServ).
+**Decision:** Agents have no direct route anywhere. The only way out is `ac-egress`, an HTTP
+forward proxy on the agent bridge (`10.89.0.1:3128`, never `0.0.0.0`). It serves `CONNECT` and
+plain absolute-URI requests to allowlisted hostnames on ports 443 and 80. nftables
+(`deploy/agentfw.nft`) makes it the only path: from `acbr0` the host accepts only TCP to the
+proxy, and nothing is forwarded to or from the bridge.
+- The proxy checks the allowlist first and only then resolves the name, on the host. Agents
+  get no DNS. Every address in the answer must be public (not private, loopback, link-local,
+  CGNAT/tailnet, multicast, documentation or reserved), and the proxy connects only to those
+  vetted addresses, with no second lookup. IP literals are refused, including disguised forms
+  such as `127.1`.
+- A plain request is forwarded with a `Host` header naming the vetted target, not the client's.
+- The allowlist is a root-owned 0600 file (`/etc/agent-cloud/egress-allow.txt`), re-read on
+  SIGHUP or when it changes; a bad version keeps the previous list. The proxy logs one line per
+  decision (agent IP, host:port, allow or deny and why), never headers or bodies.
+- The bridge has no NAT (`ipMasq: false`), so even without the firewall agents have no working
+  route out.
+- The agent image sets `HTTPS_PROXY` and friends as a convenience. It also turns off Claude
+  Code's telemetry and its claude.ai connectors, which through the agent's login would reach
+  the owner's connected accounts (Gmail, Drive and others). The proxy denies them regardless.
+**Consequences:** Adding a host means editing the allowlist (deny lines in
+`journalctl -u ac-egress` show what is missing). The proxy does not stop:
+- exfiltration to an allowed host: a push to any repo or gist the agent's credentials reach, or
+  data inside model API requests. The allowlist limits where data can go, not what goes there;
+- domain fronting: TLS is not inspected, so inside a tunnel to an allowed name a client can name
+  another site served from the same CDN address. Many CDNs refuse a mismatched SNI and Host,
+  but nothing here enforces it;
+- broad wildcards: `*.githubusercontent.com` admits any public repo's raw files;
+- traffic between agents: they share the bridge at layer 2, which this does not filter.
+DNS tunnelling is closed: agents have no resolver, and the proxy resolves only allowlisted names.
+**Revisit when:** agents need different allowlists, or the gaps above matter enough for SNI
+checks or TLS interception.
 
 ## ADR-008: Reuse rusty_mill crates via a pinned git dependency
 **Status:** accepted.

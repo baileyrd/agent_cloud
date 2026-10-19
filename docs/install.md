@@ -214,5 +214,14 @@ curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a
 The gateway locks the data directory (`/var/lib/agent-cloud`), so stop it (`sudo systemctl stop ac-gateway`)
 before running `ac-ctl` against the same directory. Stopping the gateway leaves its agents running.
 
+**After a host reboot** the registry still records agents as running, but containerd has no task for them.
+The gateway reconciles once at startup and logs each agent it changes
+(`journalctl -u ac-gateway`: `reconcile: a1 had no VM; marked paused`). It also removes what the dead VM left
+behind: Kata processes and state dirs, containerd's task bundle, the netns and the CNI lease. A leftover lease
+would otherwise fail the next start with `duplicate allocation is not allowed`. With the gateway stopped,
+`sudo ac-ctl --image <image> --network reconcile` does the same. Then resume each agent
+(`POST /api/v1/agents/<id>/resume`), which boots a fresh VM on its workspace. Verified by killing a VM's QEMU
+and shim and restarting the gateway (2026-10-19); not yet across a real reboot.
+
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).

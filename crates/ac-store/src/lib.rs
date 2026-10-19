@@ -156,6 +156,20 @@ impl SessionStore for EngineStore {
             .insert(rec)
             .map_err(|e| err("insert agent", format!("{e:?}")))
     }
+
+    fn list(&self) -> Result<Vec<(AgentId, State)>, PortError> {
+        let mut out = Vec::new();
+        for uuid in self.store.all_ids::<AgentRecord>() {
+            let Some(rec) = self.store.get::<AgentRecord>(uuid) else {
+                continue;
+            };
+            let id = AgentId::parse(&rec.slug).map_err(|e| err("list", e))?;
+            let state = from_code(rec.state)
+                .ok_or_else(|| err("decode state", format!("unknown state code {}", rec.state)))?;
+            out.push((id, state));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +215,23 @@ mod tests {
         let s = EngineStore::open(&dir).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.state(&id("a1")).ok().flatten(), Some(State::Paused));
         assert_eq!(s.state(&id("b2")).ok().flatten(), Some(State::Running));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_returns_every_agent_with_its_state() {
+        let dir = tmp();
+        let s = EngineStore::open(&dir).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(s.list().as_deref(), Ok([])));
+        assert!(s.set_state(&id("a1"), State::Running).is_ok());
+        assert!(s.set_state(&id("b2"), State::Paused).is_ok());
+        assert!(s.set_state(&id("a1"), State::Destroyed).is_ok());
+        let mut all = s.list().unwrap_or_else(|e| panic!("{e}"));
+        all.sort_by(|x, y| x.0.as_str().cmp(y.0.as_str()));
+        assert_eq!(
+            all,
+            [(id("a1"), State::Destroyed), (id("b2"), State::Paused)]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

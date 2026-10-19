@@ -49,6 +49,8 @@ Details: [docs/architecture.md](docs/architecture.md).
    `cargo build --release -p ac-ctl`, then
    `sudo target/release/ac-ctl --image agent:latest create a1` (also `pause`, `resume`, `destroy`, `status`).
    `destroy` keeps the workspace (a later `create` of the same id reuses it); `destroy --purge` removes it.
+   `pause` stops the VM and `resume` boots a fresh one on the same workspace. `reconcile` (no agent id) marks
+   agents whose VM vanished, for example after a reboot, as paused; the gateway runs it at startup.
    Defaults: data in `/var/lib/agent-cloud`, containerd namespace `agents`. Verified on one host (Fedora 44, i5-3550):
    create, pause, resume, destroy all worked. A fresh Fedora host needs the fixes in [docs/install.md](docs/install.md#fedora-44-notes-verified-on-baileyserv-i5-3550-2026-10-18).
 5. Run `sudo scripts/m0-smoke.sh` first on a new host: it checks KVM, containerd, Kata and the

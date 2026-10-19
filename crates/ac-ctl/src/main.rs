@@ -1,6 +1,7 @@
 //! `ac-ctl`: drive the agent fleet from the shell.
 //!
 //! Exit codes: 0 ok, 1 operation failed (or `status` of an unknown agent), 2 bad usage.
+//! `reconcile` prints one `<id> paused` line per agent it changed.
 
 mod args;
 
@@ -9,7 +10,7 @@ use std::process::ExitCode;
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_fleet::{Fleet, FleetError};
 use ac_store::EngineStore;
-use args::{Action, Cli, USAGE};
+use args::{Action, Cli, Job, USAGE};
 use platform_linux::LinuxSpawner;
 
 fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
@@ -28,13 +29,24 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             workspace_owner: Some((cli.uid, cli.uid)),
             network,
             vc_root: "/run/vc".into(),
+            task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
             command_timeout: Some(std::time::Duration::from_secs(120)),
             trace: std::env::var_os("AC_TRACE").is_some(),
         },
     );
     let fleet = Fleet::new(runtime, EngineStore::open(&cli.data)?);
-    let id = &cli.id;
-    let state = match cli.action {
+    let (action, id) = match &cli.job {
+        Job::Agent(action, id) => (*action, id),
+        Job::Reconcile => {
+            let changed = fleet.reconcile()?;
+            if changed.is_empty() {
+                return Ok("nothing to reconcile".to_owned());
+            }
+            let lines: Vec<String> = changed.iter().map(|id| format!("{id} paused")).collect();
+            return Ok(lines.join("\n"));
+        }
+    };
+    let state = match action {
         Action::Create => fleet.create(id)?,
         Action::Pause => fleet.pause(id)?,
         Action::Resume => fleet.resume(id)?,

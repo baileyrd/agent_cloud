@@ -7,7 +7,8 @@
 
 ## M1: One agent, by hand
 - [ ] Desktop image: Xorg dummy (or chosen streamer), Xfce, policy-locked Chromium
-- [ ] Shell image: unprivileged user, harness, toolchains
+- [x] Shell image (`images/agent-shell`): unprivileged user, Claude Code, toolchains; its login is kept on
+  `/workspace` and survives pause/resume
 - [x] Start one container under Kata via `ac-ctl` (create/pause/resume/destroy verified with `nginx:alpine`)
 - [ ] Start one real agent image (shell + desktop), open its desktop, run a task end to end
 
@@ -16,11 +17,14 @@
 - [ ] Watch and take over via one authenticated WSS
 
 ## M3: Control plane
-- [ ] Spawner: create, pause, destroy, workspace volume lifecycle
+- [x] Spawner: create, pause (stops the VM), resume, destroy (keeps the workspace) and purge, verified through
+  the gateway on BaileyServ (2026-10-19)
+- [x] Startup reconcile: agents recorded running with no VM become paused and are cleaned up (`ac-ctl reconcile`,
+  run by `ac-gateway` at start); verified after a simulated VM crash, not yet across a real reboot
 - [x] Gateway lifecycle API with bearer auth, private-bind check (`ac-gateway`); TLS via Tailscale still pending
 - [ ] Agent API (AG-UI via `rusty_agui`) and WebSocket viewer proxy
 - [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
-- [x] Fleet lifecycle and `ctr`/Kata adapter against fakes (`ac-fleet`, `ac-ctr`); real-host run pending M0
+- [x] Fleet lifecycle and `ctr`/Kata adapter (`ac-fleet`, `ac-ctr`), tested against fakes and on the host
 
 ## M4: Safe to leave running
 - [ ] Egress allowlist proxy and nftables rules
@@ -30,7 +34,7 @@
 
 ## Later
 - Local model option for an offline posture
-- Snapshot and resume agents
+- Memory snapshots, so pause/resume keeps running processes (today pause stops the VM)
 - Capture the Dots viewer protocol on an unfiltered network
 
 ## Open questions

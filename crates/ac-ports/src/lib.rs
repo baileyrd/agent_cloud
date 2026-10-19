@@ -33,6 +33,8 @@ pub trait Runtime {
     /// Remove the VM, keeping its volume; `purge` removes the volume too. Must succeed when the
     /// VM is already gone, so a destroyed agent's volume can be purged later.
     fn destroy(&self, id: &AgentId, purge: bool) -> Result<(), PortError>;
+    /// Agents whose VM is up: the runtime has a task for them that has not stopped.
+    fn running(&self) -> Result<Vec<AgentId>, PortError>;
 }
 
 /// Durable record of agents and their lifecycle state.
@@ -41,4 +43,6 @@ pub trait SessionStore {
     fn state(&self, id: &AgentId) -> Result<Option<State>, PortError>;
     /// Persist a new state.
     fn set_state(&self, id: &AgentId, state: State) -> Result<(), PortError>;
+    /// Every known agent and its state, in no particular order.
+    fn list(&self) -> Result<Vec<(AgentId, State)>, PortError>;
 }

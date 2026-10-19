@@ -96,6 +96,23 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         self.step(id, Command::Destroy, |r| r.destroy(id, purge))
     }
 
+    /// Bring the registry in line with the runtime after a host reboot or a VM crash: an agent
+    /// recorded `Running` whose VM is gone has what it left behind (network, Kata state) cleaned
+    /// up and becomes `Paused`, so `resume` boots it again on its workspace. Returns those
+    /// agents. Stops at the first failure; running it again is safe.
+    pub fn reconcile(&self) -> Result<Vec<AgentId>, FleetError> {
+        let live = self.runtime.running()?;
+        let mut changed = Vec::new();
+        for (id, state) in self.store.list()? {
+            if state == State::Running && !live.contains(&id) {
+                self.runtime.pause(&id)?;
+                self.persist(&id, state, Command::Pause)?;
+                changed.push(id);
+            }
+        }
+        Ok(changed)
+    }
+
     fn step(
         &self,
         id: &AgentId,
@@ -137,12 +154,18 @@ mod tests {
             self.0.borrow_mut().insert(id.to_string(), s);
             Ok(())
         }
+        fn list(&self) -> Result<Vec<(AgentId, State)>, PortError> {
+            let all = self.0.borrow();
+            Ok(all.iter().map(|(k, s)| (agent(k), *s)).collect())
+        }
     }
 
     #[derive(Default)]
     struct FakeRuntime {
         calls: RefCell<Vec<&'static str>>,
         fail: bool,
+        /// What `running` reports.
+        live: Vec<AgentId>,
     }
 
     impl FakeRuntime {
@@ -171,10 +194,59 @@ mod tests {
         fn destroy(&self, _: &AgentId, purge: bool) -> Result<(), PortError> {
             self.call(if purge { "purge" } else { "destroy" })
         }
+        fn running(&self) -> Result<Vec<AgentId>, PortError> {
+            self.call("running").map(|()| self.live.clone())
+        }
+    }
+
+    fn agent(s: &str) -> AgentId {
+        AgentId::parse(s).unwrap_or_else(|e| panic!("{e}"))
     }
 
     fn id() -> AgentId {
-        AgentId::parse("a1").unwrap_or_else(|e| panic!("{e}"))
+        agent("a1")
+    }
+
+    #[test]
+    fn reconcile_pauses_running_agents_whose_vm_is_gone() {
+        let store = FakeStore::default();
+        for (name, state) in [
+            ("up", State::Running),
+            ("gone", State::Running),
+            ("asleep", State::Paused),
+            ("dead", State::Destroyed),
+            ("half", State::Creating),
+        ] {
+            let _ = store.set_state(&agent(name), state);
+        }
+        let rt = FakeRuntime {
+            live: vec![agent("up")],
+            ..Default::default()
+        };
+        let fleet = Fleet::new(&rt, store);
+        let changed = fleet.reconcile().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(changed, [agent("gone")]);
+        assert_eq!(*rt.calls.borrow(), ["running", "pause"]);
+        let state = |n| fleet.state(&agent(n)).ok().flatten();
+        assert_eq!(state("gone"), Some(State::Paused));
+        assert_eq!(state("up"), Some(State::Running));
+        assert_eq!(state("half"), Some(State::Creating));
+        // Nothing left to do the second time; the agent can be resumed.
+        assert!(matches!(fleet.reconcile().as_deref(), Ok([])));
+        assert!(matches!(fleet.resume(&agent("gone")), Ok(State::Running)));
+    }
+
+    #[test]
+    fn reconcile_failure_leaves_the_record_running() {
+        let store = FakeStore::default();
+        let _ = store.set_state(&id(), State::Running);
+        let rt = FakeRuntime {
+            fail: true,
+            ..Default::default()
+        };
+        let fleet = Fleet::new(&rt, store);
+        assert!(matches!(fleet.reconcile(), Err(FleetError::Port(_))));
+        assert_eq!(fleet.state(&id()).ok().flatten(), Some(State::Running));
     }
 
     #[test]

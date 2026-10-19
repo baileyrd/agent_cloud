@@ -5,6 +5,10 @@
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
 //! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check.
+//!
+//! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
+//! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
+//! logged and the gateway serves anyway.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -87,12 +91,22 @@ fn run() -> Result<(), String> {
             workspace_owner: Some((uid, uid)),
             network,
             vc_root: "/run/vc".into(),
+            task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
             command_timeout: Some(std::time::Duration::from_secs(120)),
             trace: std::env::var_os("AC_TRACE").is_some(),
         },
     );
     let store = EngineStore::open(&data).map_err(|e| e.to_string())?;
-    let api = Api::new(Fleet::new(runtime, store), &token).ok_or("token file is empty")?;
+    let fleet = Fleet::new(runtime, store);
+    match fleet.reconcile() {
+        Ok(changed) => {
+            for id in changed {
+                eprintln!("ac-gateway: reconcile: {id} had no VM; marked paused");
+            }
+        }
+        Err(e) => eprintln!("ac-gateway: reconcile: {e}"),
+    }
+    let api = Api::new(fleet, &token).ok_or("token file is empty")?;
     let server = Server::bind(addr, Http(api)).map_err(|e| format!("bind {addr}: {e}"))?;
     eprintln!("ac-gateway listening on {addr}");
     server.run().map_err(|e| e.to_string())

@@ -163,6 +163,9 @@ mod tests {
             self.0.borrow_mut().insert(id.to_string(), s);
             Ok(())
         }
+        fn list(&self) -> Result<Vec<(AgentId, State)>, PortError> {
+            Ok(Vec::new())
+        }
     }
 
     struct Rt {
@@ -191,6 +194,9 @@ mod tests {
         }
         fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {
             self.go()
+        }
+        fn running(&self) -> Result<Vec<AgentId>, PortError> {
+            self.go().map(|()| Vec::new())
         }
     }
 

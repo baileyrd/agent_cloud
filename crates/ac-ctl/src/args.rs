@@ -8,7 +8,9 @@ use ac_domain::{AgentId, IdError};
 /// Usage text.
 pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces DIR] [--ctr PATH] \
 [--namespace NS] [--uid N] [--network] [--purge] <create|pause|resume|destroy|status> <agent-id>
-  destroy keeps the agent's workspace; destroy --purge removes it (also after a plain destroy).";
+       ac-ctl --image IMAGE [...] [--network] reconcile
+  destroy keeps the agent's workspace; destroy --purge removes it (also after a plain destroy).
+  reconcile marks agents recorded running but with no VM (after a reboot) paused, for resume.";
 
 /// What to do to the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,15 @@ pub enum Action {
     Status,
 }
 
+/// What the command line asks for.
+#[derive(Debug)]
+pub enum Job {
+    /// Act on one agent.
+    Agent(Action, AgentId),
+    /// Bring the registry in line with containerd.
+    Reconcile,
+}
+
 /// Parsed command line.
 #[derive(Debug)]
 pub struct Cli {
@@ -45,10 +56,8 @@ pub struct Cli {
     pub uid: u32,
     /// Attach agents to the CNI network.
     pub network: bool,
-    /// Requested action.
-    pub action: Action,
-    /// Target agent.
-    pub id: AgentId,
+    /// What to do.
+    pub job: Job,
 }
 
 /// Why parsing failed.
@@ -69,7 +78,7 @@ pub enum ArgError {
     /// `--uid` was not a number.
     BadUid(String),
     /// `--purge` given with an action other than `destroy`.
-    PurgeWithout(Action),
+    PurgeWithout(String),
 }
 
 impl fmt::Display for ArgError {
@@ -82,7 +91,7 @@ impl fmt::Display for ArgError {
             Self::Extra(a) => write!(f, "unexpected argument {a}"),
             Self::BadId(e) => e.fmt(f),
             Self::BadUid(v) => write!(f, "--uid must be a number, got {v}"),
-            Self::PurgeWithout(a) => write!(f, "--purge only applies to destroy, not {a:?}"),
+            Self::PurgeWithout(a) => write!(f, "--purge only applies to destroy, not {a}"),
         }
     }
 }
@@ -129,16 +138,21 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
         }
     }
     let mut pos = positional.into_iter();
-    let action = match (
-        action(&pos.next().ok_or(ArgError::Missing("action"))?)?,
-        purge,
-    ) {
-        (Action::Destroy { .. }, true) => Action::Destroy { purge: true },
-        (other, true) => return Err(ArgError::PurgeWithout(other)),
-        (other, false) => other,
+    let word = pos.next().ok_or(ArgError::Missing("action"))?;
+    let job = if word == "reconcile" {
+        Job::Reconcile
+    } else {
+        let action = match action(&word)? {
+            Action::Destroy { .. } => Action::Destroy { purge },
+            other => other,
+        };
+        let id = AgentId::parse(&pos.next().ok_or(ArgError::Missing("agent id"))?)
+            .map_err(ArgError::BadId)?;
+        Job::Agent(action, id)
     };
-    let id = AgentId::parse(&pos.next().ok_or(ArgError::Missing("agent id"))?)
-        .map_err(ArgError::BadId)?;
+    if purge && !matches!(job, Job::Agent(Action::Destroy { .. }, _)) {
+        return Err(ArgError::PurgeWithout(word));
+    }
     if let Some(extra) = pos.next() {
         return Err(ArgError::Extra(extra));
     }
@@ -150,8 +164,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
         image: image.ok_or(ArgError::Missing("--image"))?,
         uid,
         network,
-        action,
-        id,
+        job,
     })
 }
 
@@ -166,8 +179,7 @@ mod tests {
     #[test]
     fn parses_with_defaults() {
         let cli = p("--image agent:1 create a1").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(cli.action, Action::Create);
-        assert_eq!(cli.id.as_str(), "a1");
+        assert!(matches!(&cli.job, Job::Agent(Action::Create, id) if id.as_str() == "a1"));
         assert_eq!(
             cli.workspaces,
             PathBuf::from("/var/lib/agent-cloud/workspaces")
@@ -192,13 +204,31 @@ mod tests {
 
     #[test]
     fn purge_only_with_destroy() {
-        let cli = p("--image i destroy a1").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(cli.action, Action::Destroy { purge: false });
-        let cli = p("--image i --purge destroy a1").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(cli.action, Action::Destroy { purge: true });
+        let action = |s| match p(s).map(|c| c.job) {
+            Ok(Job::Agent(a, _)) => Some(a),
+            _ => None,
+        };
+        assert_eq!(
+            action("--image i destroy a1"),
+            Some(Action::Destroy { purge: false })
+        );
+        assert_eq!(
+            action("--image i --purge destroy a1"),
+            Some(Action::Destroy { purge: true })
+        );
+        for bad in ["pause a1", "reconcile"] {
+            let r = p(&format!("--image i --purge {bad}"));
+            assert!(matches!(r, Err(ArgError::PurgeWithout(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn reconcile_takes_no_agent_id() {
+        let cli = p("--image i --network reconcile").unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(cli.job, Job::Reconcile) && cli.network);
         assert!(matches!(
-            p("--image i --purge pause a1"),
-            Err(ArgError::PurgeWithout(Action::Pause))
+            p("--image i reconcile a1"),
+            Err(ArgError::Extra(_))
         ));
     }
 

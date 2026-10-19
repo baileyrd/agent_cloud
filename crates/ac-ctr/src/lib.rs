@@ -251,56 +251,87 @@ impl<S: Spawner> CtrRuntime<S> {
     }
 
     /// Create the agent's namespace and attach it. Undoes itself on failure.
-    fn network_up(&self, net: &Network, id: &AgentId) -> Result<(), PortError> {
-        self.netns_cmd("create", "add", net, id)?;
-        self.cni("create", net, "ADD", id)
-            .map_err(|e| with_cleanup(e, self.network_down(net, id)))
+    fn network_up(&self, op: &'static str, net: &Network, id: &AgentId) -> Result<(), PortError> {
+        self.netns_cmd(op, "add", net, id)?;
+        self.cni(op, net, "ADD", id)
+            .map_err(|e| with_cleanup(e, self.network_down(op, net, id)))
     }
 
     /// Detach and remove the agent's namespace. No namespace means nothing to do.
-    fn network_down(&self, net: &Network, id: &AgentId) -> Result<(), PortError> {
+    fn network_down(&self, op: &'static str, net: &Network, id: &AgentId) -> Result<(), PortError> {
         if !net.netns(id).exists() {
             return Ok(());
         }
-        self.cni("destroy", net, "DEL", id)?;
-        self.netns_cmd("destroy", "del", net, id)
+        self.cni(op, net, "DEL", id)?;
+        self.netns_cmd(op, "del", net, id)
     }
 
     /// Remove what an earlier failed run left under this id: its container and snapshot.
-    fn remove_stale(&self, id: &AgentId) -> Result<(), PortError> {
-        self.ctr_gone_ok("create", &os(&["container", "delete", id.as_str()]))?;
-        self.ctr_gone_ok("create", &os(&["snapshots", "rm", id.as_str()]))
+    fn remove_stale(&self, op: &'static str, id: &AgentId) -> Result<(), PortError> {
+        self.ctr_gone_ok(op, &os(&["container", "delete", id.as_str()]))?;
+        self.ctr_gone_ok(op, &os(&["snapshots", "rm", id.as_str()]))
     }
 
-    /// Kill the Kata processes of a sandbox that never came up and remove its state dirs.
-    fn kill_sandbox(&self, id: &AgentId) -> Result<(), PortError> {
+    /// Kill a sandbox's leftover Kata processes and remove its state dirs.
+    fn kill_sandbox(&self, op: &'static str, id: &AgentId) -> Result<(), PortError> {
         for pattern in kata_patterns(id) {
-            self.pkill(&pattern)?;
+            self.pkill(op, &pattern)?;
         }
         for kind in ["vm", "sbs"] {
-            remove_dir_if_present(&self.cfg.vc_root.join(kind).join(id.as_str()))?;
+            remove_dir_if_present(op, &self.cfg.vc_root.join(kind).join(id.as_str()))?;
         }
         Ok(())
     }
 
     /// `pkill -KILL -f <pattern>`; exit 1 (nothing matched) is success.
-    fn pkill(&self, pattern: &str) -> Result<(), PortError> {
+    fn pkill(&self, op: &'static str, pattern: &str) -> Result<(), PortError> {
         let args = os(&["-KILL", "-f", pattern]);
-        match self.exec("create", OsStr::new("pkill"), &args, None)? {
+        match self.exec(op, OsStr::new("pkill"), &args, None)? {
             (ExitStatus::Code(0 | 1), _) => Ok(()),
-            (status, stderr) => Err(failure("create", status, &stderr)),
+            (status, stderr) => Err(failure(op, status, &stderr)),
         }
     }
 
-    /// Undo a create that failed to start: every step runs; the first error is returned.
-    fn undo_create(&self, id: &AgentId, net: Option<&Network>) -> Result<(), PortError> {
+    /// Undo a start that failed: every step runs; the first error is returned.
+    fn undo_start(
+        &self,
+        op: &'static str,
+        id: &AgentId,
+        net: Option<&Network>,
+    ) -> Result<(), PortError> {
         [
-            self.kill_sandbox(id),
-            self.remove_stale(id),
-            net.map_or(Ok(()), |net| self.network_down(net, id)),
+            self.kill_sandbox(op, id),
+            self.remove_stale(op, id),
+            net.map_or(Ok(()), |net| self.network_down(op, net, id)),
         ]
         .into_iter()
         .collect()
+    }
+
+    /// Boot the agent's VM on its existing workspace: clear stale state, attach the network,
+    /// start the container. A failed start undoes itself.
+    fn boot(&self, op: &'static str, id: &AgentId, dir: &Path) -> Result<(), PortError> {
+        self.remove_stale(op, id)?;
+        let net = self.cfg.network.as_ref();
+        if let Some(net) = net {
+            // A namespace left by a VM that died without `pause` would make `ip netns add` fail.
+            self.network_down(op, net, id)?;
+            self.network_up(op, net, id)?;
+        }
+        self.start_container(op, id, dir, net)
+            .map_err(|e| with_cleanup(e, self.undo_start(op, id, net)))
+    }
+
+    /// Stop the VM and remove its container, Kata leftovers and network; the workspace stays.
+    /// Anything already gone counts as done, so this also clears up after a VM that died.
+    fn stop(&self, op: &'static str, id: &AgentId) -> Result<(), PortError> {
+        self.ctr_gone_ok(op, &os(&["task", "delete", "--force", id.as_str()]))?;
+        self.ctr_gone_ok(op, &os(&["container", "delete", id.as_str()]))?;
+        self.kill_sandbox(op, id)?;
+        match &self.cfg.network {
+            Some(net) => self.network_down(op, net, id),
+            None => Ok(()),
+        }
     }
 }
 
@@ -339,10 +370,10 @@ fn kata_patterns(id: &AgentId) -> [String; 3] {
     ]
 }
 
-fn remove_dir_if_present(dir: &Path) -> Result<(), PortError> {
+fn remove_dir_if_present(op: &'static str, dir: &Path) -> Result<(), PortError> {
     match std::fs::remove_dir_all(dir) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(PortError {
-            op: "create",
+            op,
             cause: format!("rm {}: {e}", dir.display()),
         }),
         _ => Ok(()),
@@ -382,30 +413,29 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
                 cause: format!("chown {}: {e}", dir.display()),
             })?;
         }
-        self.remove_stale(id)?;
-        let net = self.cfg.network.as_ref();
-        if let Some(net) = net {
-            self.network_up(net, id)?;
-        }
-        self.start_container(id, &dir, net)
-            .map_err(|e| with_cleanup(e, self.undo_create(id, net)))
+        self.boot("create", id, &dir)
     }
 
+    // Pause stops the VM rather than freezing it (`ctr task pause`): a frozen Kata VM keeps its
+    // memory, and nothing could bring it back after a host reboot. Resume boots a fresh VM.
     fn pause(&self, id: &AgentId) -> Result<(), PortError> {
-        self.ctr("pause", &os(&["task", "pause", id.as_str()]))
+        self.stop("pause", id)
     }
 
     fn resume(&self, id: &AgentId) -> Result<(), PortError> {
-        self.ctr("resume", &os(&["task", "resume", id.as_str()]))
+        let dir = self.workspace(id);
+        if !dir.is_dir() {
+            return Err(PortError {
+                op: "resume",
+                cause: format!("workspace {} is missing", dir.display()),
+            });
+        }
+        self.boot("resume", id, &dir)
     }
 
     fn destroy(&self, id: &AgentId) -> Result<(), PortError> {
         // Already gone counts as done, so destroy can be retried after a crash or reboot.
-        self.ctr_gone_ok("destroy", &os(&["task", "delete", "--force", id.as_str()]))?;
-        self.ctr_gone_ok("destroy", &os(&["container", "delete", id.as_str()]))?;
-        if let Some(net) = &self.cfg.network {
-            self.network_down(net, id)?;
-        }
+        self.stop("destroy", id)?;
         let dir = self.workspace(id);
         std::fs::remove_dir_all(&dir).map_err(|e| PortError {
             op: "destroy",
@@ -417,6 +447,7 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
 impl<S: Spawner> CtrRuntime<S> {
     fn start_container(
         &self,
+        op: &'static str,
         id: &AgentId,
         dir: &Path,
         net: Option<&Network>,
@@ -446,7 +477,7 @@ impl<S: Spawner> CtrRuntime<S> {
         }
         args.extend([self.cfg.image.clone(), id.to_string()]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.ctr("create", &os(&args))
+        self.ctr(op, &os(&args))
     }
 }
 
@@ -702,18 +733,22 @@ mod tests {
         assert_eq!(
             programs(&log),
             [
-                "ctr", "ctr", "ip", "sh", "ctr", "pkill", "pkill", "pkill", "ctr", "ctr", "sh",
-                "ip"
+                "ctr", "ctr", "sh", "ip", "ip", "sh", "ctr", "pkill", "pkill", "pkill", "ctr",
+                "ctr", "sh", "ip"
             ]
         );
         let calls = argv(&log);
-        assert_eq!(calls[5], ["-KILL", "-f", "[s]andbox-a1,"]);
-        assert_eq!(calls[6][2], "[c]ontainerd-shim-kata-v2.* -id a1( |$)");
-        assert_eq!(calls[7][2], "[s]hared/sandboxes/a1/shared");
-        assert_eq!(calls[8][2..], ["container", "delete", "a1"]);
-        assert_eq!(calls[9][2..], ["snapshots", "rm", "a1"]);
-        assert_eq!(env_of(&log, 10, "CNI_COMMAND").as_deref(), Some("DEL"));
-        assert_eq!(calls[11], ["netns", "del", "ac-a1"]);
+        // The namespace the fixture left behind is removed before a fresh one is added.
+        assert_eq!(env_of(&log, 2, "CNI_COMMAND").as_deref(), Some("DEL"));
+        assert_eq!(calls[3], ["netns", "del", "ac-a1"]);
+        assert_eq!(calls[4], ["netns", "add", "ac-a1"]);
+        assert_eq!(calls[7], ["-KILL", "-f", "[s]andbox-a1,"]);
+        assert_eq!(calls[8][2], "[c]ontainerd-shim-kata-v2.* -id a1( |$)");
+        assert_eq!(calls[9][2], "[s]hared/sandboxes/a1/shared");
+        assert_eq!(calls[10][2..], ["container", "delete", "a1"]);
+        assert_eq!(calls[11][2..], ["snapshots", "rm", "a1"]);
+        assert_eq!(env_of(&log, 12, "CNI_COMMAND").as_deref(), Some("DEL"));
+        assert_eq!(calls[13], ["netns", "del", "ac-a1"]);
         assert!(!root.join("vc/vm/a1").exists() && !root.join("vc/sbs/a1").exists());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -738,7 +773,7 @@ mod tests {
         let (rt, log, root) = rt_run_fails(ExitStatus::Code(1), ExitStatus::Code(2));
         let err = rt.create(&id()).err().map(|e| e.cause).unwrap_or_default();
         assert!(err.contains("cleanup also failed"), "{err}");
-        assert_eq!(programs(&log)[5..], ["pkill", "ctr", "ctr", "sh", "ip"]);
+        assert_eq!(programs(&log)[7..], ["pkill", "ctr", "ctr", "sh", "ip"]);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -773,12 +808,45 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_resume_use_task_verbs() {
-        let (rt, log, _) = rt(ExitStatus::Code(0));
-        assert!(rt.pause(&id()).is_ok() && rt.resume(&id()).is_ok());
+    fn pause_stops_the_vm_and_keeps_the_workspace() {
+        let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
+        let _ = std::fs::create_dir_all(root.join("a1"));
+        let _ = std::fs::write(root.join("netns/ac-a1"), "");
+        let _ = std::fs::create_dir_all(root.join("vc/vm/a1"));
+        assert!(rt.pause(&id()).is_ok());
+        assert_eq!(
+            programs(&log),
+            ["ctr", "ctr", "pkill", "pkill", "pkill", "sh", "ip"]
+        );
         let calls = argv(&log);
-        assert_eq!(calls[0][2..], ["task", "pause", "a1"]);
-        assert_eq!(calls[1][2..], ["task", "resume", "a1"]);
+        assert_eq!(calls[0][2..], ["task", "delete", "--force", "a1"]);
+        assert_eq!(calls[1][2..], ["container", "delete", "a1"]);
+        assert_eq!(env_of(&log, 5, "CNI_COMMAND").as_deref(), Some("DEL"));
+        assert!(!root.join("vc/vm/a1").exists());
+        assert!(root.join("a1").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_boots_a_fresh_vm_on_the_kept_workspace() {
+        let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
+        let _ = std::fs::create_dir_all(root.join("a1"));
+        assert!(rt.resume(&id()).is_ok());
+        assert_eq!(programs(&log), ["ctr", "ctr", "ip", "sh", "ctr"]);
+        let run = &argv(&log)[4];
+        assert_eq!(run[2..4], ["run", "-d"]);
+        let src = format!("src={}", root.join("a1").display());
+        assert!(run.iter().any(|a| a.contains(&src)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_without_a_workspace_is_refused_before_any_command() {
+        let (rt, log, root) = rt(ExitStatus::Code(0));
+        let err = rt.resume(&id()).err();
+        assert_eq!(err.map(|e| e.op), Some("resume"));
+        assert!(programs(&log).is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -799,8 +867,11 @@ mod tests {
         let _ = std::fs::create_dir_all(root.join("a1"));
         let _ = std::fs::write(root.join("netns/ac-a1"), "");
         assert!(rt.destroy(&id()).is_ok());
-        assert_eq!(programs(&log), ["ctr", "ctr", "sh", "ip"]);
-        assert_eq!(env_of(&log, 2, "CNI_COMMAND").as_deref(), Some("DEL"));
+        assert_eq!(
+            programs(&log),
+            ["ctr", "ctr", "pkill", "pkill", "pkill", "sh", "ip"]
+        );
+        assert_eq!(env_of(&log, 5, "CNI_COMMAND").as_deref(), Some("DEL"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -809,7 +880,7 @@ mod tests {
         let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
         let _ = std::fs::create_dir_all(root.join("a1"));
         assert!(rt.destroy(&id()).is_ok());
-        assert_eq!(programs(&log), ["ctr", "ctr"]);
+        assert_eq!(programs(&log), ["ctr", "ctr", "pkill", "pkill", "pkill"]);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -818,7 +889,7 @@ mod tests {
         let (mut rt, log, _) = rt(ExitStatus::Code(0));
         rt.cfg.command_timeout = Some(Duration::from_secs(30));
         assert!(rt.pause(&id()).is_ok());
-        assert_eq!(programs(&log), ["timeout"]);
+        assert!(programs(&log).iter().all(|p| p == "timeout"));
         assert_eq!(
             argv(&log)[0],
             [
@@ -828,7 +899,8 @@ mod tests {
                 "-n",
                 "agents",
                 "task",
-                "pause",
+                "delete",
+                "--force",
                 "a1"
             ]
         );

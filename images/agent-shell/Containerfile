@@ -17,7 +17,10 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 # No sudo, no password. The workspace volume is bind-mounted at /workspace and chowned to this uid.
 RUN useradd --uid 1000 --user-group --create-home --home-dir /home/agent --shell /bin/bash agent
 
+# Claude Code keeps .claude.json, its login and sessions in CLAUDE_CONFIG_DIR. On the persistent
+# workspace they survive pause/resume and destroy; the image layer under $HOME does not.
 ENV HOME=/home/agent \
+    CLAUDE_CONFIG_DIR=/workspace/.claude \
     DISABLE_AUTOUPDATER=1
 USER agent
 WORKDIR /workspace

@@ -10,7 +10,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 | Agent escapes to host | Kata microVM (own guest kernel, KVM); no sudo; no containerd socket |
 | Agent reads other agents' data | Separate microVMs and separate workspace volumes |
 | Agent exfiltrates data | Egress allowlist (model APIs, Git hosts only) |
-| Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent user's home |
+| Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
 | Network attacker reaches the API | Gateway on tailnet only, bearer token, TLS; no public port |
 | Runaway agent starves the host | Per-agent CPU/memory caps, disk quotas, concurrent-build limit |
@@ -35,7 +35,11 @@ may execute untrusted code or be steered by prompt injection from web content.
 ## Credentials for model access
 
 Each agent uses its own login (for example a Codex or Claude Code login under the agent
-user), as Cloudroom core does. Do not put inference credentials in control-plane
+user), as Cloudroom core does. Claude Code's login is kept on the agent's workspace
+(`CLAUDE_CONFIG_DIR=/workspace/.claude`) so it survives pause and resume. On the host that
+is `/var/lib/agent-cloud/workspaces/<id>/.claude`, owned by `AC_UID` (default 1000), so a
+host user with that uid can read every agent's login. Use an otherwise unused uid on shared
+hosts. Do not put inference credentials in control-plane
 environment files. A request flow that asks the owner for a secret through a form, not
 chat, is worth building (Cloudroom's `cloud-secrets` skill is a reference).
 

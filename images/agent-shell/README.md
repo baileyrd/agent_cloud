@@ -33,7 +33,10 @@ Then run `claude` inside (or in one step: `sudo ctr -n agents task exec --tty --
 without `--tty` it has no terminal). First run asks for a theme, then "Select login method"; option 1 (Claude
 subscription) prints a login URL to open in your own browser. Or export `ANTHROPIC_API_KEY`.
 `pause` stops the VM (everything running in it ends) and keeps `/workspace`; `resume` boots a fresh VM
-on it, with a new network namespace. Logins live in the agent's home, inside the VM, and go away with `destroy`. Verified with Claude Code 2.1.302:
+on it, with a new network namespace. The image sets `CLAUDE_CONFIG_DIR=/workspace/.claude`, so Claude Code's
+`.claude.json`, login (`.credentials.json`) and sessions live on the workspace volume and survive
+pause/resume (verified on a fresh agent: VM up 0 min after resume, `claude -p` still logged in). Agents
+created from an older image keep them in `/home/agent`, on the image layer, and lose them on pause. Verified with Claude Code 2.1.302:
 the VM reports 3.9 GB total with `default_memory = 4096`, and 1 vCPU by default.
 
 A create that fails or times out cleans up after itself: it kills the sandbox's QEMU, shim and virtiofsd,

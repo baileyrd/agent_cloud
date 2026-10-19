@@ -86,9 +86,14 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         self.step(id, Command::Resume, |r| r.resume(id))
     }
 
-    /// Tear the agent down; its record stays as `Destroyed`.
-    pub fn destroy(&self, id: &AgentId) -> Result<State, FleetError> {
-        self.step(id, Command::Destroy, |r| r.destroy(id))
+    /// Tear the agent down, keeping its workspace; its record stays as `Destroyed`. `purge` also
+    /// removes the workspace, and is allowed on an agent that is already destroyed.
+    pub fn destroy(&self, id: &AgentId, purge: bool) -> Result<State, FleetError> {
+        if purge && self.store.state(id)? == Some(State::Destroyed) {
+            self.runtime.destroy(id, true)?;
+            return Ok(State::Destroyed);
+        }
+        self.step(id, Command::Destroy, |r| r.destroy(id, purge))
     }
 
     fn step(
@@ -163,8 +168,8 @@ mod tests {
         fn resume(&self, _: &AgentId) -> Result<(), PortError> {
             self.call("resume")
         }
-        fn destroy(&self, _: &AgentId) -> Result<(), PortError> {
-            self.call("destroy")
+        fn destroy(&self, _: &AgentId, purge: bool) -> Result<(), PortError> {
+            self.call(if purge { "purge" } else { "destroy" })
         }
     }
 
@@ -179,7 +184,7 @@ mod tests {
         assert!(matches!(fleet.create(&id()), Ok(State::Running)));
         assert!(matches!(fleet.pause(&id()), Ok(State::Paused)));
         assert!(matches!(fleet.resume(&id()), Ok(State::Running)));
-        assert!(matches!(fleet.destroy(&id()), Ok(State::Destroyed)));
+        assert!(matches!(fleet.destroy(&id(), false), Ok(State::Destroyed)));
         assert_eq!(*rt.calls.borrow(), ["create", "pause", "resume", "destroy"]);
     }
 
@@ -223,9 +228,32 @@ mod tests {
         let rt = FakeRuntime::default();
         let fleet = Fleet::new(&rt, FakeStore::default());
         let _ = fleet.create(&id());
-        let _ = fleet.destroy(&id());
+        let _ = fleet.destroy(&id(), false);
         assert!(matches!(fleet.create(&id()), Ok(State::Running)));
         assert_eq!(*rt.calls.borrow(), ["create", "destroy", "create"]);
+    }
+
+    #[test]
+    fn purge_works_live_or_after_destroy_but_not_on_unknown() {
+        let rt = FakeRuntime::default();
+        let fleet = Fleet::new(&rt, FakeStore::default());
+        assert!(matches!(
+            fleet.destroy(&id(), true),
+            Err(FleetError::NotFound(_))
+        ));
+        let _ = fleet.create(&id());
+        assert!(matches!(fleet.destroy(&id(), true), Ok(State::Destroyed)));
+        let _ = fleet.create(&id());
+        let _ = fleet.destroy(&id(), false);
+        assert!(matches!(fleet.destroy(&id(), true), Ok(State::Destroyed)));
+        assert!(matches!(
+            fleet.destroy(&id(), false),
+            Err(FleetError::Illegal(_))
+        ));
+        assert_eq!(
+            *rt.calls.borrow(),
+            ["create", "purge", "create", "destroy", "purge"]
+        );
     }
 
     #[test]

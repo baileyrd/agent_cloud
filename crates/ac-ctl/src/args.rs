@@ -7,7 +7,8 @@ use ac_domain::{AgentId, IdError};
 
 /// Usage text.
 pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces DIR] [--ctr PATH] \
-[--namespace NS] [--uid N] [--network] <create|pause|resume|destroy|status> <agent-id>";
+[--namespace NS] [--uid N] [--network] [--purge] <create|pause|resume|destroy|status> <agent-id>
+  destroy keeps the agent's workspace; destroy --purge removes it (also after a plain destroy).";
 
 /// What to do to the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,8 +19,11 @@ pub enum Action {
     Pause,
     /// Start a paused VM.
     Resume,
-    /// Tear down.
-    Destroy,
+    /// Tear down, keeping the workspace unless `purge`.
+    Destroy {
+        /// Also remove the workspace.
+        purge: bool,
+    },
     /// Print the lifecycle state.
     Status,
 }
@@ -64,6 +68,8 @@ pub enum ArgError {
     BadId(IdError),
     /// `--uid` was not a number.
     BadUid(String),
+    /// `--purge` given with an action other than `destroy`.
+    PurgeWithout(Action),
 }
 
 impl fmt::Display for ArgError {
@@ -76,6 +82,7 @@ impl fmt::Display for ArgError {
             Self::Extra(a) => write!(f, "unexpected argument {a}"),
             Self::BadId(e) => e.fmt(f),
             Self::BadUid(v) => write!(f, "--uid must be a number, got {v}"),
+            Self::PurgeWithout(a) => write!(f, "--purge only applies to destroy, not {a:?}"),
         }
     }
 }
@@ -87,7 +94,7 @@ fn action(word: &str) -> Result<Action, ArgError> {
         "create" => Action::Create,
         "pause" => Action::Pause,
         "resume" => Action::Resume,
-        "destroy" => Action::Destroy,
+        "destroy" => Action::Destroy { purge: false },
         "status" => Action::Status,
         other => return Err(ArgError::UnknownAction(other.to_owned())),
     })
@@ -97,7 +104,7 @@ fn action(word: &str) -> Result<Action, ArgError> {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
     let (mut data, mut workspaces) = (PathBuf::from("/var/lib/agent-cloud"), None::<PathBuf>);
     let (mut ctr, mut namespace, mut image) = ("ctr".to_owned(), "agents".to_owned(), None);
-    let (mut uid, mut network) = (1000u32, false);
+    let (mut uid, mut network, mut purge) = (1000u32, false, false);
     let mut positional = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -117,11 +124,19 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
                 uid = v.parse().map_err(|_| ArgError::BadUid(v))?;
             }
             "--network" => network = true,
+            "--purge" => purge = true,
             _ => return Err(ArgError::UnknownFlag(arg)),
         }
     }
     let mut pos = positional.into_iter();
-    let action = action(&pos.next().ok_or(ArgError::Missing("action"))?)?;
+    let action = match (
+        action(&pos.next().ok_or(ArgError::Missing("action"))?)?,
+        purge,
+    ) {
+        (Action::Destroy { .. }, true) => Action::Destroy { purge: true },
+        (other, true) => return Err(ArgError::PurgeWithout(other)),
+        (other, false) => other,
+    };
     let id = AgentId::parse(&pos.next().ok_or(ArgError::Missing("agent id"))?)
         .map_err(ArgError::BadId)?;
     if let Some(extra) = pos.next() {
@@ -172,6 +187,18 @@ mod tests {
         assert!(matches!(
             p("--image i --uid x status a1"),
             Err(ArgError::BadUid(_))
+        ));
+    }
+
+    #[test]
+    fn purge_only_with_destroy() {
+        let cli = p("--image i destroy a1").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cli.action, Action::Destroy { purge: false });
+        let cli = p("--image i --purge destroy a1").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cli.action, Action::Destroy { purge: true });
+        assert!(matches!(
+            p("--image i --purge pause a1"),
+            Err(ArgError::PurgeWithout(Action::Pause))
         ));
     }
 

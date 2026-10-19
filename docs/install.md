@@ -139,7 +139,8 @@ user, backups.
 
 1. Spawn one agent, send a prompt through the gateway, open the desktop stream, take over the
    mouse, then destroy it.
-2. Confirm the workspace is cleaned up on destroy.
+2. Confirm the workspace survives `DELETE /api/v1/agents/{id}` and is removed by `DELETE ...?purge=true`
+   (checked on BaileyServ 2026-10-19: destroy, re-create, file still there; purge, directory gone).
 3. Confirm a second agent cannot see the first one's files.
 4. Spawn five agents; record RAM and CPU to calibrate [sizing.md](sizing.md).
 

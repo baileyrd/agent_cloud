@@ -433,14 +433,13 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
         self.boot("resume", id, &dir)
     }
 
-    fn destroy(&self, id: &AgentId) -> Result<(), PortError> {
+    fn destroy(&self, id: &AgentId, purge: bool) -> Result<(), PortError> {
         // Already gone counts as done, so destroy can be retried after a crash or reboot.
         self.stop("destroy", id)?;
-        let dir = self.workspace(id);
-        std::fs::remove_dir_all(&dir).map_err(|e| PortError {
-            op: "destroy",
-            cause: format!("rm {}: {e}", dir.display()),
-        })
+        if purge {
+            remove_dir_if_present("destroy", &self.workspace(id))?;
+        }
+        Ok(())
     }
 }
 
@@ -853,10 +852,10 @@ mod tests {
     }
 
     #[test]
-    fn destroy_deletes_task_container_and_volume() {
+    fn purge_deletes_task_container_and_volume() {
         let (rt, log, root) = rt(ExitStatus::Code(0));
         let _ = std::fs::create_dir_all(root.join("a1"));
-        assert!(rt.destroy(&id()).is_ok());
+        assert!(rt.destroy(&id(), true).is_ok());
         let calls = argv(&log);
         assert_eq!(calls[0][2..], ["task", "delete", "--force", "a1"]);
         assert_eq!(calls[1][2..], ["container", "delete", "a1"]);
@@ -865,11 +864,24 @@ mod tests {
     }
 
     #[test]
+    fn destroy_keeps_the_volume_unless_purged() {
+        let (rt, _, root) = rt(ExitStatus::Code(0));
+        let _ = std::fs::create_dir_all(root.join("a1"));
+        assert!(rt.destroy(&id(), false).is_ok());
+        assert!(root.join("a1").is_dir());
+        assert!(rt.destroy(&id(), true).is_ok());
+        assert!(!root.join("a1").exists());
+        // Purging again, with the volume already gone, is still success.
+        assert!(rt.destroy(&id(), true).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn destroy_detaches_the_network_when_the_namespace_exists() {
         let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
         let _ = std::fs::create_dir_all(root.join("a1"));
         let _ = std::fs::write(root.join("netns/ac-a1"), "");
-        assert!(rt.destroy(&id()).is_ok());
+        assert!(rt.destroy(&id(), false).is_ok());
         assert_eq!(
             programs(&log),
             ["ctr", "ctr", "pkill", "pkill", "pkill", "sh", "ip"]
@@ -882,7 +894,7 @@ mod tests {
     fn destroy_skips_network_teardown_when_there_is_no_namespace() {
         let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
         let _ = std::fs::create_dir_all(root.join("a1"));
-        assert!(rt.destroy(&id()).is_ok());
+        assert!(rt.destroy(&id(), false).is_ok());
         assert_eq!(programs(&log), ["ctr", "ctr", "pkill", "pkill", "pkill"]);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -936,7 +948,7 @@ mod tests {
     #[test]
     fn nonzero_exit_is_an_error_and_stops_destroy() {
         let (rt, log, _) = rt(ExitStatus::Code(1));
-        let err = rt.destroy(&id()).err().map(|e| e.op);
+        let err = rt.destroy(&id(), false).err().map(|e| e.op);
         assert_eq!(err, Some("destroy"));
         assert_eq!(argv(&log).len(), 1);
     }

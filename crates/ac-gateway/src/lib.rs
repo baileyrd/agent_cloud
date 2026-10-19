@@ -2,7 +2,8 @@
 //! The HTTP transport lives in `main.rs`, so every route is testable here.
 //!
 //! Routes (all under `/api/v1/agents/{id}`, bearer token required):
-//! `GET` status, `POST` create, `POST .../pause`, `POST .../resume`, `DELETE` destroy.
+//! `GET` status, `POST` create, `POST .../pause`, `POST .../resume`, `DELETE` destroy (keeps the
+//! workspace; `DELETE ...?purge=true` removes it, also for an agent already destroyed).
 
 pub mod bind;
 
@@ -36,12 +37,12 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         })
     }
 
-    /// Handle one request. `target` may carry a query string, which is ignored.
+    /// Handle one request. Of the query string, only `purge` on `DELETE` is read.
     pub fn handle(&self, method: &str, target: &str, authorization: Option<&str>) -> Reply {
         if !self.authorized(authorization) {
             return error(401, "unauthorized");
         }
-        let path = target.split('?').next().unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let Some(rest) = path.strip_prefix(PREFIX) else {
             return error(404, "not found");
         };
@@ -58,7 +59,10 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             ("POST", None) => self.done(&id, self.fleet.create(&id), 201),
             ("POST", Some("pause")) => self.done(&id, self.fleet.pause(&id), 200),
             ("POST", Some("resume")) => self.done(&id, self.fleet.resume(&id), 200),
-            ("DELETE", None) => self.done(&id, self.fleet.destroy(&id), 200),
+            ("DELETE", None) => match purge(query) {
+                Some(purge) => self.done(&id, self.fleet.destroy(&id, purge), 200),
+                None => error(400, "purge must be true or false"),
+            },
             (_, None | Some("pause" | "resume")) => error(405, "method not allowed"),
             _ => error(404, "not found"),
         }
@@ -84,6 +88,18 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             Ok(state) => agent(id, state, ok),
             Err(e) => map_error(&e),
         }
+    }
+}
+
+/// The `purge` query parameter: absent or `false` keeps the workspace. `None` if malformed.
+fn purge(query: &str) -> Option<bool> {
+    match query
+        .split('&')
+        .find(|p| p.split('=').next() == Some("purge"))
+    {
+        None | Some("purge=false") => Some(false),
+        Some("purge=true") => Some(true),
+        Some(_) => None,
     }
 }
 
@@ -173,7 +189,7 @@ mod tests {
         fn resume(&self, _: &AgentId) -> Result<(), PortError> {
             self.go()
         }
-        fn destroy(&self, _: &AgentId) -> Result<(), PortError> {
+        fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {
             self.go()
         }
     }
@@ -207,6 +223,24 @@ mod tests {
             call(&a, "DELETE", "/api/v1/agents/a1").1,
             r#"{"id":"a1","state":"destroyed"}"#
         );
+    }
+
+    #[test]
+    fn delete_purge_parameter() {
+        let a = api(false);
+        let _ = call(&a, "POST", "/api/v1/agents/a1");
+        for bad in ["purge=yes", "purge=", "purge", "x=1&purge=1"] {
+            let r = call(&a, "DELETE", &format!("/api/v1/agents/a1?{bad}"));
+            assert_eq!(r.0, 400, "{bad}");
+        }
+        assert_eq!(call(&a, "DELETE", "/api/v1/agents/a1?purge=false").0, 200);
+        // Already destroyed: a plain destroy is refused, a purge still goes through.
+        assert_eq!(call(&a, "DELETE", "/api/v1/agents/a1").0, 409);
+        assert_eq!(
+            call(&a, "DELETE", "/api/v1/agents/a1?x=1&purge=true"),
+            (200, r#"{"id":"a1","state":"destroyed"}"#.into())
+        );
+        assert_eq!(call(&a, "DELETE", "/api/v1/agents/zz?purge=true").0, 404);
     }
 
     #[test]

@@ -38,7 +38,7 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         Action::Create => fleet.create(id)?,
         Action::Pause => fleet.pause(id)?,
         Action::Resume => fleet.resume(id)?,
-        Action::Destroy => fleet.destroy(id)?,
+        Action::Destroy { purge } => fleet.destroy(id, purge)?,
         Action::Status => fleet
             .state(id)?
             .ok_or_else(|| FleetError::NotFound(id.clone()))?,

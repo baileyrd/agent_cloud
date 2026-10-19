@@ -48,12 +48,13 @@ Details: [docs/architecture.md](docs/architecture.md).
 4. Drive it with the CLI (needs root for containerd):
    `cargo build --release -p ac-ctl`, then
    `sudo target/release/ac-ctl --image agent:latest create a1` (also `pause`, `resume`, `destroy`, `status`).
+   `destroy` keeps the workspace (a later `create` of the same id reuses it); `destroy --purge` removes it.
    Defaults: data in `/var/lib/agent-cloud`, containerd namespace `agents`. Verified on one host (Fedora 44, i5-3550):
    create, pause, resume, destroy all worked. A fresh Fedora host needs the fixes in [docs/install.md](docs/install.md#fedora-44-notes-verified-on-baileyserv-i5-3550-2026-10-18).
 5. Run `sudo scripts/m0-smoke.sh` first on a new host: it checks KVM, containerd, Kata and the
    kernel-differs isolation test (runbook Phases 0-3).
 6. Gateway: `ac-gateway` serves `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
-   with a bearer token. Env: `AC_TOKEN_FILE` (mode 0600), `AC_IMAGE`, `AC_BIND` (private addresses
+   with a bearer token. `DELETE` keeps the workspace; `DELETE ...?purge=true` removes it. Env: `AC_TOKEN_FILE` (mode 0600), `AC_IMAGE`, `AC_BIND` (private addresses
    only; default `127.0.0.1:8780`), `AC_DATA`. Not yet: the agent API (AG-UI) and desktop viewer.
    systemd units for the gateway and the agent LAN-drop rule: [docs/install.md, Host services](docs/install.md#host-services).
 

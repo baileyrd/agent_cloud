@@ -30,8 +30,9 @@ pub trait Runtime {
     fn pause(&self, id: &AgentId) -> Result<(), PortError>;
     /// Start a paused VM.
     fn resume(&self, id: &AgentId) -> Result<(), PortError>;
-    /// Remove the VM and its volume.
-    fn destroy(&self, id: &AgentId) -> Result<(), PortError>;
+    /// Remove the VM, keeping its volume; `purge` removes the volume too. Must succeed when the
+    /// VM is already gone, so a destroyed agent's volume can be purged later.
+    fn destroy(&self, id: &AgentId, purge: bool) -> Result<(), PortError>;
 }
 
 /// Durable record of agents and their lifecycle state.

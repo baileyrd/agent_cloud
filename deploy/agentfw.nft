@@ -1,12 +1,29 @@
 #!/usr/sbin/nft -f
-# Keep agents (bridge acbr0) off the LAN until the egress allowlist exists (ADR-007).
+# Agents (bridge acbr0) reach only the egress proxy on the host (ADR-007): no route to the
+# internet, the LAN or any other host service, and no DNS.
 # Idempotent: declaring then deleting the table makes a reload replace it in one transaction.
+define proxy = 10.89.0.1
+define proxy_port = 3128
+
 table inet agentfw
 delete table inet agentfw
 
 table inet agentfw {
+	# Agent -> host: the proxy port only. Runs before firewalld (priority filter + 10), whose
+	# default zone would also let agents reach host services on ports 1025-65535.
+	chain input {
+		type filter hook input priority -10; policy accept;
+		iifname "acbr0" ct state established,related accept
+		iifname "acbr0" ip daddr $proxy tcp dport $proxy_port accept
+		iifname "acbr0" counter reject with icmpx admin-prohibited
+	}
+
+	# Agent <-> anywhere else: nothing is routed. The private-range drop stays first, so a
+	# mistake in the catch-all can never open the LAN.
 	chain forward {
 		type filter hook forward priority -10; policy accept;
 		iifname "acbr0" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop
+		iifname "acbr0" counter reject with icmpx admin-prohibited
+		oifname "acbr0" counter drop
 	}
 }

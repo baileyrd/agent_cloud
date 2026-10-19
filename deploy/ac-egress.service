@@ -1,0 +1,46 @@
+# The agents' only route out (ADR-007): an allowlist forward proxy on the agent bridge.
+# The bind address (acbr0's gateway) exists only after the first agent's CNI ADD creates the
+# bridge, so ac-egress retries the bind every 2 s instead of being ordered after anything.
+# Runs as root with no capabilities: just enough to read the root-owned 0600 allowlist.
+[Unit]
+Description=agent-cloud egress proxy (allowlist)
+Wants=network-online.target ac-agentfw.service
+After=network-online.target ac-agentfw.service
+
+[Service]
+Environment=AC_EGRESS_BIND=10.89.0.1:3128
+Environment=AC_EGRESS_ALLOW=/etc/agent-cloud/egress-allow.txt
+ExecStart=/usr/local/bin/ac-egress
+ExecReload=/usr/bin/kill -HUP $MAINPID
+Restart=on-failure
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Second line of defence for the public-address check: no private destinations except the
+# agents themselves and the host's resolver stub.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+IPAddressAllow=10.89.0.0/16 127.0.0.53
+
+[Install]
+WantedBy=multi-user.target

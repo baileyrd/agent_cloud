@@ -18,17 +18,21 @@ const KATA: &str = "io.containerd.kata.v2";
 const WORKSPACE_MOUNT: &str = "/workspace";
 const CNI_PATH_ENV: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Public resolvers used for agents until the egress proxy owns DNS (ADR-007).
-const DEFAULT_RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 9.9.9.9\n";
+/// Agents get no DNS: the egress proxy resolves names on the host (ADR-007). With no nameserver
+/// line the guest's resolver asks its own loopback, which fails at once instead of timing out.
+const DEFAULT_RESOLV_CONF: &str =
+    "# No DNS: agents reach the internet only through the egress proxy (ADR-007).\n";
 
-/// Single-plugin CNI config: a NAT bridge, 10.89.0.0/16. Edit the written copy to change it.
+/// Single-plugin CNI config: a bridge, 10.89.0.0/16, without NAT (agents go out only through
+/// the egress proxy on the bridge address, so nothing needs masquerading). Edit the written copy
+/// to change it.
 const DEFAULT_CNI_CONFIG: &str = r#"{
   "cniVersion": "1.0.0",
   "name": "agents",
   "type": "bridge",
   "bridge": "acbr0",
   "isGateway": true,
-  "ipMasq": true,
+  "ipMasq": false,
   "ipam": {
     "type": "host-local",
     "ranges": [[{ "subnet": "10.89.0.0/16" }]],
@@ -44,8 +48,8 @@ pub struct Network {
     pub plugin: PathBuf,
     /// Single-plugin CNI config (JSON) fed to the plugin on stdin.
     pub config: PathBuf,
-    /// Host file bind-mounted read-only as the guest's `/etc/resolv.conf`. A VM cannot use the
-    /// host's loopback resolver stub, so networked agents need one of their own.
+    /// Host file bind-mounted read-only as the guest's `/etc/resolv.conf`. The default has no
+    /// nameserver: agents resolve nothing themselves.
     pub resolv_conf: PathBuf,
     /// Directory holding named network namespaces (`ip netns` uses `/run/netns`).
     pub netns_dir: PathBuf,
@@ -883,9 +887,8 @@ mod tests {
     fn default_network_config_is_written_once() {
         let dir = tmp();
         let net = Network::defaults(&dir).unwrap_or_else(|e| panic!("{e}"));
-        assert!(std::fs::read_to_string(&net.resolv_conf)
-            .unwrap_or_default()
-            .contains("nameserver 1.1.1.1"));
+        let resolv = std::fs::read_to_string(&net.resolv_conf).unwrap_or_default();
+        assert!(resolv.contains("No DNS") && !resolv.contains("nameserver"));
         assert!(std::fs::read_to_string(&net.config)
             .unwrap_or_default()
             .contains("\"bridge\": \"acbr0\""));

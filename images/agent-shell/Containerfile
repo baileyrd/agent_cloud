@@ -22,6 +22,16 @@ RUN useradd --uid 1000 --user-group --create-home --home-dir /home/agent --shell
 ENV HOME=/home/agent \
     CLAUDE_CONFIG_DIR=/workspace/.claude \
     DISABLE_AUTOUPDATER=1
+# Everything goes out through ac-egress on the agent bridge (ADR-007). These variables are a
+# convenience; the host firewall is what stops direct connections. Lowercase too: curl reads only
+# a lowercase http_proxy.
+ENV HTTPS_PROXY=http://10.89.0.1:3128 https_proxy=http://10.89.0.1:3128 \
+    HTTP_PROXY=http://10.89.0.1:3128 http_proxy=http://10.89.0.1:3128 \
+    NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
+# Keep Claude Code to the model API: no telemetry or error reports, and no claude.ai connectors
+# (through the agent's login they would reach the owner's connected Gmail, Drive and so on).
+ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    ENABLE_CLAUDEAI_MCP_SERVERS=false
 USER agent
 WORKDIR /workspace
 

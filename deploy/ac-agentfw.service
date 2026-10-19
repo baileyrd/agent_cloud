@@ -1,7 +1,7 @@
-# Loads deploy/agentfw.nft before containerd starts any agent.
+# Loads deploy/agentfw.nft (agents reach only ac-egress) before containerd starts any agent.
 # No ExecStop: stopping the unit never removes the rule; `restart` replaces it atomically.
 [Unit]
-Description=agent-cloud: drop agent traffic to private networks
+Description=agent-cloud: agents reach only the egress proxy
 Before=containerd.service ac-gateway.service
 
 [Service]

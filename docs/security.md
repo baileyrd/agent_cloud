@@ -8,7 +8,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 | Threat | Mitigation |
 |---|---|
 | Agent escapes to host | Kata microVM (own guest kernel, KVM); no sudo; no containerd socket |
-| Agent reads other agents' data | Separate microVMs and separate workspace volumes |
+| Agent reads other agents' data | Separate microVMs and workspace volumes; no network path between agents |
 | Agent exfiltrates data | Egress allowlist proxy (`ac-egress`), firewall makes it the only route; limits destinations, not content (ADR-007) |
 | Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
@@ -24,6 +24,12 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [x] nftables egress rules: agents reach only the egress proxy (verified 2026-10-19 from a1:
   direct connections to the internet, the LAN, 169.254.169.254 and other host ports refused;
   no DNS)
+- [x] Agents cannot reach each other: a `bridge`-family nft rule drops frames between `acbr0` ports
+  (verified 2026-10-20: a1 reached 0 of a2's 65535 TCP ports, including a live listener; both
+  still reached the proxy)
+- [x] firewalld does not decide the proxy's reachability by accident: `acbr0` is in its own
+  `agents` zone, which accepts only TCP 3128 (verified 2026-10-20 with the default zone's
+  TCP 1025-3388 removed: a1 still reached the proxy, and failed with `acbr0` taken out of the zone)
 - [x] Proxy allowlist limited to the model APIs and Git hosts actually in use (measured
   2026-10-19: `api.anthropic.com`, `platform.claude.com` for token refresh, GitHub)
 - [ ] Per-agent memory and CPU limits; cap on concurrent builds
@@ -53,6 +59,6 @@ chat, is worth building (Cloudroom's `cloud-secrets` skill is a reference).
 - The command guard only blocks known-bad patterns.
 - Egress control limits destinations, not content: an agent can still send data to an allowed
   host (a GitHub gist, a model API request). TLS is not inspected, so domain fronting on shared
-  CDN addresses is possible. Agents on the same bridge can reach each other. See ADR-007.
+  CDN addresses is possible. See ADR-007.
 - Screen streaming exposes whatever the agent's browser shows, including anything a logged-in
   session reveals. Treat viewer access as equivalent to agent access.

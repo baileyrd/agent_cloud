@@ -187,16 +187,25 @@ Unit files and the rule live in [`deploy/`](../deploy). Install from the repo ro
 
 **Agent firewall** (`ac-agentfw.service`, ADR-007): from the agent bridge `acbr0`, the host accepts only TCP to
 the egress proxy (10.89.0.1:3128); everything else is rejected, and nothing is forwarded to or from the bridge.
-Private ranges (10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10) are also dropped explicitly. The input chain
-runs before firewalld, whose default zone would also let agents reach host ports 1025-65535. It loads before
-containerd, has no `ExecStop` (stopping the unit leaves the rules in place), and `reload`/`restart` replace the
-table in one transaction, so reloading never duplicates rules.
+Private ranges (10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10) are also dropped explicitly. A `bridge`
+table drops frames switched between two agents' ports, which the `inet` hooks never see (no `br_netfilter`), so
+agents cannot reach each other. It loads before containerd, has no `ExecStop` (stopping the unit leaves the rules
+in place), and `reload`/`restart` replace both tables in one transaction, so reloading never duplicates rules.
+
+firewalld filters the same packets after these rules, so it must accept the proxy port too. The `agents` zone
+(`deploy/firewalld-agents.xml`) binds `acbr0` and accepts only TCP 3128. firewalld matches the interface by name,
+so the binding applies when the first CNI ADD creates the bridge, with nothing to re-run. Without the zone,
+`acbr0` falls into the default zone, and agents reach the proxy only if that zone happens to allow 3128
+(Fedora Workstation's allows TCP 1025-65535).
 
 ```bash
 sudo install -D -m 0644 deploy/agentfw.nft /etc/agent-cloud/agentfw.nft
 sudo install -m 0644 deploy/ac-agentfw.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ac-agentfw
 sudo nft list table inet agentfw          # expect input: ... tcp dport 3128 accept, then reject
+sudo nft list table bridge agentfw        # expect forward: meta ibrname "acbr0" ... drop
+sudo install -m 0644 deploy/firewalld-agents.xml /etc/firewalld/zones/agents.xml
+sudo firewall-cmd --reload && sudo firewall-cmd --zone=agents --list-all   # interfaces: acbr0, ports: 3128/tcp
 ```
 
 **Egress proxy** (`ac-egress.service`, ADR-007): the agents' only way out. It allows hostnames on

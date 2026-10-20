@@ -54,12 +54,20 @@ gateway (most control, most work).
 authenticated WSS. Note it brings its own X server; the dummy-driver Xorg design may be replaced.
 
 ## ADR-007: Egress control
-**Status:** accepted (2026-10-19; verified on BaileyServ).
+**Status:** accepted (2026-10-19; verified on BaileyServ; agent isolation and the firewalld zone
+added 2026-10-20).
 **Decision:** Agents have no direct route anywhere. The only way out is `ac-egress`, an HTTP
 forward proxy on the agent bridge (`10.89.0.1:3128`, never `0.0.0.0`). It serves `CONNECT` and
 plain absolute-URI requests to allowlisted hostnames on ports 443 and 80. nftables
 (`deploy/agentfw.nft`) makes it the only path: from `acbr0` the host accepts only TCP to the
 proxy, and nothing is forwarded to or from the bridge.
+- Agents cannot reach each other. Frames between two bridge ports never reach the `inet` hooks
+  (no `br_netfilter`), so a `bridge`-family rule drops every frame forwarded within `acbr0`. Host
+  traffic is delivered locally, not forwarded, so the proxy is unaffected. (The CNI bridge
+  plugin's `portIsolation` would also work, but `cni-agents.json` is written once per host.)
+- firewalld evaluates the same packets after `agentfw`, so an `accept` there is not enough. The
+  `agents` zone (`deploy/firewalld-agents.xml`) binds `acbr0` by name and accepts only TCP 3128.
+  Before it, the proxy was reachable only because the default zone allowed TCP 1025-3388.
 - The proxy checks the allowlist first and only then resolves the name, on the host. Agents
   get no DNS. Every address in the answer must be public (not private, loopback, link-local,
   CGNAT/tailnet, multicast, documentation or reserved), and the proxy connects only to those
@@ -81,8 +89,7 @@ proxy, and nothing is forwarded to or from the bridge.
 - domain fronting: TLS is not inspected, so inside a tunnel to an allowed name a client can name
   another site served from the same CDN address. Many CDNs refuse a mismatched SNI and Host,
   but nothing here enforces it;
-- broad wildcards: `*.githubusercontent.com` admits any public repo's raw files;
-- traffic between agents: they share the bridge at layer 2, which this does not filter.
+- broad wildcards: `*.githubusercontent.com` admits any public repo's raw files.
 DNS tunnelling is closed: agents have no resolver, and the proxy resolves only allowlisted names.
 **Revisit when:** agents need different allowlists, or the gaps above matter enough for SNI
 checks or TLS interception.

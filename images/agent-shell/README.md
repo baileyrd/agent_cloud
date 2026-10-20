@@ -87,5 +87,5 @@ On first use `--network` writes two files under the data directory, which you ca
 
 The firewall (`deploy/agentfw.nft`) and the proxy run as boot-time units
 ([docs/install.md, Host services](../../docs/install.md#host-services)). Check the rules with
-`sudo nft list table inet agentfw`. They are not a complete boundary: agents on the same bridge can still reach
-each other, and an agent can send data to any allowed host (see ADR-007).
+`sudo nft list table inet agentfw` and `sudo nft list table bridge agentfw` (agents cannot reach each other).
+They are not a complete boundary: an agent can send data to any allowed host (see ADR-007).

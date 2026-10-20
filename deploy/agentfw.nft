@@ -1,7 +1,7 @@
 #!/usr/sbin/nft -f
 # Agents (bridge acbr0) reach only the egress proxy on the host (ADR-007): no route to the
-# internet, the LAN or any other host service, and no DNS.
-# Idempotent: declaring then deleting the table makes a reload replace it in one transaction.
+# internet, the LAN, any other host service or each other, and no DNS.
+# Idempotent: declaring then deleting each table makes a reload replace it in one transaction.
 define proxy = 10.89.0.1
 define proxy_port = 3128
 
@@ -9,8 +9,8 @@ table inet agentfw
 delete table inet agentfw
 
 table inet agentfw {
-	# Agent -> host: the proxy port only. Runs before firewalld (priority filter + 10), whose
-	# default zone would also let agents reach host services on ports 1025-65535.
+	# Agent -> host: the proxy port only. firewalld (priority filter + 10) sees the packet too:
+	# its `agents` zone (deploy/firewalld-agents.xml) must also accept TCP 3128 from acbr0.
 	chain input {
 		type filter hook input priority -10; policy accept;
 		iifname "acbr0" ct state established,related accept
@@ -25,5 +25,18 @@ table inet agentfw {
 		iifname "acbr0" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop
 		iifname "acbr0" counter reject with icmpx admin-prohibited
 		oifname "acbr0" counter drop
+	}
+}
+
+# Agent <-> agent: frames switched between two acbr0 ports never reach the inet hooks above
+# (br_netfilter is not loaded), so drop them at the bridge layer. Agent <-> host frames are
+# delivered locally (bridge input/output), not forwarded, so the proxy is unaffected.
+table bridge agentfw
+delete table bridge agentfw
+
+table bridge agentfw {
+	chain forward {
+		type filter hook forward priority 0; policy accept;
+		meta ibrname "acbr0" counter drop
 	}
 }

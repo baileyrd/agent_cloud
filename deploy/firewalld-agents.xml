@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- /etc/firewalld/zones/agents.xml: the agent bridge (ADR-007) accepts only TCP 3128 (ac-egress).
+     The binding applies when acbr0 appears (first CNI ADD), so nothing has to re-run then.
+     The default target rejects the rest; icmp-block-inversion with no blocks rejects all ICMP. -->
+<zone>
+  <short>agents</short>
+  <description>agent-cloud bridge acbr0: the egress proxy port only.</description>
+  <interface name="acbr0"/>
+  <port protocol="tcp" port="3128"/>
+  <icmp-block-inversion/>
+</zone>

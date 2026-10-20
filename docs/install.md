@@ -254,7 +254,9 @@ behind: Kata processes and state dirs, containerd's task bundle, the netns and t
 would otherwise fail the next start with `duplicate allocation is not allowed`. With the gateway stopped,
 `sudo ac-ctl --image <image> --network reconcile` does the same. Then resume each agent
 (`POST /api/v1/agents/<id>/resume`), which boots a fresh VM on its workspace. Verified by killing a VM's QEMU
-and shim and restarting the gateway (2026-10-19); not yet across a real reboot.
+and shim and restarting the gateway (2026-10-19). A real reboot with every agent already paused passed
+`scripts/post-reboot-check.sh` (2026-10-20): firewall, `agents` zone and proxy came up, and a1 resumed. Reconciling
+an agent that was running when the host went down is still untested across a real reboot.
 
 **Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the

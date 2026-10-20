@@ -55,7 +55,8 @@ Details: [docs/architecture.md](docs/architecture.md).
    create, pause, resume, destroy all worked. A fresh Fedora host needs the fixes in [docs/install.md](docs/install.md#fedora-44-notes-verified-on-baileyserv-i5-3550-2026-10-18).
 5. Run `sudo scripts/m0-smoke.sh` first on a new host: it checks KVM, containerd, Kata and the
    kernel-differs isolation test (runbook Phases 0-3).
-6. Gateway: `ac-gateway` serves `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
+6. Gateway: `ac-gateway` serves `GET /api/v1/agents` (every agent and its state),
+   `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
    with a bearer token. `DELETE` keeps the workspace; `DELETE ...?purge=true` removes it. Env: `AC_TOKEN_FILE` (mode 0600), `AC_IMAGE`, `AC_BIND` (private addresses
    only; default `127.0.0.1:8780`), `AC_DATA`. Not yet: the agent API (AG-UI) and desktop viewer.
    systemd units for the gateway, the agent firewall and the egress proxy (`ac-egress`, ADR-007): [docs/install.md, Host services](docs/install.md#host-services).

@@ -62,6 +62,13 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         Ok(self.store.state(id)?)
     }
 
+    /// Every known agent and its state, sorted by id.
+    pub fn list(&self) -> Result<Vec<(AgentId, State)>, FleetError> {
+        let mut all = self.store.list()?;
+        all.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        Ok(all)
+    }
+
     /// Provision a new agent, or re-create a destroyed one. A runtime failure leaves it `Creating`
     /// (retry with `create`, or clear it with `destroy`)
     /// (visible and destroyable) rather than silently forgotten.

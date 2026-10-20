@@ -1,8 +1,8 @@
 //! Sans-IO gateway logic: auth, routing and error mapping over a [`Fleet`].
 //! The HTTP transport lives in `main.rs`, so every route is testable here.
 //!
-//! Routes (all under `/api/v1/agents/{id}`, bearer token required):
-//! `GET` status, `POST` create, `POST .../pause`, `POST .../resume`, `DELETE` destroy (keeps the
+//! Routes (bearer token required): `GET /api/v1/agents` lists every agent and its state. Under
+//! `/api/v1/agents/{id}`: `GET` status, `POST` create, `POST .../pause`, `POST .../resume`, `DELETE` destroy (keeps the
 //! workspace; `DELETE ...?purge=true` removes it, also for an agent already destroyed).
 
 pub mod bind;
@@ -43,6 +43,12 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             return error(401, "unauthorized");
         }
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if path == PREFIX.trim_end_matches('/') {
+            return match method {
+                "GET" => self.list(),
+                _ => error(405, "method not allowed"),
+            };
+        }
         let Some(rest) = path.strip_prefix(PREFIX) else {
             return error(404, "not found");
         };
@@ -83,6 +89,19 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         }
     }
 
+    fn list(&self) -> Reply {
+        match self.fleet.list() {
+            Ok(all) => {
+                let items: Vec<String> = all.iter().map(|(id, s)| record(id, *s)).collect();
+                Reply {
+                    status: 200,
+                    body: format!(r#"{{"agents":[{}]}}"#, items.join(",")),
+                }
+            }
+            Err(e) => map_error(&e),
+        }
+    }
+
     fn done(&self, id: &AgentId, result: Result<State, FleetError>, ok: u16) -> Reply {
         match result {
             Ok(state) => agent(id, state, ok),
@@ -104,11 +123,15 @@ fn purge(query: &str) -> Option<bool> {
 }
 
 fn agent(id: &AgentId, state: State, status: u16) -> Reply {
-    let state = format!("{state:?}").to_lowercase();
     Reply {
         status,
-        body: format!(r#"{{"id":"{id}","state":"{state}"}}"#),
+        body: record(id, state),
     }
+}
+
+fn record(id: &AgentId, state: State) -> String {
+    let state = format!("{state:?}").to_lowercase();
+    format!(r#"{{"id":"{id}","state":"{state}"}}"#)
 }
 
 fn map_error(e: &FleetError) -> Reply {
@@ -164,7 +187,11 @@ mod tests {
             Ok(())
         }
         fn list(&self) -> Result<Vec<(AgentId, State)>, PortError> {
-            Ok(Vec::new())
+            let all = self.0.borrow();
+            Ok(all
+                .iter()
+                .map(|(k, s)| (AgentId::parse(k).unwrap_or_else(|e| panic!("{e}")), *s))
+                .collect())
         }
     }
 
@@ -229,6 +256,24 @@ mod tests {
             call(&a, "DELETE", "/api/v1/agents/a1").1,
             r#"{"id":"a1","state":"destroyed"}"#
         );
+    }
+
+    #[test]
+    fn list_route() {
+        let a = api(false);
+        assert_eq!(
+            call(&a, "GET", "/api/v1/agents"),
+            (200, r#"{"agents":[]}"#.into())
+        );
+        let _ = call(&a, "POST", "/api/v1/agents/b2");
+        let _ = call(&a, "POST", "/api/v1/agents/a1");
+        let _ = call(&a, "POST", "/api/v1/agents/a1/pause");
+        assert_eq!(
+            call(&a, "GET", "/api/v1/agents?x=1").1,
+            r#"{"agents":[{"id":"a1","state":"paused"},{"id":"b2","state":"running"}]}"#
+        );
+        assert_eq!(call(&a, "POST", "/api/v1/agents").0, 405);
+        assert_eq!(a.handle("GET", "/api/v1/agents", None).status, 401);
     }
 
     #[test]

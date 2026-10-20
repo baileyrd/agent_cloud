@@ -247,5 +247,14 @@ would otherwise fail the next start with `duplicate allocation is not allowed`. 
 (`POST /api/v1/agents/<id>/resume`), which boots a fresh VM on its workspace. Verified by killing a VM's QEMU
 and shim and restarting the gateway (2026-10-19); not yet across a real reboot.
 
+**Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on
+any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the
+allowlist's owner and mode, and that the gateway and proxy listen only on private addresses. It checks that
+every agent the gateway lists (`GET /api/v1/agents`) is paused or destroyed and has no netns, Kata processes,
+containerd task or CNI lease left. Then it resumes `a1` through the gateway and, inside it, checks
+`claude auth status`, `claude -p`, the API through the proxy, a denied host (example.com) and an unreachable
+LAN address (192.168.50.1). It pauses `a1` again afterwards (`KEEP_A1=1` leaves it running). It takes about
+30 s.
+
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ac-domain", "crates/ac-ports", "crates/ac-fleet", "crates/ac-ctr", "crates/ac-history", "crates/ac-store", "crates/ac-ctl", "crates/ac-gateway", "crates/ac-egress"]
+members = ["crates/ac-domain", "crates/ac-ports", "crates/ac-fleet", "crates/ac-ctr", "crates/ac-history", "crates/ac-store", "crates/ac-ctl", "crates/ac-gateway", "crates/ac-egress", "crates/ac-viewer"]
 
 [workspace.package]
 version = "0.1.0"

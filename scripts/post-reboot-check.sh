@@ -1,6 +1,7 @@
 #!/bin/sh
 # After a host reboot: the units, firewall and agents came back as expected, and agent a1
-# resumes through the gateway with a working login and egress (ADR-007). Run as root:
+# resumes through the gateway with a working login and egress (ADR-007) and runs a job through
+# the task API (ADR-010). Run as root:
 #   sudo scripts/post-reboot-check.sh
 # Leaves the system as found: if it resumed a1, it pauses it again (KEEP_A1=1 leaves it running).
 set -u
@@ -56,10 +57,10 @@ binds ac-gateway
 val() { sed -n "s/^$1=//p" "$ENV" | tail -n 1; }
 BIND=$(val AC_BIND)
 TOKEN_FILE=$(val AC_TOKEN_FILE)
-# The token goes to curl on stdin, not on its command line.
+# The token goes to curl on stdin, not on its command line. $3: an optional (constant) JSON body.
 api() {
     printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")" |
-        curl -sS -m 180 -H @- -X "$1" "http://$BIND/api/v1/agents$2"
+        curl -sS -m 180 -H @- -X "$1" ${3:+--data-binary "$3"} "http://$BIND/api/v1/agents$2"
 }
 
 list=$(api GET "") || list=
@@ -99,7 +100,7 @@ was=$(echo "$agents" | awk -v id="$AGENT" '$1 == id { print $2 }')
 resumed=
 restore() {
     if [ -n "$resumed" ] && [ "${KEEP_A1:-0}" != 1 ]; then
-        r=$(api POST "/$AGENT/pause")
+        r=$(api POST "/$AGENT/pause?force=true")
         case $r in *'"state":"paused"'*) pass "$AGENT paused again (as found)" ;; *) bad "pause $AGENT: $r" ;; esac
     fi
     resumed=
@@ -159,5 +160,24 @@ case $out in
     *REACHED*) bad "$LAN_HOST reachable: $(echo "$out" | tr '\n' ' ')" ;;
     *) pass "$LAN_HOST unreachable, direct and via the proxy" ;;
 esac
+
+# --- task API: one job end to end ------------------------------------------------------------
+st() { sed -n 's/.*"state":"\([a-z_]*\)".*/\1/p'; }
+r=$(api POST "/$AGENT/jobs" '{"prompt":"reply with exactly the word pong","timeout_secs":180}')
+job=$(printf '%s' "$r" | sed -n 's/.*"job_id":"\([a-z0-9-]*\)".*/\1/p')
+if [ -z "$job" ]; then
+    bad "job submit: ${r:-no answer}"
+else
+    state=$(printf '%s' "$r" | st) i=0
+    while { [ "$state" = queued ] || [ "$state" = running ]; } && [ "$i" -lt 8 ]; do
+        state=$(api GET "/$AGENT/jobs/$job?wait=30" | st)
+        i=$((i + 1))
+    done
+    out=$(api GET "/$AGENT/jobs/$job/output")
+    case "$state:$out" in
+        succeeded:*[Pp]ong*) pass "job $job succeeded: $(echo "$out" | head -n 1 | cut -c1-40)" ;;
+        *) bad "job $job ${state:-?}: $(echo "$out" | head -c 200 | tr '\n' ' ')" ;;
+    esac
+fi
 
 exit "$fail"

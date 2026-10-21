@@ -157,3 +157,72 @@ registry but not unbounded event history ([issue 774](https://github.com/Rusty-M
 inspect command is needed); record layout changes need a schema-tag bump and migration.
 **Revisit when:** a second consumer needs the same segment log (hoist it as its own crate) or the
 registry outgrows RAM.
+
+## ADR-010: Task API (jobs)
+**Status:** proposed (2026-10-21).
+**Context:** A script or another agent should be able to say "run this prompt in agent X" and get a job
+id, live status and the result, without exec-ing into the VM. Everything inside the VM and its workspace
+is writable by the agent, so a prompt-injected agent can tamper with any file it writes there.
+**Decision:** Jobs are part of `ac-gateway`, under `/api/v1/agents/{id}/jobs`, with the same token, Origin
+and bind rules as the rest of the API.
+- *Routes:* `POST .../jobs` `{"prompt", "timeout_secs"?, "idempotency_key"?}` answers 202 with the job;
+  `GET .../jobs` (the agent's retained jobs, newest first); `GET .../jobs/{job}[?wait=N]` (N <= 30 s:
+  long-poll until the state changes); `GET .../jobs/{job}/output` (the final assistant message) and
+  `.../output?part=stream` (the stream-json log), plain text; `POST .../jobs/{job}/cancel`.
+- *States:* `queued`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out`, `interrupted`, as a pure
+  state machine in `ac-domain` (`job.rs`). One running job per agent; up to 8 queue behind it (429 beyond).
+  A job is accepted only while the agent is `running` (409 otherwise; resume is an explicit call).
+- *Trust:* state, timestamps, timeout and exit code live in the host registry (`ac-store`, `jobs.mmap`
+  beside `agents.mmap`, same lock). What the agent writes (the result and the stream log) is untrusted
+  data: capped, served as `text/plain` with `nosniff`, never parsed by the gateway.
+- *Prompt delivery without stdin:* the prompt is kept host-side (`<data>/jobs/<agent>/<job>/prompt.txt`,
+  root, 0700 directories). At start the gateway creates `.job-<job>.prompt` (0600, owned by `AC_UID`) in the
+  root of the agent's workspace with `O_CREAT|O_EXCL`, which never follows a symlink. Everything below the
+  workspace root is agent-controlled, so the gateway (root) never writes, chowns or reads a path inside
+  it; a symlinked `.jobs` would otherwise turn a root write into a write anywhere on the host. A short
+  start exec, running as the agent user in the VM, makes `.jobs/<job>/` (0700), moves the prompt to
+  `prompt.txt`, and opens tmux window `job-<job>` in session `main`. Every exec is an argv array: a
+  constant script plus the job id (gateway-generated, `[a-z0-9]`) and operator settings as positional
+  parameters. The prompt never appears in any argv, host or guest; `claude` reads it on stdin from the file.
+- *Running:* the window runs `claude -p --output-format stream-json --verbose <permission flags>
+  < prompt.txt`, through `head -c 16 MiB` (a job whose log passes that is stopped) and `tee stream.jsonl`,
+  with a readable digest on the terminal, so a human can watch it in the viewer and take over. When
+  `claude` exits, the runner writes `result.txt` (the `result` event, at most 256 KiB) and then
+  `exit_code` (via rename). The execs that start, poll and kill a job exit by themselves and run with
+  stdin `/dev/null`, the probe's path (`exec_once`), so no live exec ever sees stdin EOF.
+- *Supervision:* one gateway thread ticks every second. For a running job it polls a 2 s status exec
+  (window alive, else `exit_code`, else gone) every 2 s; on exit it copies the capped result and the last
+  1 MiB of the log to the host job directory with two more execs, then records the outcome. Output stays
+  readable after the agent is paused.
+- *Timeouts and cancel:* default 30 min, 1 s to 4 h, enforced by the gateway from the registry's start
+  time. Cancel and timeout run a kill exec: it walks the window's process tree (children by parent pid,
+  plus the pane's session), stops every process, kills it, closes the window, and fails unless all of
+  them are gone. The runner also wraps `claude` in `timeout` at the deadline plus 5 min, a backstop for
+  a gateway that is down.
+- *Lifecycle:* pause or destroy of an agent with a queued or running job is 409 unless `?force=true`;
+  then the running job becomes `interrupted` and queued ones `cancelled`. Startup reconcile does the same
+  for agents without a VM. Queued jobs are cancelled, not kept: resuming is an explicit, possibly much
+  later act, and running stale work then would surprise the caller. A gateway restart re-attaches: a job
+  recorded `running` is polled, never started again (and the start exec refuses an existing
+  `.jobs/<job>`). The job is marked `running` before its start exec, so a crash between the two shows up
+  as `failed` ("runner ended without an exit code"), never as a duplicate.
+- *Permissions:* a headless `claude` cannot ask. `AC_JOB_PERMISSION_MODE` (default `acceptEdits`) and
+  `AC_JOB_ALLOWED_TOOLS` (default `Read,Glob,Grep,Edit,Write` and `Bash` patterns for `git
+  status|diff|log|add|commit`, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`) become
+  flags. `bypassPermissions` / `--dangerously-skip-permissions` only with `AC_JOB_UNSAFE=1`.
+- *Limits and retention:* prompt <= 64 KiB; per agent the last 20 finished jobs are kept (registry
+  records and host copies), and the workspace keeps the last 5 `.jobs/<job>` directories, each log at
+  most 16 MiB, so job logs take at most about 85 MiB of a workspace.
+- *Idempotency:* the same `idempotency_key` for the same agent returns the retained job with that key
+  (200) instead of creating one, whatever its prompt or state.
+- *Events:* queued, started, the outcome, cancelled and interrupted go to the agent's `ac-history` log
+  as `job <id> <state>`: ids and states only, timestamps from the log, no prompt or output.
+**Consequences:** jobs run with the agent's own login and permissions; the permission list is a second
+layer and the VM, egress allowlist and isolation are the boundary. A job's outcome is what the agent's
+VM reports: a compromised agent can fake its own job's exit code and result, never another agent's, and
+never the registry's state or times. Output is read through execs, so a wedged agent delays collection
+(the watchdog still recovers it).
+**Not now:** `rusty_agui` (AG-UI events over SSE) fits a later per-job event stream that turns the
+stream-json log into `RUN_STARTED`/`TEXT_MESSAGE_*`/`TOOL_CALL_*`/`RUN_FINISHED`; it does not fit the
+control plane (AG-UI has no queue, job id or re-attach; a run is one request). Long-polling the status
+is enough for now.

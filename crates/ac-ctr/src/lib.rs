@@ -283,10 +283,11 @@ impl<S: Spawner> CtrRuntime<S> {
     /// SIGKILL host `ctr task exec` clients of agent `id`: the gateway's own (`ours_only`) or
     /// every one. SIGKILL is the signal that frees a wedged shim (SIGTERM is forwarded through it).
     pub fn kill_exec_clients(&self, id: &AgentId, ours_only: bool) -> Result<(), PortError> {
-        // The bracket keeps a pattern from matching its own command line.
+        // The bracket keeps a pattern from matching its own command line; no leading dash, or
+        // pkill reads the pattern as an option.
         let pattern = if ours_only {
             format!(
-                "--exec-id [{}]{}-{id}-",
+                "exec-id [{}]{}-{id}-",
                 &VIEW_EXEC_PREFIX[..1],
                 &VIEW_EXEC_PREFIX[1..]
             )
@@ -842,7 +843,7 @@ mod tests {
         assert!(rt.kill_exec_clients(&id(), true).is_ok());
         assert!(rt.kill_exec_clients(&id(), false).is_ok());
         let calls = argv(&log);
-        assert_eq!(calls[0], ["-KILL", "-f", "--exec-id [a]cview-a1-"]);
+        assert_eq!(calls[0], ["-KILL", "-f", "exec-id [a]cview-a1-"]);
         assert_eq!(
             calls[1],
             ["-KILL", "-f", "[t]ask exec --exec-id [^ ]+ a1( |$)"]

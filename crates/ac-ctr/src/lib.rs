@@ -130,6 +130,16 @@ impl<S: Spawner> CtrRuntime<S> {
         Self { spawner, cfg }
     }
 
+    /// The configuration it was built with.
+    pub fn config(&self) -> &CtrConfig {
+        &self.cfg
+    }
+
+    /// The process spawner (tests read a mock's record of spawned commands through it).
+    pub fn spawner(&self) -> &S {
+        &self.spawner
+    }
+
     fn workspace(&self, id: &AgentId) -> PathBuf {
         self.cfg.workspace_root.join(id.as_str())
     }

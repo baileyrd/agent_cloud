@@ -5,11 +5,15 @@
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
 //! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_PROBE_INTERVAL`
-//! (seconds between watchdog probes, default 30; 0 turns the watchdog off).
+//! (seconds between watchdog probes, default 30; 0 turns the watchdog off). Jobs (ADR-010):
+//! `AC_JOB_PERMISSION_MODE` (default `acceptEdits`), `AC_JOB_ALLOWED_TOOLS` (comma-separated,
+//! default [`jobs::DEFAULT_TOOLS`]), `AC_JOB_UNSAFE=1` (`--dangerously-skip-permissions` instead).
 //!
 //! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
 //! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
-//! logged and the gateway serves anyway. It then SIGKILLs `ctr` clients an earlier gateway left
+//! logged and the gateway serves anyway. Jobs of agents that are not running are then ended
+//! (`Jobs::reconcile`); running jobs of running agents are re-attached by the job supervisor,
+//! which ticks every second. It then SIGKILLs `ctr` clients an earlier gateway left
 //! and detaches their tmux control clients in every running agent.
 //!
 //! The watchdog probes each running agent with a 2 s exec. If one does not answer (a wedged
@@ -25,6 +29,7 @@ use std::time::Duration;
 
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_fleet::Fleet;
+use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::viewer::{Hub, Terminal};
 use ac_gateway::web::App;
 use ac_gateway::{bind, Api, Unhealthy};
@@ -32,7 +37,7 @@ use ac_store::EngineStore;
 use platform_linux::LinuxSpawner;
 use rusty_serve::Server;
 
-type Gateway = App<CtrRuntime<LinuxSpawner>, EngineStore>;
+type Gateway = App<CtrRuntime<LinuxSpawner>, Arc<EngineStore>>;
 
 /// Probe every running agent each `interval`; see the module docs.
 fn watchdog(app: &Gateway, hub: &Hub, unhealthy: &Unhealthy, interval: Duration) {
@@ -138,9 +143,14 @@ fn run() -> Result<(), String> {
     let interval: u64 = env("AC_PROBE_INTERVAL", "30")
         .parse()
         .map_err(|e| format!("AC_PROBE_INTERVAL: {e}"))?;
+    let claude = jobs::claude_flags(
+        std::env::var("AC_JOB_PERMISSION_MODE").ok().as_deref(),
+        std::env::var("AC_JOB_ALLOWED_TOOLS").ok().as_deref(),
+        env("AC_JOB_UNSAFE", "") == "1",
+    )?;
     let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
-    let store = EngineStore::open(&data).map_err(|e| e.to_string())?;
-    let fleet = Fleet::new(runtime, store);
+    let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
+    let fleet = Fleet::new(runtime, Arc::clone(&store));
     match fleet.reconcile() {
         Ok(changed) => {
             for id in changed {
@@ -149,11 +159,27 @@ fn run() -> Result<(), String> {
         }
         Err(e) => eprintln!("ac-gateway: reconcile: {e}"),
     }
+    let hub = Hub::new(
+        CtrRuntime::new(LinuxSpawner, cfg.clone()),
+        data.join("history"),
+    );
+    let notes = hub.clone();
+    let jobs = Arc::new(
+        Jobs::new(
+            store.clone(),
+            store,
+            CtrRuntime::new(LinuxSpawner, cfg),
+            data.join("jobs"),
+            claude,
+        )
+        .with_notes(move |id, text| notes.note(id, text)),
+    );
+    jobs.reconcile();
     let unhealthy = Unhealthy::default();
     let api = Api::new(fleet, &token)
         .ok_or("token file is empty")?
-        .with_unhealthy(Arc::clone(&unhealthy));
-    let hub = Hub::new(CtrRuntime::new(LinuxSpawner, cfg), data.join("history"));
+        .with_unhealthy(Arc::clone(&unhealthy))
+        .with_jobs(jobs.clone());
     for id in api.running() {
         let term = hub.terminal();
         let cleared = term
@@ -163,7 +189,11 @@ fn run() -> Result<(), String> {
             eprintln!("ac-gateway: {id}: clearing old viewer clients: {e}");
         }
     }
-    let app = Arc::new(App::new(api, hub.clone()));
+    let app = Arc::new(App::new(api, hub.clone()).with_jobs(Arc::clone(&jobs)));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(1));
+        jobs.tick();
+    });
     if interval > 0 {
         let app = Arc::clone(&app);
         let every = Duration::from_secs(interval);

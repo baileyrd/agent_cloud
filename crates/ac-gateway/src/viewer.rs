@@ -308,6 +308,11 @@ impl Hub {
         self.inner.term.as_ref()
     }
 
+    /// Record an event (a job's state change) in the agent's history log.
+    pub fn note(&self, id: &AgentId, text: &str) {
+        self.inner.recorder.event(id, text);
+    }
+
     /// Answer a viewer route (`None`: not one). The caller has checked the token and Origin.
     pub fn handle(&self, method: &str, target: &str, body: &[u8]) -> Option<Answer> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));

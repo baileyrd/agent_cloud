@@ -57,7 +57,9 @@ dependencies = [
  "ac-viewer",
  "platform",
  "platform-linux",
+ "platform-mock",
  "rusty_http",
+ "rusty_json",
  "rusty_serve",
 ]
 
@@ -239,6 +241,11 @@ dependencies = [
  "rusty_percent",
  "rusty_retry",
 ]
+
+[[package]]
+name = "rusty_json"
+version = "0.1.0"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
 
 [[package]]
 name = "rusty_multimodal_db_engine"

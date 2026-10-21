@@ -3,9 +3,12 @@
 //!
 //! Routes (bearer token required): `GET /api/v1/agents` lists every agent and its state. Under
 //! `/api/v1/agents/{id}`: `GET` status, `POST` create, `POST .../pause`, `POST .../resume`, `DELETE` destroy (keeps the
-//! workspace; `DELETE ...?purge=true` removes it, also for an agent already destroyed).
+//! workspace; `DELETE ...?purge=true` removes it, also for an agent already destroyed). Pause and destroy of
+//! an agent with a queued or running job are refused (409) unless `?force=true`, which interrupts the job
+//! first (ADR-010).
 
 pub mod bind;
+pub mod jobs;
 pub mod viewer;
 pub mod web;
 
@@ -50,11 +53,34 @@ impl Auth {
 /// Agents the watchdog found wedged (by id). Shared with [`Api`], which reports them.
 pub type Unhealthy = Arc<Mutex<HashSet<String>>>;
 
+/// What the lifecycle API asks of an agent's jobs (ADR-010).
+pub trait Busy: Send + Sync {
+    /// Whether the agent has a queued or running job.
+    fn busy(&self, id: &AgentId) -> bool;
+    /// The agent's VM is about to go away: kill its running job and mark it interrupted; cancel the
+    /// queued ones.
+    fn interrupt(&self, id: &AgentId);
+    /// The agent's workspace was purged: forget its jobs.
+    fn forget(&self, id: &AgentId);
+}
+
+/// No task API: nothing is ever busy.
+struct NoJobs;
+
+impl Busy for NoJobs {
+    fn busy(&self, _: &AgentId) -> bool {
+        false
+    }
+    fn interrupt(&self, _: &AgentId) {}
+    fn forget(&self, _: &AgentId) {}
+}
+
 /// The authenticated lifecycle API.
 pub struct Api<R, S> {
     fleet: Fleet<R, S>,
     auth: Auth,
     unhealthy: Unhealthy,
+    jobs: Arc<dyn Busy>,
 }
 
 impl<R: Runtime, S: SessionStore> Api<R, S> {
@@ -64,7 +90,19 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             fleet,
             auth: Auth::new(token)?,
             unhealthy: Unhealthy::default(),
+            jobs: Arc::new(NoJobs),
         })
+    }
+
+    /// Ask `jobs` before pausing or destroying an agent.
+    pub fn with_jobs(mut self, jobs: Arc<dyn Busy>) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
+    /// An agent's lifecycle state, `None` if unknown.
+    pub fn state(&self, id: &AgentId) -> Result<Option<State>, FleetError> {
+        self.fleet.state(id)
     }
 
     /// Report agents in `set` as `"health":"unhealthy"`.
@@ -91,7 +129,8 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             .unwrap_or_default()
     }
 
-    /// Handle one request. Of the query string, only `purge` on `DELETE` is read.
+    /// Handle one request. Of the query string, only `purge` on `DELETE` and `force` on pause and
+    /// `DELETE` are read.
     pub fn handle(&self, method: &str, target: &str, authorization: Option<&str>) -> Reply {
         if !self.auth.check(authorization) {
             return error(401, "unauthorized");
@@ -117,11 +156,21 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         match (method, action) {
             ("GET", None) => self.status(&id),
             ("POST", None) => self.done(&id, self.fleet.create(&id), 201),
-            ("POST", Some("pause")) => self.done(&id, self.fleet.pause(&id), 200),
+            ("POST", Some("pause")) => match flag(query, "force") {
+                Some(force) => self.vacate(&id, force, || self.fleet.pause(&id)),
+                None => error(400, "force must be true or false"),
+            },
             ("POST", Some("resume")) => self.done(&id, self.fleet.resume(&id), 200),
-            ("DELETE", None) => match purge(query) {
-                Some(purge) => self.done(&id, self.fleet.destroy(&id, purge), 200),
-                None => error(400, "purge must be true or false"),
+            ("DELETE", None) => match (flag(query, "purge"), flag(query, "force")) {
+                (Some(purge), Some(force)) => {
+                    let reply = self.vacate(&id, force, || self.fleet.destroy(&id, purge));
+                    if purge && reply.status == 200 {
+                        self.jobs.forget(&id);
+                    }
+                    reply
+                }
+                (None, _) => error(400, "purge must be true or false"),
+                (_, None) => error(400, "force must be true or false"),
             },
             (_, None | Some("pause" | "resume")) => error(405, "method not allowed"),
             _ => error(404, "not found"),
@@ -149,6 +198,26 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         }
     }
 
+    /// Pause or destroy: refused while the agent has a job, unless `force`, which interrupts it
+    /// first, so a job never outlives its VM untracked.
+    fn vacate(
+        &self,
+        id: &AgentId,
+        force: bool,
+        act: impl FnOnce() -> Result<State, FleetError>,
+    ) -> Reply {
+        if self.jobs.busy(id) {
+            if !force {
+                return error(
+                    409,
+                    &format!("agent {id} has a queued or running job; ?force=true interrupts it"),
+                );
+            }
+            self.jobs.interrupt(id);
+        }
+        self.done(id, act(), 200)
+    }
+
     fn done(&self, id: &AgentId, result: Result<State, FleetError>, ok: u16) -> Reply {
         match result {
             Ok(state) => self.agent(id, state, ok),
@@ -157,15 +226,15 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
     }
 }
 
-/// The `purge` query parameter: absent or `false` keeps the workspace. `None` if malformed.
-fn purge(query: &str) -> Option<bool> {
-    match query
-        .split('&')
-        .find(|p| p.split('=').next() == Some("purge"))
-    {
-        None | Some("purge=false") => Some(false),
-        Some("purge=true") => Some(true),
-        Some(_) => None,
+/// A boolean query parameter (`purge`, `force`): absent or `false` is false. `None` if malformed.
+fn flag(query: &str, name: &str) -> Option<bool> {
+    let Some(p) = query.split('&').find(|p| p.split('=').next() == Some(name)) else {
+        return Some(false);
+    };
+    match p.strip_prefix(name) {
+        Some("=false") => Some(false),
+        Some("=true") => Some(true),
+        _ => None,
     }
 }
 
@@ -205,7 +274,7 @@ pub fn error(status: u16, message: &str) -> Reply {
     }
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.chars()
         .flat_map(|c| match c {
             '"' => vec!['\\', '"'],

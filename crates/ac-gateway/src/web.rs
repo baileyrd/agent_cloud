@@ -1,19 +1,29 @@
 //! The whole HTTP surface, in order: the Origin check (every request), the viewer page and its
 //! script and style (no data in them, so no token: a browser cannot send a header when it
-//! navigates), the viewer routes, then the lifecycle API. Everything under `/api` needs the token.
+//! navigates), the viewer routes, the job routes, then the lifecycle API. Everything under `/api`
+//! needs the token.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ac_ports::{Runtime, SessionStore};
 use rusty_http::{HeaderMap, Method, StatusCode};
 use rusty_serve::{Request, Response, SharedHandler};
 
+use crate::jobs::{self, Jobs, Route};
 use crate::viewer::{Answer, Hub};
 use crate::{error, Api, Auth, Reply};
 
 const PAGE: &str = include_str!("../assets/viewer.html");
 const SCRIPT: &str = include_str!("../assets/viewer.js");
 const STYLE: &str = include_str!("../assets/viewer.css");
+
+/// For agent-written text: never sniffed, never rendered as a page.
+const UNTRUSTED: [(&str, &str); 4] = [
+    ("Content-Type", "text/plain; charset=utf-8"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Content-Security-Policy", "default-src 'none'; sandbox"),
+    ("Cache-Control", "no-store"),
+];
 
 /// For the page: nothing but this origin's own script, style and API.
 pub const CSP: &str =
@@ -25,6 +35,7 @@ pub struct App<R, S> {
     api: Mutex<Api<R, S>>,
     auth: Auth,
     hub: Hub,
+    jobs: Option<Arc<Jobs>>,
 }
 
 impl<R: Runtime, S: SessionStore> App<R, S> {
@@ -34,7 +45,14 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             auth: api.auth(),
             api: Mutex::new(api),
             hub,
+            jobs: None,
         }
+    }
+
+    /// Serve the task API too.
+    pub fn with_jobs(mut self, jobs: Arc<Jobs>) -> Self {
+        self.jobs = Some(jobs);
+        self
     }
 
     /// The lifecycle API (for the watchdog).
@@ -64,19 +82,47 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
         match self.hub.handle(method, r.target, r.body) {
             Some(Answer::Json(reply)) => json(reply),
             Some(Answer::Stream(stream)) => Response::stream("application/x-ndjson", stream),
-            Some(Answer::Text(text)) => with(
-                Response::json(StatusCode::OK, text.into_bytes()),
-                &[
-                    ("Content-Type", "text/plain; charset=utf-8"),
-                    ("Cache-Control", "no-store"),
-                ],
-            ),
-            None => {
-                let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
-                json(api.handle(method, r.target, r.authorization))
-            }
+            Some(Answer::Text(text)) => untrusted(text.into_bytes()),
+            None => match jobs::route(method, path) {
+                Some(route) => self.job(route, r),
+                None => {
+                    let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
+                    json(api.handle(method, r.target, r.authorization))
+                }
+            },
         }
     }
+}
+
+impl<R: Runtime, S: SessionStore> App<R, S> {
+    /// A job route. A submit takes the lifecycle lock around the agent's state check and the
+    /// queueing, so a pause cannot slip between them; the others never take it.
+    fn job(&self, route: Result<Route, Reply>, r: &Request<'_>) -> Response {
+        let Some(jobs) = &self.jobs else {
+            return json(error(404, "not found"));
+        };
+        let route = match route {
+            Ok(route) => route,
+            Err(reply) => return json(reply),
+        };
+        if let Route::Submit(id) = &route {
+            let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
+            return json(match api.state(id) {
+                Ok(state) => jobs.submit(id, state, r.body),
+                Err(e) => error(500, &e.to_string()),
+            });
+        }
+        let query = r.target.split_once('?').map_or("", |(_, q)| q);
+        match jobs.handle(route, query) {
+            jobs::Answer::Json(reply) => json(reply),
+            jobs::Answer::Output(bytes) => untrusted(bytes),
+        }
+    }
+}
+
+/// Agent-written bytes as plain text (see [`UNTRUSTED`]).
+fn untrusted(body: Vec<u8>) -> Response {
+    with(Response::json(StatusCode::OK, body), &UNTRUSTED)
 }
 
 /// A browser request from another site is refused. `Origin` (sent on POSTs and cross-origin

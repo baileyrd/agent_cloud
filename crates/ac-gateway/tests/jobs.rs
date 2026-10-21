@@ -78,6 +78,13 @@ impl JobRunner for Fake {
             .push((job.to_string(), prompt.to_vec(), timeout, claude.to_vec()));
         Ok(())
     }
+    /// The marker appears once the test says how the job ended.
+    fn finished(&self, _: &AgentId, job: &JobId) -> bool {
+        self.w()
+            .status
+            .get(job.as_str())
+            .is_some_and(|p| *p != Probe::Running)
+    }
     fn status(&self, _: &AgentId, job: &JobId) -> Result<Probe, String> {
         let mut w = self.w();
         w.statuses += 1;
@@ -190,9 +197,9 @@ impl Rig {
         self.clock.fetch_add(ms, Ordering::SeqCst);
     }
 
-    /// Tick past the poll interval.
+    /// Tick past the least time between marker-prompted probes.
     fn tick(&self) {
-        self.advance(2_500);
+        self.advance(5_000);
         self.jobs.tick();
     }
 }
@@ -900,7 +907,7 @@ fn ctr_status_kill_and_read_parse_strictly() {
         let (rt, log) = ctr(&root, out);
         assert_eq!(rt.status(&a1, &job).map_err(drop), want, "{out:?}");
         let argv = argvs(&log).pop().unwrap_or_default();
-        assert_eq!(argv[..4], ["timeout", "-s", "KILL", "2"], "a 2 s probe");
+        assert_eq!(argv[..4], ["timeout", "-s", "KILL", "10"], "a 10 s probe");
         assert_eq!(argv.last(), Some(&job.to_string()));
     }
     for (out, ok) in [("killed\n", true), ("gone\n", true), ("alive: 12\n", false)] {
@@ -967,4 +974,30 @@ fn permission_flags() {
         jobs::claude_flags(Some("plan"), None, true).ok(),
         Some(vec!["--dangerously-skip-permissions".to_owned()])
     );
+}
+
+#[test]
+fn running_job_is_probed_rarely_until_it_says_it_finished() {
+    let r = rig();
+    let id = r.ok("a1", "long");
+    r.jobs.tick();
+    r.jobs.tick();
+    let first = r.fake.w().statuses;
+    assert_eq!(first, 1, "probed once on the tick after it started");
+    for _ in 0..29 {
+        r.advance(1_000);
+        r.jobs.tick();
+    }
+    assert_eq!(r.fake.w().statuses, first, "no exec for 29 s");
+    r.advance(1_000);
+    r.jobs.tick();
+    assert_eq!(r.fake.w().statuses, first + 1, "then one per 30 s");
+    // The marker brings the next probe forward, after at least 3 s.
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.advance(1_000);
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &id), "running");
+    r.advance(2_000);
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &id), "succeeded");
 }

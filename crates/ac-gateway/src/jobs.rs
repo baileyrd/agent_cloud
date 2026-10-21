@@ -44,8 +44,14 @@ pub const MAX_WAITERS: usize = 8;
 pub const RESULT_CAP: usize = 256 * 1024;
 /// What is kept of a job's stream log (its end).
 pub const STREAM_CAP: usize = 1024 * 1024;
-/// How often a running job is polled.
-const POLL: Duration = Duration::from_secs(2);
+/// How often a running job is probed with an exec when it has not said it finished. Execs are
+/// kept rare and unhurried: a `ctr` exec SIGKILLed at a short budget while the host was loaded
+/// left a1's shim wedged (2026-10-21, a 2 s status poll every 2 s).
+const PROBE: Duration = Duration::from_secs(30);
+/// Least time between status execs prompted by the finished marker.
+const MARKER_RETRY: Duration = Duration::from_secs(3);
+/// Budget of a status exec.
+const STATUS_LIMIT: Duration = Duration::from_secs(10);
 /// Added to the job's timeout for the runner's own `timeout`, a backstop for a stopped gateway.
 const BACKSTOP_SECS: u32 = 300;
 
@@ -68,11 +74,13 @@ mkdir -p -m 700 .jobs
 mkdir -m 700 ".jobs/$id"
 mv ".job-$id.prompt" ".jobs/$id/prompt.txt"
 ls -1t .jobs | grep -E '^[a-z0-9-]+$' | tail -n +6 | while read -r old; do rm -rf -- ".jobs/$old"; done
+rm -f -- .job-*.done
 tmux has-session -t main 2>/dev/null || tmux new-session -d -s main -c /workspace
 tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$@""#;
 
 /// The job's window (bash): `claude` reads the prompt on stdin; its log is capped at 16 MiB (a
-/// job that passes it is stopped); the terminal shows a digest. `exit_code` is written last.
+/// job that passes it is stopped); the terminal shows a digest. `exit_code` is written last, then
+/// the marker `.job-<id>.done` in the workspace root, which the gateway sees without an exec.
 const RUN: &str = r#"id=$1 secs=$2
 shift 2
 d=/workspace/.jobs/$id
@@ -85,23 +93,27 @@ jq -Rrj 'fromjson? | select(.type == "result") | .result // empty' "$d/stream.js
     | head -c 262144 > "$d/result.txt"
 printf '%s\n' "$rc" > "$d/exit_code.tmp"
 mv "$d/exit_code.tmp" "$d/exit_code"
+: > "/workspace/.job-$id.done"
 printf '\njob %s ended: exit %s\n' "$id" "$rc""#;
 
 /// Whether a job runs: its window's pane is alive (`running`), else its exit code (`exit N`),
-/// else `gone`. Liveness first: the runner writes `exit_code` before it exits.
+/// else `gone`. Liveness first: the runner writes `exit_code` before it exits. The window is found
+/// by name in `list-windows`: `display -t` falls back to the current pane when the target is
+/// missing, so it would report the agent's own shell.
 const STATUS: &str = r#"id=$1
-dead=$(tmux display -p -t "main:=job-$id" '#{pane_dead}' 2>/dev/null) || dead=
+dead=$(tmux list-windows -t main -F '#{window_name} #{pane_dead}' 2>/dev/null | sed -n "s/^job-$id //p" | head -n 1)
 if [ "$dead" = 0 ]; then echo running; exit 0; fi
 f=/workspace/.jobs/$id/exit_code
 if [ -f "$f" ]; then printf 'exit %s\n' "$(head -c 12 "$f" | tr -dc 0-9-)"; exit 0; fi
 echo gone"#;
 
-/// Kill a job's window: its process tree (by parent pid) and the pane's session, stopped first so
-/// nothing forks meanwhile, then killed; the window closed. Prints `killed` once every one of them
+/// Kill a job's window (found by name, then addressed by its id, as in [`STATUS`]): its process
+/// tree (by parent pid) and the pane's session, stopped first so nothing forks meanwhile, then
+/// killed; the window closed. Prints `killed` once every one of them
 /// is gone (zombies count as gone), `gone` if there was no window, else fails.
-const KILL: &str = r#"t="main:=job-$1"
-pid=$(tmux display -p -t "$t" '#{pane_pid}' 2>/dev/null) || pid=
-[ -n "$pid" ] || { echo gone; exit 0; }
+const KILL: &str = r#"w=$(tmux list-windows -t main -F '#{window_name} #{window_id} #{pane_pid}' 2>/dev/null | sed -n "s/^job-$1 //p" | head -n 1)
+[ -n "$w" ] || { echo gone; exit 0; }
+t=${w% *} pid=${w#* }
 all=$pid new=$pid
 while [ -n "$new" ]; do
     new=$(ps -o pid= --ppid "$(echo $new | tr ' ' ,)" | tr -s ' \n' '  ')
@@ -179,7 +191,10 @@ pub trait JobRunner: Send + Sync + 'static {
         timeout_secs: u32,
         claude: &[String],
     ) -> Result<(), String>;
-    /// Whether the job still runs (a 2 s exec).
+    /// Whether the job's runner says it finished: its marker exists in the workspace root. Read on
+    /// the host without opening anything; only a hint, confirmed by [`JobRunner::status`].
+    fn finished(&self, agent: &AgentId, job: &JobId) -> bool;
+    /// Whether the job still runs (an exec).
     fn status(&self, agent: &AgentId, job: &JobId) -> Result<Probe, String>;
     /// Kill the job's processes and close its window; fails unless they are gone.
     fn kill(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
@@ -230,10 +245,21 @@ impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
             })
     }
 
+    fn finished(&self, agent: &AgentId, job: &JobId) -> bool {
+        // lstat of a name directly in the workspace root (the bind mount itself): follows no
+        // symlink and opens nothing, so the agent can only make it say yes or no.
+        let marker = self
+            .config()
+            .workspace_root
+            .join(agent.as_str())
+            .join(format!(".job-{job}.done"));
+        std::fs::symlink_metadata(marker).is_ok()
+    }
+
     fn status(&self, agent: &AgentId, job: &JobId) -> Result<Probe, String> {
         let args = ["sh", "-c", STATUS, "ac-job-status", job.as_str()];
         let out = self
-            .exec_once("job status", agent, &args, Duration::from_secs(2))
+            .exec_once("job status", agent, &args, STATUS_LIMIT)
             .map_err(|e| e.to_string())?;
         parse_probe(&out)
     }
@@ -690,10 +716,13 @@ impl Jobs {
             }
             return;
         }
+        // An exec every PROBE (to notice a runner that vanished), or sooner once the runner says it
+        // finished; a marker that lies costs at most one exec per MARKER_RETRY.
         {
             let mut book = self.lock();
             let last = book.entry(j.id.to_string()).or_insert(0);
-            if now.saturating_sub(*last) < POLL.as_millis() as u64 {
+            let since = Duration::from_millis(now.saturating_sub(*last));
+            if since < PROBE && (since < MARKER_RETRY || !self.runner.finished(&j.agent, &j.id)) {
                 return;
             }
             *last = now;

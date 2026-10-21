@@ -1,9 +1,10 @@
-//! Ports: the traits adapters (containerd, Postgres, ...) implement.
+//! Ports: the traits adapters (containerd, the registry, ...) implement.
 //! Synchronous by design; async arrives with the gateway, the one real I/O fan-out.
 
 use std::fmt;
+use std::sync::Arc;
 
-use ac_domain::{AgentId, State};
+use ac_domain::{AgentId, Job, JobId, State};
 
 /// Adapter failure with context; adapters map their own errors into this.
 #[derive(Debug)]
@@ -45,4 +46,45 @@ pub trait SessionStore {
     fn set_state(&self, id: &AgentId, state: State) -> Result<(), PortError>;
     /// Every known agent and its state, in no particular order.
     fn list(&self) -> Result<Vec<(AgentId, State)>, PortError>;
+}
+
+/// Durable record of jobs (ADR-010): states, times, exit codes. Agent-written output is not kept
+/// here.
+pub trait JobStore {
+    /// Insert or replace a job.
+    fn put_job(&self, job: &Job) -> Result<(), PortError>;
+    /// Every job of `agent`, in no particular order.
+    fn jobs(&self, agent: &AgentId) -> Result<Vec<Job>, PortError>;
+    /// Every queued or running job, of every agent.
+    fn active_jobs(&self) -> Result<Vec<Job>, PortError>;
+    /// Forget a job; an unknown one is fine.
+    fn remove_job(&self, agent: &AgentId, id: &JobId) -> Result<(), PortError>;
+}
+
+/// One store shared by the fleet and the job supervisor.
+impl<T: SessionStore + ?Sized> SessionStore for Arc<T> {
+    fn state(&self, id: &AgentId) -> Result<Option<State>, PortError> {
+        (**self).state(id)
+    }
+    fn set_state(&self, id: &AgentId, state: State) -> Result<(), PortError> {
+        (**self).set_state(id, state)
+    }
+    fn list(&self) -> Result<Vec<(AgentId, State)>, PortError> {
+        (**self).list()
+    }
+}
+
+impl<T: JobStore + ?Sized> JobStore for Arc<T> {
+    fn put_job(&self, job: &Job) -> Result<(), PortError> {
+        (**self).put_job(job)
+    }
+    fn jobs(&self, agent: &AgentId) -> Result<Vec<Job>, PortError> {
+        (**self).jobs(agent)
+    }
+    fn active_jobs(&self) -> Result<Vec<Job>, PortError> {
+        (**self).active_jobs()
+    }
+    fn remove_job(&self, agent: &AgentId, id: &JobId) -> Result<(), PortError> {
+        (**self).remove_job(agent, id)
+    }
 }

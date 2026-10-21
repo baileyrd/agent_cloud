@@ -1,6 +1,6 @@
 [package]
 name = "ac-store"
-description = "SessionStore adapter on rusty_multimodal_db_engine: agent registry and lifecycle state."
+description = "SessionStore and JobStore adapter on rusty_multimodal_db_engine: agent registry, lifecycle state and jobs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

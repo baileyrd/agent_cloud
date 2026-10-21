@@ -5,7 +5,11 @@
 //! lifecycle state is the engine's scannable field, so a state change is a
 //! single durable field write, not a record rewrite.
 //!
+//! Jobs (ADR-010) live beside the agents in a second file, `jobs.mmap`, under the same lock.
+//!
 //! Holds only bounded registry data; unbounded history belongs in `ac-history`.
+
+mod jobs;
 
 use std::path::Path;
 
@@ -20,7 +24,7 @@ use rusty_multimodal_db_engine::generic::traits::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const NAMESPACE: Uuid = Uuid::from_u128(0x6163_2d63_6c6f_7564_0000_0000_0000_0001);
+pub(crate) const NAMESPACE: Uuid = Uuid::from_u128(0x6163_2d63_6c6f_7564_0000_0000_0000_0001);
 const STORE_FILE: &str = "agents.mmap";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -81,7 +85,7 @@ fn from_code(code: u32) -> Option<State> {
     })
 }
 
-fn err(op: &'static str, cause: impl std::fmt::Display) -> PortError {
+pub(crate) fn err(op: &'static str, cause: impl std::fmt::Display) -> PortError {
     PortError {
         op,
         cause: cause.to_string(),
@@ -92,9 +96,10 @@ fn uuid_of(id: &AgentId) -> Uuid {
     Uuid::new_v5(&NAMESPACE, id.as_str().as_bytes())
 }
 
-/// Engine-backed registry of agents and their lifecycle state.
+/// Engine-backed registry of agents and their lifecycle state, and of jobs.
 pub struct EngineStore {
     store: GenericProductionStore<GenericMmapStore<AgentRecord, BySlug, ByState>>,
+    jobs: jobs::JobTable,
     // Held for its Drop: refuses a second process on the same data directory.
     _lock: DirLock,
 }
@@ -112,6 +117,7 @@ impl EngineStore {
         .map_err(|e| err("open store", e))?;
         Ok(Self {
             store: GenericProductionStore::new(core),
+            jobs: jobs::open(dir)?,
             _lock: lock,
         })
     }
@@ -173,12 +179,12 @@ impl SessionStore for EngineStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
-    fn tmp() -> std::path::PathBuf {
+    pub(crate) fn tmp() -> std::path::PathBuf {
         static N: AtomicUsize = AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
             "ac-store-{}-{}",

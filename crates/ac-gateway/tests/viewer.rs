@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ac_ctr::Exec;
 use ac_domain::{AgentId, State};
 use ac_fleet::Fleet;
-use ac_gateway::viewer::{Hub, Terminal};
+use ac_gateway::viewer::{Hub, Terminal, ViewClient, ViewCommand, Writer};
 use ac_gateway::web::App;
 use ac_gateway::Api;
 use ac_ports::{PortError, Runtime, SessionStore};
@@ -49,7 +49,7 @@ struct Fake(Arc<Mutex<World>>);
 impl Fake {
     fn new() -> Self {
         let w = World {
-            meta: "20 3 2 1 1 0".into(),
+            meta: "20 3 2 1 1 0 0".into(),
             screen: vec![
                 "\x1b[32m$\x1b[0m hello".into(),
                 String::new(),
@@ -242,7 +242,32 @@ impl Terminal for Fake {
     fn prepare(&self, _: &AgentId) -> Result<(), String> {
         Ok(())
     }
-    fn attach(&self, _: &AgentId, write: bool) -> Result<Exec, String> {
+    fn attach_view(&self, _: &AgentId) -> Result<ViewClient, String> {
+        Ok(ViewClient::new(self.spawn(false)))
+    }
+    fn attach_writer(&self, _: &AgentId) -> Result<Writer, String> {
+        Ok(Writer::new(self.spawn(true)))
+    }
+    fn scrollback(&self, _: &AgentId) -> Result<Vec<String>, String> {
+        Ok(vec!["older line".into()])
+    }
+    fn detach(&self, _: &AgentId, client: &str) -> Result<(), String> {
+        let mut w = self.world();
+        w.detached.push(client.to_owned());
+        // tmux tells the detached client, which then exits.
+        w.outputs.retain(|tx| tx.send(b"%exit\n".to_vec()).is_ok());
+        Ok(())
+    }
+    fn probe(&self, _: &AgentId) -> bool {
+        true
+    }
+    fn kill_clients(&self, _: &AgentId, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl Fake {
+    fn spawn(&self, write: bool) -> Exec {
         let alive = Rc::new(Cell::new(true));
         let (tx, rx) = mpsc::channel();
         self.world().attached += 1;
@@ -265,27 +290,11 @@ impl Terminal for Fake {
                 }) as Box<dyn File>
             }),
         };
-        Ok(Exec::new(
+        Exec::new(
             Box::new(child),
             b"detach-client\n",
             Duration::from_millis(100),
-        ))
-    }
-    fn scrollback(&self, _: &AgentId) -> Result<Vec<String>, String> {
-        Ok(vec!["older line".into()])
-    }
-    fn detach(&self, _: &AgentId, client: &str) -> Result<(), String> {
-        let mut w = self.world();
-        w.detached.push(client.to_owned());
-        // tmux tells the detached client, which then exits.
-        w.outputs.retain(|tx| tx.send(b"%exit\n".to_vec()).is_ok());
-        Ok(())
-    }
-    fn probe(&self, _: &AgentId) -> bool {
-        true
-    }
-    fn kill_clients(&self, _: &AgentId, _: bool) -> Result<(), String> {
-        Ok(())
+        )
     }
 }
 
@@ -524,10 +533,32 @@ fn watch_take_over_release_and_history() {
     assert_eq!(
         fake.sent(true),
         [
-            "send-keys -t main C-c Enter",
+            "send-keys -t main -H 03 0d",
             "send-keys -t main -H 6c 73 0a"
         ]
     );
+    // Hostile input reaches the pane byte for byte and never as tmux syntax.
+    let hostile = "x\nkill-server\n; run-shell 'rm -rf ~' \"q\" %exit\0\r\\ #{pane_pid}";
+    assert_eq!(a.post(addr, "text", hostile).0, 200);
+    assert_eq!(a.post(addr, "paste", hostile).0, 200);
+    assert_eq!(a.post(addr, "resize?cols=100&rows=30", "").0, 200);
+    assert_eq!(
+        a.post(addr, "resize?cols=100;kill-server&rows=30", "").0,
+        400
+    );
+    wait_for("hostile input", || fake.sent(true).len() >= 5);
+    let sent = fake.sent(true);
+    let decode = |line: &str| -> Vec<u8> {
+        let hex = line
+            .strip_prefix("send-keys -t main -H ")
+            .unwrap_or_else(|| panic!("{line}"));
+        hex.split(' ')
+            .map(|h| u8::from_str_radix(h, 16).unwrap_or_else(|e| panic!("{h}: {e}")))
+            .collect()
+    };
+    assert_eq!(decode(&sent[2]), hostile.as_bytes());
+    assert_eq!(decode(&sent[3]), hostile.as_bytes());
+    assert_eq!(sent[4], "refresh-client -C 100x30");
     assert_eq!(b.post(addr, "takeover?force=true", "").0, 200);
     assert_eq!(
         a.post(addr, "text", "x").0,
@@ -590,6 +621,39 @@ fn watch_take_over_release_and_history() {
         w.attached
     );
     assert!(!w.eof_while_alive, "stdin closed while a client was alive");
+    drop(w);
+    // The shared client heard nothing but the fixed view commands; the writer nothing but hex
+    // keys and resizes.
+    let fixed: Vec<String> = [
+        ViewCommand::ClientName,
+        ViewCommand::CursorInfo,
+        ViewCommand::Snapshot,
+    ]
+    .iter()
+    .map(|c| c.line().trim_end().to_owned())
+    .collect();
+    let shared = fake.sent(false);
+    assert!(shared.len() >= 5, "{shared:?}");
+    assert!(
+        shared
+            .iter()
+            .all(|c| fixed.contains(c) || c == "detach-client"),
+        "{shared:?}"
+    );
+    for line in fake.sent(true) {
+        let hex = line.strip_prefix("send-keys -t main -H ").is_some_and(|h| {
+            h.split(' ')
+                .all(|x| x.len() == 2 && x.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+        let resize = line.strip_prefix("refresh-client -C ").is_some_and(|r| {
+            r.split_once('x')
+                .is_some_and(|(c, r)| c.parse::<u16>().is_ok() && r.parse::<u16>().is_ok())
+        });
+        assert!(
+            hex || resize || line == "detach-client",
+            "writer got {line:?}"
+        );
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

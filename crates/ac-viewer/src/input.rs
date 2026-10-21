@@ -1,6 +1,8 @@
-//! Viewer input as tmux commands for the take-over client. Key names come from a fixed set and
-//! are plain words, so nothing a browser sends is parsed by tmux as command syntax (`;`, quotes,
-//! `#{}`); typed and pasted text goes as hex bytes (`send-keys -H`).
+//! Viewer input for the take-over client, as an [`Input`] whose payloads can only be built here,
+//! after validation. [`Input::lines`] is the one place that renders tmux commands, and it emits
+//! viewer bytes only as hex (`send-keys -H`): no viewer byte can become a tmux command, a newline
+//! or control-mode syntax. Key names are turned into the bytes a terminal would send, following
+//! the pane's cursor-key mode.
 
 use std::fmt;
 
@@ -16,11 +18,6 @@ const HEX_CHUNK: usize = 512;
 pub const COLS: (u16, u16) = (20, 500);
 /// Rows, likewise.
 pub const ROWS: (u16, u16) = (5, 200);
-
-const NAMED: [&str; 17] = [
-    "Enter", "Tab", "BTab", "BSpace", "Escape", "Space", "Up", "Down", "Left", "Right", "Home",
-    "End", "PPage", "NPage", "IC", "DC", "KPEnter",
-];
 
 /// Why input was refused.
 #[derive(Debug, PartialEq, Eq)]
@@ -46,8 +43,46 @@ impl fmt::Display for InputError {
     }
 }
 
-/// Space-separated key names (`Enter`, `C-c`, `M-x`, `F5`, `S-Up` ...) as one command line.
-pub fn keys(body: &str) -> Result<String, InputError> {
+/// Bytes for the pane, already validated and capped. Built only by [`keys`], [`text`], [`paste`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bytes(Vec<u8>);
+
+/// A size within [`COLS`] and [`ROWS`]. Built only by [`resize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    cols: u16,
+    rows: u16,
+}
+
+/// One request's worth of take-over input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    /// Bytes to the pane.
+    Bytes(Bytes),
+    /// Size the window.
+    Resize(Size),
+}
+
+impl Input {
+    /// The tmux command lines for the take-over client: `send-keys -t main -H <hex>...` or
+    /// `refresh-client -C <cols>x<rows>`, nothing else.
+    pub fn lines(&self) -> Vec<String> {
+        match self {
+            Self::Bytes(Bytes(b)) => b
+                .chunks(HEX_CHUNK)
+                .map(|chunk| {
+                    let hex: Vec<String> = chunk.iter().map(|x| format!("{x:02x}")).collect();
+                    format!("send-keys -t main -H {}\n", hex.join(" "))
+                })
+                .collect(),
+            Self::Resize(Size { cols, rows }) => vec![format!("refresh-client -C {cols}x{rows}\n")],
+        }
+    }
+}
+
+/// Space-separated key names (`Enter`, `C-c`, `M-x`, `F5`, `S-Up` ...) as the bytes a terminal
+/// sends for them. `app_cursor`: the pane is in application cursor-key mode.
+pub fn keys(body: &str, app_cursor: bool) -> Result<Input, InputError> {
     let names: Vec<&str> = body.split_whitespace().collect();
     if names.is_empty() {
         return Err(InputError::Empty);
@@ -55,43 +90,121 @@ pub fn keys(body: &str) -> Result<String, InputError> {
     if names.len() > MAX_KEYS {
         return Err(InputError::TooLarge);
     }
-    if let Some(bad) = names.iter().find(|k| !valid_key(k)) {
-        return Err(InputError::BadKey((*bad).chars().take(32).collect()));
+    let mut out = Vec::new();
+    for name in names {
+        let bytes = key_bytes(name, app_cursor)
+            .ok_or_else(|| InputError::BadKey(name.chars().take(32).collect()))?;
+        out.extend(bytes);
     }
-    Ok(format!("send-keys -t main {}\n", names.join(" ")))
+    Ok(Input::Bytes(Bytes(out)))
 }
 
-fn valid_key(name: &str) -> bool {
+/// Modifier bits as xterm encodes them (`CSI 1 ; 1+bits X`).
+const SHIFT: u8 = 1;
+const ALT: u8 = 2;
+const CTRL: u8 = 4;
+
+fn key_bytes(name: &str, app_cursor: bool) -> Option<Vec<u8>> {
     let mut base = name;
-    let mut mods = 0;
-    while let Some(rest) = ["C-", "M-", "S-"].iter().find_map(|m| base.strip_prefix(m)) {
+    let mut mods = 0u8;
+    while let Some((bit, rest)) = [("C-", CTRL), ("M-", ALT), ("S-", SHIFT)]
+        .iter()
+        .find_map(|(p, bit)| base.strip_prefix(p).map(|r| (*bit, r)))
+    {
+        if mods & bit != 0 {
+            return None;
+        }
+        mods |= bit;
         base = rest;
-        mods += 1;
     }
-    let function = base
-        .strip_prefix('F')
-        .and_then(|n| n.parse::<u8>().ok())
-        .is_some_and(|n| (1..=12).contains(&n));
-    let modified_char =
-        mods > 0 && base.len() == 1 && base.bytes().all(|b| b.is_ascii_alphanumeric());
-    mods <= 3 && (NAMED.contains(&base) || function || modified_char)
+    // A letter or digit with Ctrl and/or Alt: the control byte, ESC-prefixed for Alt.
+    if base.len() == 1 && mods & (CTRL | ALT) != 0 && mods & SHIFT == 0 {
+        let c = base.as_bytes()[0].to_ascii_lowercase();
+        if !c.is_ascii_alphanumeric() {
+            return None;
+        }
+        let b = if mods & CTRL != 0 && c.is_ascii_lowercase() {
+            c & 0x1f
+        } else {
+            c
+        };
+        return Some(if mods & ALT != 0 {
+            vec![0x1b, b]
+        } else {
+            vec![b]
+        });
+    }
+    // Cursor and editing keys: the final byte of the CSI/SS3 form, or a `CSI n ~` number.
+    let csi = |fin: u8| -> Vec<u8> {
+        if mods != 0 {
+            format!("\x1b[1;{}{}", mods + 1, fin as char).into_bytes()
+        } else if app_cursor {
+            vec![0x1b, b'O', fin]
+        } else {
+            vec![0x1b, b'[', fin]
+        }
+    };
+    let tilde = |n: u8| -> Vec<u8> {
+        if mods != 0 {
+            format!("\x1b[{n};{}~", mods + 1).into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        }
+    };
+    let alt = |b: &[u8]| -> Option<Vec<u8>> {
+        match mods {
+            0 => Some(b.to_vec()),
+            ALT => Some([&[0x1b], b].concat()),
+            _ => None,
+        }
+    };
+    match base {
+        "Up" => Some(csi(b'A')),
+        "Down" => Some(csi(b'B')),
+        "Right" => Some(csi(b'C')),
+        "Left" => Some(csi(b'D')),
+        "Home" => Some(csi(b'H')),
+        "End" => Some(csi(b'F')),
+        "IC" => Some(tilde(2)),
+        "DC" => Some(tilde(3)),
+        "PPage" => Some(tilde(5)),
+        "NPage" => Some(tilde(6)),
+        "F1" | "F2" | "F3" | "F4" if mods == 0 => {
+            Some(vec![0x1b, b'O', b'P' + base.as_bytes()[1] - b'1'])
+        }
+        "F5" => Some(tilde(15)),
+        "F6" => Some(tilde(17)),
+        "F7" => Some(tilde(18)),
+        "F8" => Some(tilde(19)),
+        "F9" => Some(tilde(20)),
+        "F10" => Some(tilde(21)),
+        "F11" => Some(tilde(23)),
+        "F12" => Some(tilde(24)),
+        "Enter" | "KPEnter" => alt(b"\r"),
+        "Tab" => alt(b"\t"),
+        "BTab" if mods == 0 => Some(b"\x1b[Z".to_vec()),
+        "BSpace" => alt(b"\x7f"),
+        "Escape" => alt(b"\x1b"),
+        "Space" => alt(b" "),
+        _ => None,
+    }
 }
 
 /// Typed bytes, sent exactly.
-pub fn text(bytes: &[u8]) -> Result<Vec<String>, InputError> {
+pub fn text(bytes: &[u8]) -> Result<Input, InputError> {
     if bytes.is_empty() {
         return Err(InputError::Empty);
     }
     if bytes.len() > MAX_TEXT {
         return Err(InputError::TooLarge);
     }
-    Ok(hex_commands(bytes))
+    Ok(Input::Bytes(Bytes(bytes.to_vec())))
 }
 
-/// Pasted bytes. Paste-end markers inside are removed (they would let pasted text escape
-/// bracketed paste and run as typed input); when the program asked for bracketed paste the
-/// whole is wrapped in the markers.
-pub fn paste(bytes: &[u8], bracketed: bool) -> Result<Vec<String>, InputError> {
+/// Pasted bytes. Paste markers inside are removed (an end marker would let pasted text escape
+/// bracketed paste and run as typed input); when the program asked for bracketed paste the whole
+/// is wrapped in the markers.
+pub fn paste(bytes: &[u8], bracketed: bool) -> Result<Input, InputError> {
     if bytes.is_empty() {
         return Err(InputError::Empty);
     }
@@ -99,53 +212,71 @@ pub fn paste(bytes: &[u8], bracketed: bool) -> Result<Vec<String>, InputError> {
         return Err(InputError::TooLarge);
     }
     let mut body = bytes.to_vec();
-    for marker in [&b"\x1b[200~"[..], b"\x1b[201~"] {
-        while let Some(at) = body.windows(marker.len()).position(|w| w == marker) {
-            body.drain(at..at + marker.len());
-        }
-    }
     // Removing one marker can join two halves into another; repeat until none is left.
-    if body
+    while let Some(at) = body
         .windows(6)
-        .any(|w| w == b"\x1b[200~" || w == b"\x1b[201~")
+        .position(|w| w == b"\x1b[200~" || w == b"\x1b[201~")
     {
-        return paste(&body, bracketed);
+        body.drain(at..at + 6);
     }
     if bracketed {
         body.splice(0..0, b"\x1b[200~".iter().copied());
         body.extend_from_slice(b"\x1b[201~");
     }
-    Ok(hex_commands(&body))
+    Ok(Input::Bytes(Bytes(body)))
 }
 
 /// Size the take-over client (and so the window) to the viewer.
-pub fn resize(cols: u16, rows: u16) -> Result<String, InputError> {
+pub fn resize(cols: u16, rows: u16) -> Result<Input, InputError> {
     if !(COLS.0..=COLS.1).contains(&cols) || !(ROWS.0..=ROWS.1).contains(&rows) {
         return Err(InputError::BadSize);
     }
-    Ok(format!("refresh-client -C {cols}x{rows}\n"))
-}
-
-fn hex_commands(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .chunks(HEX_CHUNK)
-        .map(|chunk| {
-            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
-            format!("send-keys -t main -H {}\n", hex.join(" "))
-        })
-        .collect()
+    Ok(Input::Resize(Size { cols, rows }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn bytes(i: Result<Input, InputError>) -> Vec<u8> {
+        match i {
+            Ok(Input::Bytes(Bytes(b))) => b,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn hex(s: &[u8]) -> String {
+        s.iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
-    fn key_names() {
+    fn key_names_become_terminal_bytes() {
         assert_eq!(
-            keys("Enter C-c M-x S-Up F12 C-M-a").as_deref(),
-            Ok("send-keys -t main Enter C-c M-x S-Up F12 C-M-a\n")
+            bytes(keys("Enter C-c M-x BSpace Tab", false)),
+            b"\r\x03\x1bx\x7f\t"
         );
+        assert_eq!(bytes(keys("Up Left Home", false)), b"\x1b[A\x1b[D\x1b[H");
+        assert_eq!(
+            bytes(keys("Up End", true)),
+            b"\x1bOA\x1bOF",
+            "application cursor mode"
+        );
+        assert_eq!(
+            bytes(keys("S-Up C-Right M-DC", true)),
+            b"\x1b[1;2A\x1b[1;5C\x1b[3;3~"
+        );
+        assert_eq!(
+            bytes(keys("F1 F4 F5 F12 S-F5 BTab PPage", false)),
+            b"\x1bOP\x1bOS\x1b[15~\x1b[24~\x1b[15;2~\x1b[Z\x1b[5~"
+        );
+        assert_eq!(bytes(keys("C-M-a M-Enter C-1", false)), b"\x1b\x01\x1b\r1");
+    }
+
+    #[test]
+    fn bad_keys_are_refused() {
         for bad in [
             "a",
             ";",
@@ -155,42 +286,68 @@ mod tests {
             "C-",
             "#{pane_pid}",
             "\"",
-            "C-C-C-C-a",
-            "Up\nkill-server",
+            "C-C-a",
+            "S-a",
+            "C-Enter",
+            "kill-server",
         ] {
-            assert!(matches!(keys(bad), Err(InputError::BadKey(_))), "{bad:?}");
+            assert!(
+                matches!(keys(bad, false), Err(InputError::BadKey(_))),
+                "{bad:?}"
+            );
         }
-        assert_eq!(keys("  "), Err(InputError::Empty));
-        assert_eq!(keys(&"Up ".repeat(MAX_KEYS + 1)), Err(InputError::TooLarge));
+        assert_eq!(keys("  ", false), Err(InputError::Empty));
+        assert_eq!(
+            keys(&"Up ".repeat(MAX_KEYS + 1), false),
+            Err(InputError::TooLarge)
+        );
     }
 
     #[test]
-    fn text_is_hex_only() {
-        let cmds = text("é;\n".as_bytes()).unwrap_or_default();
-        assert_eq!(cmds, ["send-keys -t main -H c3 a9 3b 0a\n"]);
-        assert_eq!(text(&vec![b'x'; HEX_CHUNK + 1]).map(|c| c.len()), Ok(2));
+    fn hostile_text_is_only_ever_hex() {
+        let hostile: &[u8] =
+            b"ls\nkill-server\n; run-shell 'rm -rf ~' \"q\" %begin 1 1 1\n%exit\0\x1b]52;c;x\x07\r\\";
+        for input in [
+            text(hostile),
+            paste(hostile, true),
+            paste(hostile, false),
+            keys("Enter", false),
+        ] {
+            for line in input.unwrap_or_else(|e| panic!("{e}")).lines() {
+                let rest = line
+                    .strip_prefix("send-keys -t main -H ")
+                    .and_then(|r| r.strip_suffix('\n'))
+                    .unwrap_or_else(|| panic!("{line:?}"));
+                assert!(
+                    rest.split(' ')
+                        .all(|h| h.len() == 2 && h.bytes().all(|c| c.is_ascii_hexdigit())),
+                    "{line:?}"
+                );
+            }
+        }
+        assert_eq!(
+            text(hostile).map(|i| i.lines()),
+            Ok(vec![format!("send-keys -t main -H {}\n", hex(hostile))])
+        );
+    }
+
+    #[test]
+    fn text_chunks_and_caps() {
+        assert_eq!(
+            text(&vec![b'x'; HEX_CHUNK + 1]).map(|i| i.lines().len()),
+            Ok(2)
+        );
         assert_eq!(text(&vec![b'x'; MAX_TEXT + 1]), Err(InputError::TooLarge));
         assert_eq!(text(b""), Err(InputError::Empty));
     }
 
     #[test]
     fn paste_cannot_escape_brackets() {
-        let hex = |s: &str| {
-            s.bytes()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let cmds = paste(b"a\x1b[201~rm -rf ~\n", true).unwrap_or_default();
         assert_eq!(
-            cmds,
-            [format!(
-                "send-keys -t main -H {}\n",
-                hex("\x1b[200~arm -rf ~\n\x1b[201~")
-            )]
+            bytes(paste(b"a\x1b[201~rm -rf ~\n", true)),
+            b"\x1b[200~arm -rf ~\n\x1b[201~"
         );
-        let nested = paste(b"\x1b[20\x1b[201~1~x", false).unwrap_or_default();
-        assert_eq!(nested, [format!("send-keys -t main -H {}\n", hex("x"))]);
+        assert_eq!(bytes(paste(b"\x1b[20\x1b[201~1~x", false)), b"x");
         assert_eq!(
             paste(&vec![b'x'; MAX_PASTE + 1], true),
             Err(InputError::TooLarge)
@@ -199,7 +356,10 @@ mod tests {
 
     #[test]
     fn resize_bounds() {
-        assert_eq!(resize(120, 40).as_deref(), Ok("refresh-client -C 120x40\n"));
+        assert_eq!(
+            resize(120, 40).map(|i| i.lines()),
+            Ok(vec!["refresh-client -C 120x40\n".to_owned()])
+        );
         for (c, r) in [(19, 40), (501, 40), (120, 4), (120, 201)] {
             assert_eq!(resize(c, r), Err(InputError::BadSize));
         }

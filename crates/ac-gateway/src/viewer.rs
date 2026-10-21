@@ -1,9 +1,13 @@
 //! The terminal viewer (ADR-006): watch an agent's tmux session `main` live, take over its
 //! input, and record what it shows.
 //!
-//! One read-only tmux control client per viewed agent (the bridge) feeds every viewer of it; a
-//! second, writable client exists only while a viewer holds the take-over lock. Both are
-//! [`Exec`]s, so their stdin never reaches EOF while they run. Routes (bearer token required):
+//! One tmux control client per viewed agent (the bridge, a [`ViewClient`]) feeds every viewer of
+//! it; a second one (a [`Writer`]) exists only while a viewer holds the take-over lock. The view
+//! guarantee rests on the gateway, not on tmux: non-holders get 403, the view client's whole
+//! vocabulary is the closed [`ViewCommand`] enum, and the writer takes only [`Input`], whose
+//! bytes are sent as hex. (tmux's own `read-only` flag is not used: while such a client is
+//! attached, tmux refuses the agent's own tmux commands too.) Both wrap an [`Exec`], so their
+//! stdin never reaches EOF while they run. Routes (bearer token required):
 //! - `GET /api/v1/agents/{id}/term`: NDJSON stream ([`ac_viewer::screen`] messages);
 //! - `POST /api/v1/agents/{id}/term/{viewer}/{keys|text|paste|resize|takeover|release}`;
 //! - `GET /api/v1/agents/{id}/history?limit=N`: recorded output as plain text.
@@ -21,7 +25,7 @@ use ac_ctr::{CtrRuntime, Exec};
 use ac_domain::AgentId;
 use ac_history::Log;
 use ac_viewer::control::{Notice, Parser};
-use ac_viewer::input::{self, InputError};
+use ac_viewer::input::{self, Input, InputError};
 use ac_viewer::record::{self, Record};
 use ac_viewer::registry::{Full, Held, Registry};
 use ac_viewer::screen::{self, Meta, Screen, DISPLAY_FORMAT};
@@ -51,16 +55,71 @@ const KEEP_BYTES: u64 = 16 << 20;
 const HISTORY_DEFAULT: usize = 500;
 const HISTORY_MAX: usize = 5000;
 
-const RO_ATTACH: [&str; 7] = [
-    "tmux",
-    "-C",
-    "attach",
-    "-t",
-    "main",
-    "-f",
-    "read-only,ignore-size",
-];
-const RW_ATTACH: [&str; 7] = ["tmux", "-C", "attach", "-t", "main", "-f", "no-output"];
+/// The view client never sizes the window; the take-over client gets no `%output`.
+const VIEW_ATTACH: [&str; 7] = ["tmux", "-C", "attach", "-t", "main", "-f", "ignore-size"];
+const WRITER_ATTACH: [&str; 7] = ["tmux", "-C", "attach", "-t", "main", "-f", "no-output"];
+const QUIT: &[u8] = b"detach-client\n";
+
+/// The view client's whole vocabulary, rendered by [`ViewCommand::line`] from constants. There is
+/// no way to hand that client anything else, so no viewer-supplied value can reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewCommand {
+    /// The client's own name (to detach it later).
+    ClientName,
+    /// Pane size, cursor and modes ([`DISPLAY_FORMAT`]).
+    CursorInfo,
+    /// The visible screen with colours.
+    Snapshot,
+}
+
+impl ViewCommand {
+    /// The command line.
+    pub fn line(self) -> String {
+        match self {
+            Self::ClientName => "display -p '#{client_name}'\n".to_owned(),
+            Self::CursorInfo => format!("display -p -t main '{DISPLAY_FORMAT}'\n"),
+            Self::Snapshot => "capture-pane -p -e -t main\n".to_owned(),
+        }
+    }
+}
+
+/// The shared control client every viewer of an agent watches through.
+pub struct ViewClient(Exec);
+
+impl ViewClient {
+    /// Wrap a spawned `tmux -C attach` exec.
+    pub fn new(exec: Exec) -> Self {
+        Self(exec)
+    }
+
+    /// Send one of the fixed commands.
+    pub fn send(&mut self, cmd: ViewCommand) -> Result<(), String> {
+        self.0.send(cmd.line().as_bytes())
+    }
+
+    /// Its control-mode output.
+    pub fn take_stdout(&mut self) -> Option<Box<dyn platform::fs::File>> {
+        self.0.take_stdout()
+    }
+}
+
+/// The take-over client: exists only while a viewer holds the lock.
+pub struct Writer(Exec);
+
+impl Writer {
+    /// Wrap a spawned `tmux -C attach` exec.
+    pub fn new(exec: Exec) -> Self {
+        Self(exec)
+    }
+
+    /// Send validated input: `send-keys -H` hex or `refresh-client -C` lines only.
+    pub fn send(&mut self, input: &Input) -> Result<(), String> {
+        input
+            .lines()
+            .iter()
+            .try_for_each(|l| self.0.send(l.as_bytes()))
+    }
+}
 /// Detach control clients a crashed gateway left, then make sure the session exists.
 const PREPARE: &str = "tmux list-clients -F '#{client_name} #{client_flags}' 2>/dev/null \
     | awk '/control-mode/ { print $1 }' | xargs -r -n1 tmux detach-client -t; \
@@ -71,9 +130,11 @@ const PREPARE: &str = "tmux list-clients -F '#{client_name} #{client_flags}' 2>/
 pub trait Terminal: Send + Sync + 'static {
     /// Detach control clients left by an earlier gateway; create session `main` if missing.
     fn prepare(&self, id: &AgentId) -> Result<(), String>;
-    /// Attach a control client: read-only with output (`write` false), or writable with no
-    /// output. Called on the thread that will own it (an [`Exec`] is not `Send`).
-    fn attach(&self, id: &AgentId, write: bool) -> Result<Exec, String>;
+    /// Attach the shared view client (with output). Called on the thread that will own it (an
+    /// [`Exec`] is not `Send`).
+    fn attach_view(&self, id: &AgentId) -> Result<ViewClient, String>;
+    /// Attach a take-over client (no output), likewise.
+    fn attach_writer(&self, id: &AgentId) -> Result<Writer, String>;
     /// Raw `capture-pane -e` lines of the scrollback above the screen.
     fn scrollback(&self, id: &AgentId) -> Result<Vec<String>, String>;
     /// Detach one tmux client by name.
@@ -92,9 +153,15 @@ impl<S: Spawner + Send + Sync + 'static> Terminal for CtrRuntime<S> {
             .map_err(|e| e.to_string())
     }
 
-    fn attach(&self, id: &AgentId, write: bool) -> Result<Exec, String> {
-        let args = if write { RW_ATTACH } else { RO_ATTACH };
-        self.spawn_exec(id, &args, !write, b"detach-client\n")
+    fn attach_view(&self, id: &AgentId) -> Result<ViewClient, String> {
+        self.spawn_exec(id, &VIEW_ATTACH, true, QUIT)
+            .map(ViewClient::new)
+            .map_err(|e| e.to_string())
+    }
+
+    fn attach_writer(&self, id: &AgentId) -> Result<Writer, String> {
+        self.spawn_exec(id, &WRITER_ATTACH, false, QUIT)
+            .map(Writer::new)
             .map_err(|e| e.to_string())
     }
 
@@ -204,7 +271,7 @@ struct View {
     viewers: HashMap<String, SyncSender<Vec<u8>>>,
     screen: Option<Screen>,
     client: Option<String>,
-    owner: Option<SyncSender<Vec<String>>>,
+    owner: Option<SyncSender<Input>>,
 }
 
 impl Hub {
@@ -383,23 +450,23 @@ impl Hub {
                 let Some(view) = st.views.get(id.as_str()) else {
                     return error(409, "not attached");
                 };
-                let bracketed = view.screen.as_ref().is_some_and(|s| s.meta.bracketed_paste);
-                let cmds = match action {
-                    "keys" => input::keys(&String::from_utf8_lossy(body)).map(|c| vec![c]),
+                let meta = view.screen.as_ref().map(|s| s.meta);
+                let input = match action {
+                    "keys" => input::keys(
+                        &String::from_utf8_lossy(body),
+                        meta.is_some_and(|m| m.app_cursor),
+                    ),
                     "text" => input::text(body),
-                    "paste" => input::paste(body, bracketed),
-                    _ => size(query)
-                        .and_then(|(c, r)| input::resize(c, r))
-                        .map(|c| vec![c]),
+                    "paste" => input::paste(body, meta.is_some_and(|m| m.bracketed_paste)),
+                    _ => size(query).and_then(|(c, r)| input::resize(c, r)),
                 };
-                let cmds = match cmds {
-                    Ok(c) => c,
+                let input = match input {
+                    Ok(i) => i,
                     Err(InputError::TooLarge) => return error(413, "input too large"),
                     Err(e) => return error(400, &e.to_string()),
                 };
-                let n = cmds.len();
-                match view.owner.as_ref().map(|tx| tx.try_send(cmds)) {
-                    Some(Ok(())) => ok(&format!(r#"{{"sent":{n}}}"#)),
+                match view.owner.as_ref().map(|tx| tx.try_send(input)) {
+                    Some(Ok(())) => ok(r#"{"sent":true}"#),
                     Some(Err(TrySendError::Full(_))) => error(503, "input queue full"),
                     _ => error(503, "take-over client is gone"),
                 }
@@ -525,17 +592,17 @@ fn bridge(inner: Arc<Inner>, id: AgentId, gen: u64) {
 
 /// Read the read-only client's lines until it exits or is no longer wanted. Output is recorded
 /// and triggers a snapshot; while one is in flight, further output only marks it dirty, which
-/// batches bursts without a timer. The [`Exec`] is closed on every way out.
+/// batches bursts without a timer. The client is closed on every way out.
 fn run_bridge(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
     inner.term.prepare(id)?;
     let scroll = inner.term.scrollback(id).map(|r| screen::lines(&r)).ok();
-    let mut exec = inner.term.attach(id, false)?;
-    let stdout = exec.take_stdout().ok_or("control client has no stdout")?;
+    let mut client = inner.term.attach_view(id)?;
+    let stdout = client.take_stdout().ok_or("control client has no stdout")?;
     let mut lines = Lines::new(stdout);
     let mut parser = Parser::default();
     let mut wants = VecDeque::from([Want::Name]);
-    exec.send(b"display -p '#{client_name}'\n")?;
-    snapshot(&mut exec, &mut wants)?;
+    client.send(ViewCommand::ClientName)?;
+    snapshot(&mut client, &mut wants)?;
     let (mut busy, mut dirty, mut meta, mut scroll) = (true, false, None, scroll);
     while let Some(line) = lines.next_line() {
         if !inner.alive(id, gen) {
@@ -547,7 +614,7 @@ fn run_bridge(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
                 if busy {
                     dirty = true;
                 } else {
-                    snapshot(&mut exec, &mut wants)?;
+                    snapshot(&mut client, &mut wants)?;
                     busy = true;
                 }
             }
@@ -563,7 +630,7 @@ fn run_bridge(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
                     busy = dirty;
                     if dirty {
                         dirty = false;
-                        snapshot(&mut exec, &mut wants)?;
+                        snapshot(&mut client, &mut wants)?;
                     }
                 }
                 None => {}
@@ -575,28 +642,26 @@ fn run_bridge(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn snapshot(exec: &mut Exec, wants: &mut VecDeque<Want>) -> Result<(), String> {
-    let cmd = format!("display -p -t main '{DISPLAY_FORMAT}'\ncapture-pane -p -e -t main\n");
-    exec.send(cmd.as_bytes())?;
+fn snapshot(client: &mut ViewClient, wants: &mut VecDeque<Want>) -> Result<(), String> {
+    client.send(ViewCommand::CursorInfo)?;
+    client.send(ViewCommand::Snapshot)?;
     wants.extend([Want::Meta, Want::Capture]);
     Ok(())
 }
 
 /// The take-over client: forwards the lock holder's commands until the lock is released (the
 /// sender is dropped), then closes.
-fn writer(inner: Arc<Inner>, id: AgentId, rx: Receiver<Vec<String>>) {
-    let mut exec = match inner.term.attach(&id, true) {
-        Ok(e) => e,
+fn writer(inner: Arc<Inner>, id: AgentId, rx: Receiver<Input>) {
+    let mut writer = match inner.term.attach_writer(&id) {
+        Ok(w) => w,
         Err(e) => {
             eprintln!("ac-gateway: viewer: {id}: take-over client: {e}");
             return;
         }
     };
-    'run: while let Ok(cmds) = rx.recv() {
-        for c in cmds {
-            if exec.send(c.as_bytes()).is_err() {
-                break 'run;
-            }
+    while let Ok(input) = rx.recv() {
+        if writer.send(&input).is_err() {
+            break;
         }
     }
 }

@@ -12,7 +12,7 @@ pub const MAX_ROWS: usize = 300;
 pub const MAX_SCROLLBACK: usize = 1000;
 /// `display -p` format whose output [`Meta::parse`] reads.
 pub const DISPLAY_FORMAT: &str =
-    "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{cursor_flag} #{bracket_paste_flag}";
+    "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{cursor_flag} #{bracket_paste_flag} #{keypad_cursor_flag}";
 
 /// Pane size, cursor and modes, from [`DISPLAY_FORMAT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,8 @@ pub struct Meta {
     pub cursor: bool,
     /// The program asked for bracketed paste.
     pub bracketed_paste: bool,
+    /// Application cursor-key mode (arrows send `ESC O x`).
+    pub app_cursor: bool,
 }
 
 impl Meta {
@@ -39,13 +41,14 @@ impl Meta {
             .map(|w| w.parse().ok())
             .collect::<Option<_>>()?;
         match v[..] {
-            [width, height, cx, cy, cursor, paste] if width > 0 && height > 0 => Some(Self {
+            [width, height, cx, cy, cursor, paste, keys] if width > 0 && height > 0 => Some(Self {
                 width,
                 height,
                 cx,
                 cy,
                 cursor: cursor == 1,
                 bracketed_paste: paste == 1,
+                app_cursor: keys == 1,
             }),
             _ => None,
         }
@@ -189,6 +192,7 @@ mod tests {
             cy: 0,
             cursor: true,
             bracketed_paste: false,
+            app_cursor: false,
         }
     }
 
@@ -199,27 +203,29 @@ mod tests {
     #[test]
     fn meta_parses_display_output() {
         assert_eq!(
-            Meta::parse("80 24 3 4 1 0"),
+            Meta::parse("80 24 3 4 1 0 0"),
             Some(Meta {
                 width: 80,
                 height: 24,
                 cx: 3,
                 cy: 4,
                 cursor: true,
-                bracketed_paste: false
+                bracketed_paste: false,
+                app_cursor: false,
             })
         );
         assert_eq!(
-            Meta::parse("80 24 3 4 1 1").map(|m| m.bracketed_paste),
-            Some(true)
+            Meta::parse("80 24 3 4 1 1 1").map(|m| (m.bracketed_paste, m.app_cursor)),
+            Some((true, true))
         );
         for bad in [
             "",
             "80 24",
-            "0 24 0 0 1 0",
-            "x 24 0 0 1 0",
-            "80 24 0 0 1 0 9",
-            "70000 1 0 0 0 0",
+            "80 24 0 0 1 0",
+            "0 24 0 0 1 0 0",
+            "x 24 0 0 1 0 0",
+            "80 24 0 0 1 0 0 9",
+            "70000 1 0 0 0 0 0",
         ] {
             assert_eq!(Meta::parse(bad), None, "{bad}");
         }

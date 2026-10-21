@@ -159,69 +159,89 @@ inspect command is needed); record layout changes need a schema-tag bump and mig
 registry outgrows RAM.
 
 ## ADR-010: Task API (jobs)
-**Status:** proposed (2026-10-21).
+**Status:** accepted (2026-10-21; verified on BaileyServ with a1).
 **Context:** A script or another agent should be able to say "run this prompt in agent X" and get a job
 id, live status and the result, without exec-ing into the VM. Everything inside the VM and its workspace
 is writable by the agent, so a prompt-injected agent can tamper with any file it writes there.
-**Decision:** Jobs are part of `ac-gateway`, under `/api/v1/agents/{id}/jobs`, with the same token, Origin
-and bind rules as the rest of the API.
+**Decision:** Jobs are part of `ac-gateway` (`jobs.rs`), under `/api/v1/agents/{id}/jobs`, with the same
+token, Origin and bind rules as the rest of the API.
 - *Routes:* `POST .../jobs` `{"prompt", "timeout_secs"?, "idempotency_key"?}` answers 202 with the job;
   `GET .../jobs` (the agent's retained jobs, newest first); `GET .../jobs/{job}[?wait=N]` (N <= 30 s:
-  long-poll until the state changes); `GET .../jobs/{job}/output` (the final assistant message) and
-  `.../output?part=stream` (the stream-json log), plain text; `POST .../jobs/{job}/cancel`.
+  long-poll until the state changes; 8 waiters at most, then 429); `GET .../jobs/{job}/output` (the final
+  assistant message; 409 while running) and `.../output?part=stream` (the stream-json log, live while
+  running), plain text; `POST .../jobs/{job}/cancel`. Bodies are parsed with `rusty_json` (first-party,
+  ADR-008); unknown members are refused.
 - *States:* `queued`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out`, `interrupted`, as a pure
-  state machine in `ac-domain` (`job.rs`). One running job per agent; up to 8 queue behind it (429 beyond).
-  A job is accepted only while the agent is `running` (409 otherwise; resume is an explicit call).
+  state machine in `ac-domain` (`job.rs`). One running job per agent; up to 8 queue behind it (429 beyond),
+  in submission order. A job is accepted only while the agent is `running` (409 otherwise; resume is an
+  explicit call); the check and the queueing happen under the lifecycle lock, so a pause cannot slip
+  between them.
 - *Trust:* state, timestamps, timeout and exit code live in the host registry (`ac-store`, `jobs.mmap`
   beside `agents.mmap`, same lock). What the agent writes (the result and the stream log) is untrusted
-  data: capped, served as `text/plain` with `nosniff`, never parsed by the gateway.
+  data: capped, served as `text/plain` with `nosniff` and `Content-Security-Policy: default-src 'none';
+  sandbox`, never parsed by the gateway.
 - *Prompt delivery without stdin:* the prompt is kept host-side (`<data>/jobs/<agent>/<job>/prompt.txt`,
   root, 0700 directories). At start the gateway creates `.job-<job>.prompt` (0600, owned by `AC_UID`) in the
-  root of the agent's workspace with `O_CREAT|O_EXCL`, which never follows a symlink. Everything below the
-  workspace root is agent-controlled, so the gateway (root) never writes, chowns or reads a path inside
-  it; a symlinked `.jobs` would otherwise turn a root write into a write anywhere on the host. A short
-  start exec, running as the agent user in the VM, makes `.jobs/<job>/` (0700), moves the prompt to
-  `prompt.txt`, and opens tmux window `job-<job>` in session `main`. Every exec is an argv array: a
-  constant script plus the job id (gateway-generated, `[a-z0-9]`) and operator settings as positional
-  parameters. The prompt never appears in any argv, host or guest; `claude` reads it on stdin from the file.
+  root of the agent's workspace with `O_CREAT|O_EXCL`, which never follows a symlink. Below the workspace
+  root everything is agent-controlled, so the gateway (root) never writes, chowns or reads a path there:
+  a symlinked `.jobs` would turn a root write into a write anywhere on the host, and a symlinked result
+  would turn the output API into a reader of host files (for another agent calling the API, too). A start
+  exec, as the agent user in the VM, makes `.jobs/<job>/` (0700), moves the prompt to `prompt.txt` and
+  opens tmux window `job-<job>` in session `main`. Every exec is an argv array: a constant script plus
+  the job id (gateway-generated, 16 hex digits) and operator settings as positional parameters. The
+  prompt is in no argv, host or guest (checked live with `/proc/*/cmdline`); `claude` reads it on stdin
+  from the file.
 - *Running:* the window runs `claude -p --output-format stream-json --verbose <permission flags>
-  < prompt.txt`, through `head -c 16 MiB` (a job whose log passes that is stopped) and `tee stream.jsonl`,
+  < prompt.txt` through `head -c 16 MiB` (a job whose log passes that is stopped) and `tee stream.jsonl`,
   with a readable digest on the terminal, so a human can watch it in the viewer and take over. When
-  `claude` exits, the runner writes `result.txt` (the `result` event, at most 256 KiB) and then
-  `exit_code` (via rename). The execs that start, poll and kill a job exit by themselves and run with
-  stdin `/dev/null`, the probe's path (`exec_once`), so no live exec ever sees stdin EOF.
-- *Supervision:* one gateway thread ticks every second. For a running job it polls a 2 s status exec
-  (window alive, else `exit_code`, else gone) every 2 s; on exit it copies the capped result and the last
-  1 MiB of the log to the host job directory with two more execs, then records the outcome. Output stays
-  readable after the agent is paused.
+  `claude` exits the runner writes `result.txt` (the `result` event, at most 256 KiB), then `exit_code`
+  (via rename), then the marker `.job-<job>.done` in the workspace root. Verified: `claude -p` works
+  non-interactively with the image's settings, streams, and contacts only `api.anthropic.com`.
+- *Supervision:* one gateway thread ticks every second. For a running job it `lstat`s the marker on the
+  host (a name directly in the trusted workspace root: nothing followed, nothing opened). It execs a
+  status script only when the marker appears (at most every 3 s, so a fake marker is cheap) or every
+  30 s, to notice a runner that vanished; the script finds the window by exact name in `list-windows`
+  (`display -t` falls back to the current pane when the target is missing, which made the agent's own
+  shell look like the job). On exit two execs copy the capped result and the last 1 MiB of the log to the
+  host job directory, so output stays readable after the agent is paused.
+- *Execs never see stdin EOF:* `CtrRuntime::exec_once` (start, status, kill and read, and also the
+  watchdog probe and the viewer's short execs) runs `timeout -s TERM -k 3 <limit> ctr ... task exec` as an
+  `Exec` with piped stdin that is dropped only after the process is reaped. Measured on a1: 125 execs of
+  `sh -c 'sleep 0.2; echo x' </dev/null` and the 126th wedged the shim (a1 left `ctr task ls`), while 200
+  with stdin held open did not, and 300 job-output reads through the new `exec_once` did not. The first
+  version of this API polled with `/dev/null`-stdin execs and wedged a1 twice.
 - *Timeouts and cancel:* default 30 min, 1 s to 4 h, enforced by the gateway from the registry's start
-  time. Cancel and timeout run a kill exec: it walks the window's process tree (children by parent pid,
-  plus the pane's session), stops every process, kills it, closes the window, and fails unless all of
-  them are gone. The runner also wraps `claude` in `timeout` at the deadline plus 5 min, a backstop for
-  a gateway that is down.
+  time. Cancel and timeout run a kill exec: it finds the window by name, walks its process tree (children
+  by parent pid, plus the pane's session), stops every process, kills it, closes the window by id, and
+  fails unless all of them are gone (zombies count as gone). The runner also wraps `claude` in `timeout`
+  at the deadline plus 5 min, a backstop for a gateway that is down.
 - *Lifecycle:* pause or destroy of an agent with a queued or running job is 409 unless `?force=true`;
-  then the running job becomes `interrupted` and queued ones `cancelled`. Startup reconcile does the same
-  for agents without a VM. Queued jobs are cancelled, not kept: resuming is an explicit, possibly much
-  later act, and running stale work then would surprise the caller. A gateway restart re-attaches: a job
-  recorded `running` is polled, never started again (and the start exec refuses an existing
-  `.jobs/<job>`). The job is marked `running` before its start exec, so a crash between the two shows up
-  as `failed` ("runner ended without an exit code"), never as a duplicate.
-- *Permissions:* a headless `claude` cannot ask. `AC_JOB_PERMISSION_MODE` (default `acceptEdits`) and
-  `AC_JOB_ALLOWED_TOOLS` (default `Read,Glob,Grep,Edit,Write` and `Bash` patterns for `git
-  status|diff|log|add|commit`, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`) become
-  flags. `bypassPermissions` / `--dangerously-skip-permissions` only with `AC_JOB_UNSAFE=1`.
-- *Limits and retention:* prompt <= 64 KiB; per agent the last 20 finished jobs are kept (registry
-  records and host copies), and the workspace keeps the last 5 `.jobs/<job>` directories, each log at
-  most 16 MiB, so job logs take at most about 85 MiB of a workspace.
+  then, before the VM stops, the running job is killed and marked `interrupted` and queued ones
+  `cancelled`. Startup reconcile (and every tick) does the same for agents that are not running, without
+  the kill. Queued jobs are cancelled, not kept: resuming is an explicit, possibly much later act, and
+  running stale work then would surprise the caller. A gateway restart re-attaches: a job recorded
+  `running` is probed, never started again (and the start exec refuses an existing `.jobs/<job>`). The
+  job is marked `running` before its start exec, so a crash between the two shows up as `failed`
+  ("runner ended without an exit code"), never as a duplicate. Purging an agent forgets its jobs.
+- *Permissions:* a headless `claude` cannot ask. `AC_JOB_PERMISSION_MODE` (default `acceptEdits`; also
+  `auto`, `dontAsk`, `manual`, `plan`) and `AC_JOB_ALLOWED_TOOLS` (comma-separated; default `Read`, `Glob`,
+  `Grep`, `Edit`, `Write` and `Bash` patterns for `git status|diff|log|add|commit`, `ls`, `cat`,
+  `python3`, `cargo build|test|check|fmt`, `sleep`) become flags. `bypassPermissions` /
+  `--dangerously-skip-permissions` only with `AC_JOB_UNSAFE=1`. See security.md for what that allows.
+- *Limits and retention:* prompt <= 64 KiB (413 beyond); per agent the last 20 finished jobs are kept
+  (registry records and host copies), and the workspace keeps the last 5 `.jobs/<job>` directories, each
+  log at most 16 MiB, so job logs take at most about 85 MiB of a workspace.
 - *Idempotency:* the same `idempotency_key` for the same agent returns the retained job with that key
-  (200) instead of creating one, whatever its prompt or state.
-- *Events:* queued, started, the outcome, cancelled and interrupted go to the agent's `ac-history` log
-  as `job <id> <state>`: ids and states only, timestamps from the log, no prompt or output.
+  (200) instead of creating one, whatever its prompt or state. Keys expire with their job's record.
+- *Events:* queued, started, the outcome (with the exit code), cancelled and interrupted go to the
+  agent's `ac-history` log as `job <id> <state>`: ids and states only, timestamps from the log, no prompt
+  or output. `GET .../history` shows them.
 **Consequences:** jobs run with the agent's own login and permissions; the permission list is a second
 layer and the VM, egress allowlist and isolation are the boundary. A job's outcome is what the agent's
 VM reports: a compromised agent can fake its own job's exit code and result, never another agent's, and
-never the registry's state or times. Output is read through execs, so a wedged agent delays collection
-(the watchdog still recovers it).
+never the registry's state or times. Output is read through execs, so a wedged agent delays collection.
+The image's PID 1 is `sleep infinity`, which never reaps, so killed jobs leave zombies until the agent
+is paused (harmless, but an init such as `tini` would clear them).
 **Not now:** `rusty_agui` (AG-UI events over SSE) fits a later per-job event stream that turns the
 stream-json log into `RUN_STARTED`/`TEXT_MESSAGE_*`/`TOOL_CALL_*`/`RUN_FINISHED`; it does not fit the
 control plane (AG-UI has no queue, job id or re-attach; a run is one request). Long-polling the status

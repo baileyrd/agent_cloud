@@ -43,8 +43,12 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] Production desktop image: Chromium managed policy applied; DevTools policy decided
 - [x] Terminal viewer: view-only by default, enforced in the gateway; one take-over holder;
   agent output sanitised to text and SGR before the browser (verified 2026-10-20, see [Viewer](#viewer))
-- [x] No `ctr task exec` ever gets stdin EOF from a pipe or file while its guest process lives
-  (it wedges the Kata shim); the gateway's watchdog recovers a wedge it finds (verified 2026-10-20)
+- [x] No `ctr task exec` ever gets stdin EOF while its guest process lives, from a pipe, a file or
+  `/dev/null` (it wedges the Kata shim); every gateway exec holds its stdin open (verified 2026-10-21:
+  `/dev/null` wedged a1 at the 126th exec, held stdin passed 200 and 300); the watchdog recovers a wedge
+  where killing `ctr` clients frees it
+- [x] Task API: job state in the host registry, agent output served as inert text, prompts never in an
+  argv, permission mode and tool list set by the operator (verified 2026-10-21, see [Task API](#task-api))
 
 ## Credentials for model access
 
@@ -100,11 +104,48 @@ What it does not protect:
 - A browser that vanishes without closing its connection holds its seat until TCP gives up; a
   closed one is noticed within about 5 s.
 
+## Task API
+
+Jobs (ADR-010) run a prompt in an agent with `claude -p`.
+
+**Who can call it:** whoever holds the gateway token, on the private bind, as for the rest of the API. If
+you give the token to another agent so it can submit jobs, it can also pause, destroy and take over every
+agent: there is one token. A per-caller, per-agent token is future work.
+
+**What a job can do:** it runs as the agent user in that agent's VM, with its login, its workspace and its
+egress allowlist. A headless `claude` cannot ask for approval, so the gateway passes the operator's choice:
+- default `AC_JOB_PERMISSION_MODE=acceptEdits` with the default `AC_JOB_ALLOWED_TOOLS`: read and search any
+  file the agent user can read; create and edit files in `/workspace`; `git status|diff|log|add|commit`
+  (not `push`); `ls`, `cat`, `sleep`; `python3` and `cargo build|test|check|fmt`. `acceptEdits` also
+  approves Claude Code's common filesystem commands inside `/workspace` on its own (a job ran `rm -f` on a
+  workspace file, 2026-10-21). Other commands are denied and the job carries on without them (a job's
+  `curl` was refused and listed under `permission_denials` in its stream log).
+- `python3` and `cargo` run arbitrary code (a `-c` argument, a build script), so with the default list a
+  job can in effect do anything the agent user can do inside its VM. Drop them for jobs that only read and
+  edit, if you want the list to mean more.
+- `AC_JOB_UNSAFE=1` passes `--dangerously-skip-permissions`: no list at all. Tradeoff: the VM, the egress
+  allowlist and the isolation between agents are the boundary in every mode; the permission list is a
+  second layer that stops a confused or prompt-injected job from casually running commands outside it.
+  Recommendation: keep `acceptEdits` with a list sized to the work.
+
+**Untrusted output:** the result and the stream log are written by the agent, and a prompt-injected agent
+writes what it likes. The gateway caps them (256 KiB, the last 1 MiB), never parses them, and serves them as
+`text/plain; charset=utf-8` with `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src
+'none'; sandbox` and `Cache-Control: no-store`, so a browser will not render or run them. A caller must treat
+them as data from an untrusted source too (for example, never paste them into a shell).
+
+**What the agent cannot change:** a job's state, times, timeout and exit code are in the host registry. The
+agent can fake its own job's result and exit code (it runs the job), never another agent's. The gateway
+(root) never writes, chowns or reads a path below the workspace root: the prompt goes in with
+`O_CREAT|O_EXCL` at the root of the bind mount, which follows no symlink, and output is read in the VM, as
+the agent user, by capped execs. Prompts are never in an argv; history records only job ids and states.
+
 ## Known gaps
 
 - A container-in-VM boundary is only as strong as the hypervisor and guest kernel config.
   Keep Kata and the host kernel patched.
 - The command guard only blocks known-bad patterns.
+- One bearer token for everything: a caller of the task API can also run the lifecycle API and the viewer.
 - Egress control limits destinations, not content: an agent can still send data to an allowed
   host (a GitHub gist, a model API request). TLS is not inspected, so domain fronting on shared
   CDN addresses is possible. See ADR-007.

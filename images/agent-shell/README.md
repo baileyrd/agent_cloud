@@ -31,9 +31,9 @@ sudo ctr -n agents task exec -t --exec-id sh1 a1 bash
 whoami; pwd                                                        # expect: agent, /workspace
 ```
 
-Never pipe or redirect a file into `ctr task exec` without `-t` (`... < script.py`, `printf ... | ctr ...`): EOF
-from a pipe or file wedges the Kata shim until that `ctr` is killed with SIGKILL. Use `< /dev/null` for commands
-that exit by themselves, or copy the file into the workspace and run it
+Never pipe or redirect a file into `ctr task exec` without `-t` (`... < script.py`, `printf ... | ctr ...`), and
+not `< /dev/null` either: stdin EOF while the guest process runs wedges the Kata shim. Feed stdin from a FIFO a
+background `sleep` holds open, or copy the file into the workspace and run it
 ([install.md, Fedora note 8](../../docs/install.md#fedora-44-notes-verified-on-baileyserv-i5-3550-2026-10-18)).
 
 Then run `claude` inside (or in one step: `sudo ctr -n agents task exec --tty --exec-id t2 a1 sh -c 'cd /workspace && claude'`;

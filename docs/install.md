@@ -184,9 +184,14 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    Without `-t`, `ctr` never passes stdin EOF to the guest, and when the host side of a pipe or file reaches
    EOF while the guest process lives, the Kata shim blocks every other call on that task: new execs fail with
    `context deadline exceeded` and the agent drops out of `ctr task ls`. SIGTERM does not help (`ctr` forwards
-   it through the stuck shim); SIGKILL of that `ctr` client does. `< /dev/null` is safe, for commands that exit
-   by themselves. To run a script, copy it into the workspace and run it there. (Measured 2026-10-20: `printf x
-   | ctr task exec ... cat` wedged, `cat </dev/null` did not; this caused an earlier a1 freeze the same day.)
+   it through the stuck shim); SIGKILL of that `ctr` client does. **`< /dev/null` is not safe either**: its EOF
+   comes at once, while the guest process still runs, so every such exec is a race (measured 2026-10-21: 125
+   execs of `sh -c 'sleep 0.2; echo x' </dev/null` and the 126th wedged a1; 200 with stdin held open did not).
+   Hold stdin open instead, from a FIFO that a background `sleep` keeps open:
+   `mkfifo /tmp/hold; sleep 100000 > /tmp/hold & ctr ... task exec ... < /tmp/hold` (kill the `sleep` once no
+   exec runs). The gateway's `exec_once` holds a pipe open the same way, and `scripts/post-reboot-check.sh` uses
+   the FIFO. To run a script, copy it into the workspace and run it there. (Measured 2026-10-20: `printf x |
+   ctr task exec ... cat` wedged; this caused an earlier a1 freeze the same day.)
 
 ## Host services
 
@@ -285,14 +290,46 @@ and shim and restarting the gateway (2026-10-19), and across real reboots (2026-
 reboot, the gateway logged `reconcile: a1 had no VM; marked paused` and `scripts/post-reboot-check.sh` passed
 (no netns, Kata processes, task or lease left; a1 resumed with its login).
 
+**Task API** (ADR-010): run a prompt in an agent as a job, with an id, live status and the result. Nothing to
+install; the gateway serves it. Jobs run `claude -p` in the agent's tmux session `main`, in a window named
+`job-<id>`, so you can watch one in the viewer (select the window with `Ctrl-b <n>` after **Take over**). Settings
+in `gateway.env` (restart the gateway after a change):
+
+- `AC_JOB_PERMISSION_MODE`: `acceptEdits` (default), `auto`, `dontAsk`, `manual` or `plan`;
+- `AC_JOB_ALLOWED_TOOLS`: comma-separated `claude --allowedTools` entries (default: read, search and edit files,
+  `git` without push, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`);
+- `AC_JOB_UNSAFE=1`: `--dangerously-skip-permissions` instead. Read [security.md](security.md#task-api) first.
+
+With curl (the token goes to curl on stdin, not on its command line):
+
+```bash
+. <(sudo grep -E '^AC_(BIND|TOKEN_FILE)=' /etc/agent-cloud/gateway.env)
+H() { printf 'Authorization: Bearer %s\n' "$(sudo cat "$AC_TOKEN_FILE")"; }
+J=http://$AC_BIND/api/v1/agents/a1/jobs
+H | curl -sS -H @- -d '{"prompt":"reply with exactly the word pong","timeout_secs":300}' $J
+# {"job_id":"6b941feec45a4c25","agent":"a1","state":"queued",...}         202
+H | curl -sS -H @- "$J/6b941feec45a4c25?wait=30"     # returns when the state changes (or after 30 s)
+H | curl -sS -H @- $J/6b941feec45a4c25/output        # pong (the final message, plain text)
+H | curl -sS -H @- "$J/6b941feec45a4c25/output?part=stream"   # the stream-json log
+H | curl -sS -H @- -X POST $J/6b941feec45a4c25/cancel
+H | curl -sS -H @- $J                                # the agent's jobs, newest first
+```
+
+Or `sudo scripts/ac-job.sh a1 'reply with exactly the word pong'` (prompt `-` reads stdin; `TIMEOUT=`, `KEY=` for
+an idempotency key, `STREAM=1`): it submits, waits, prints the result and exits 0 if the job succeeded. Add
+`"idempotency_key":"..."` to make a retried submit return the same job. The agent must be running (409
+otherwise); pause and destroy refuse an agent with a job (409) unless `?force=true`, which interrupts it. Job state
+lives in `/var/lib/agent-cloud/jobs.mmap`; prompts and collected output in `/var/lib/agent-cloud/jobs/<agent>/`
+(root, 0700); state changes appear in `GET .../history` as `job <id> <state>`.
+
 **Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the
 allowlist's owner and mode, and that the gateway and proxy listen only on private addresses. It checks that
 every agent the gateway lists (`GET /api/v1/agents`) is paused or destroyed and has no netns, Kata processes,
 containerd task or CNI lease left. Then it resumes `a1` through the gateway and, inside it, checks
 `claude auth status`, `claude -p`, the API through the proxy, a denied host (example.com) and an unreachable
-LAN address (192.168.50.1). It pauses `a1` again afterwards (`KEEP_A1=1` leaves it running). It takes about
-30 s.
+LAN address (192.168.50.1), and runs a job through the task API ("reply with exactly the word pong", expecting
+`succeeded`). It pauses `a1` again afterwards (`KEEP_A1=1` leaves it running). It takes about 45 s.
 
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).

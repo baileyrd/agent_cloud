@@ -23,7 +23,9 @@
 - [x] Startup reconcile: agents recorded running with no VM become paused and are cleaned up (`ac-ctl reconcile`,
   run by `ac-gateway` at start); verified after a simulated VM crash and across a real reboot (2026-10-20)
 - [x] Gateway lifecycle API with bearer auth, private-bind check (`ac-gateway`); TLS via Tailscale still pending
-- [ ] Agent API (AG-UI via `rusty_agui`)
+- [x] Task API: jobs with ids, long-poll status, capped output, cancel, timeouts, re-attach after a gateway restart
+  (ADR-010; verified on BaileyServ 2026-10-21)
+- [ ] Per-job event stream (AG-UI via `rusty_agui`), and a token per caller and agent
 - [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
 - [x] Fleet lifecycle and `ctr`/Kata adapter (`ac-fleet`, `ac-ctr`), tested against fakes and on the host
 
@@ -35,6 +37,7 @@
 - [ ] Five-agent load test; update [sizing.md](sizing.md) with real numbers
 
 ## Later
+- An init (`tini`) as the agent image's PID 1, so killed jobs leave no zombies
 - Local model option for an offline posture
 - Memory snapshots, so pause/resume keeps running processes (today pause stops the VM)
 - Capture the Dots viewer protocol on an unfiltered network

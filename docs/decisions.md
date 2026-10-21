@@ -41,17 +41,62 @@ and history layer instead. Keep one Cloudroom-in-a-full-VM instance as an option
 only for a concrete forcing function (independent scaling, language boundary, fault isolation).
 **Why Rust:** single static binary on the host, lifecycle and allowlist rules as types, and
 reuse of ports-and-adapters patterns from the owner's existing Rust tooling.
-**Consequences:** Sync ports first; async (tokio) enters only with the gateway's WebSocket proxy.
+**Consequences:** Sync ports throughout; the viewer uses threads and a streamed HTTP response, not
+async (ADR-006).
 
-## ADR-006: Desktop streaming layer
-**Status:** open.
-**Context:** Dots' viewer protocol is unknown (the WebSocket was blocked by a network proxy
-during inspection).
-**Options:** KasmVNC (bundles X server, VNC and web client; simplest), Xvfb/x11vnc plus
-noVNC, a WebRTC streamer such as Neko or Selkies (lower latency), ffmpeg `x11grab` into the
-gateway (most control, most work).
-**Leaning:** KasmVNC to get a working viewer, behind the gateway so clients use one
-authenticated WSS. Note it brings its own X server; the dummy-driver Xorg design may be replaced.
+## ADR-006: Viewer (terminal now, desktop later)
+**Status:** accepted for the terminal (2026-10-20, verified on BaileyServ); the desktop stream
+is still open.
+**Decision (terminal):** the owner watches an agent's tmux session `main` in a browser and can
+take over its input, while the agent keeps running. All of it lives in `ac-gateway` (one
+process owns the registry lock); bearer-token auth and the private-bind check are unchanged.
+- *Session:* the image has tmux. The gateway creates `main` in `/workspace` as the agent user
+  (with the image's environment) if it is missing. It survives browsers closing and is shared by
+  the agent and every viewer.
+- *Bridge:* the host reaches the VM only through `ctr task exec`, and `unsafe_code` is forbidden,
+  so there is no host PTY. One `tmux -C attach -f ignore-size` control client per viewed agent,
+  over plain pipes, feeds every viewer. On `%output` it asks tmux for the cursor and a
+  `capture-pane -e` snapshot (one in flight at a time, which batches bursts). tmux is the
+  terminal emulator, so resize, UTF-8, colours, vim and `claude` render as tmux renders them
+  (all verified). Rejected: a host helper PTY (`script` is not installed, `ctr -t` needs a
+  console, and resizing would mean `stty` on a hidden PTY), and one exec per keystroke or capture
+  (about 100 ms each on Kata).
+- *Kata hazard:* without `-t`, `ctr` never passes stdin EOF to the guest, and EOF from a pipe or
+  file while the guest process lives wedges the shim until that `ctr` is SIGKILLed (measured; it
+  caused an earlier a1 freeze). Every long-lived exec is an `ac_ctr::Exec`, whose only way to end
+  is quit command, 3 s, SIGTERM, 3 s, SIGKILL, reap, then drop stdin (also on panic). systemd's
+  default `KillMode=control-group` sends SIGTERM to the gateway and its `ctr` children together,
+  and `ctr` forwards it, so a restart is clean. At startup the gateway SIGKILLs leftover `ctr`
+  clients and detaches stale control clients. A watchdog probes running agents every 30 s
+  (`AC_PROBE_INTERVAL`) with a 2 s exec; on failure it SIGKILLs our `ctr` clients, then every
+  `ctr` exec client of that agent, and if it still fails marks it `"health":"unhealthy"` without
+  touching the VM.
+- *Transport:* rusty_serve has no WebSocket upgrade, so a `fetch()`-streamed chunked GET carries
+  NDJSON (a full snapshot with scrollback on connect, then changed lines and the cursor), and
+  POSTs carry input, resize and take-over. `fetch` sends `Authorization`, so no ticket is
+  needed. Origin is checked on every request; caps of 4 viewers per agent and 16 in all leave
+  rusty_serve's 64 connections for the API; viewer routes never take the lifecycle lock.
+- *Rendering:* the gateway turns snapshots into styled runs (SGR only) and drops every other
+  escape (OSC 8/52, titles, DCS, APC, C0/C1, bidi overrides). The page (about 250 lines of
+  in-repo JS, no third-party code, CSP `'self'` only) sets text with `textContent`.
+- *View-only and take-over:* view-only is the default. The guarantee rests on the gateway, not
+  tmux: input from a viewer without the lock gets 403 before anything is built; the view
+  client's whole vocabulary is a closed enum (`ViewCommand`: client name, cursor info,
+  snapshot); the take-over client exists only while a viewer holds the lock and takes only
+  `Input`, whose bytes are sent as `send-keys -H` hex (key names are mapped to terminal bytes),
+  so no viewer byte can be read as a tmux command. tmux's `read-only` flag was tried and dropped:
+  while such a client is attached, tmux refuses the agent's own tmux commands, even from inside
+  its pane. One viewer holds the lock; a second take-over is refused unless forced; release or
+  disconnect returns to view-only.
+- *Recording:* while viewed, output chunks and take-over events go to the per-agent `ac-history`
+  log (`<data>/history/<id>`, 0700, 1 MiB segments, 16 MiB kept). Keystrokes are not recorded.
+  `GET .../history` returns plain text with every escape stripped.
+**Consequences:** a viewer with the lock has the agent's shell, and so its login. Output while
+nobody watches is not recorded (it stays in tmux scrollback). A vanished browser is noticed at
+the next keep-alive write (5 s); a half-open connection holds its seat until TCP gives up.
+**Open (desktop):** Dots' viewer protocol is unknown. Options: KasmVNC (bundles X server, VNC
+and web client), Xvfb/x11vnc plus noVNC, a WebRTC streamer (Neko, Selkies), or ffmpeg
+`x11grab` into the gateway. Leaning: KasmVNC behind the gateway, on the same transport and lock.
 
 ## ADR-007: Egress control
 **Status:** accepted (2026-10-19; verified on BaileyServ; agent isolation and the firewalld zone

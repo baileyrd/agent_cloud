@@ -1,7 +1,9 @@
 # agent-shell image
 
-Fedora 44 with Node, git, ripgrep and Claude Code, running as `agent` (uid 1000, no sudo). The container
-sleeps; you attach to it. Desktop, browser and the agent API come later.
+Fedora 44 with Node, git, ripgrep, tmux, vim and Claude Code, running as `agent` (uid 1000, no sudo). The
+container sleeps; you attach to it, or watch it in a browser: the gateway's terminal viewer creates and shows
+the tmux session `main` ([docs/install.md, Terminal viewer](../../docs/install.md#host-services)). Desktop,
+browser and the agent API come later.
 
 ## Build and load (on the host)
 

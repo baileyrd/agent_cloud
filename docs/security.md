@@ -12,6 +12,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 | Agent exfiltrates data | Egress allowlist proxy (`ac-egress`), firewall makes it the only route; limits destinations, not content (ADR-007) |
 | Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
+| Agent attacks the viewer's browser | Only sanitised text and SGR colours reach the page; strict CSP; see [Viewer](#viewer) |
 | Network attacker reaches the API | Gateway on tailnet only, bearer token, TLS; no public port |
 | Runaway agent starves the host | Per-agent CPU/memory caps, disk quotas, concurrent-build limit |
 | Destructive commands | Command guard in the shell container (a backstop, not a boundary) |
@@ -40,6 +41,10 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] Data directory (registry + event logs) owned by the control-plane user, mode 0700; one process per directory is enforced by a lock
 - [ ] Backups for the data directory and workspace volumes, with a tested restore
 - [ ] Production desktop image: Chromium managed policy applied; DevTools policy decided
+- [x] Terminal viewer: view-only by default, enforced in the gateway; one take-over holder;
+  agent output sanitised to text and SGR before the browser (verified 2026-10-20, see [Viewer](#viewer))
+- [x] No `ctr task exec` ever gets stdin EOF from a pipe or file while its guest process lives
+  (it wedges the Kata shim); the gateway's watchdog recovers a wedge it finds (verified 2026-10-20)
 
 ## Credentials for model access
 
@@ -51,6 +56,49 @@ host user with that uid can read every agent's login. `AC_UID` must equal the im
 uid, so on a shared host rebuild the image with an otherwise unused uid and set `AC_UID` to it. Do not put inference credentials in control-plane
 environment files. A request flow that asks the owner for a secret through a form, not
 chat, is worth building (Cloudroom's `cloud-secrets` skill is a reference).
+
+## Viewer
+
+The terminal viewer (ADR-006) shows an agent's tmux session `main` and lets one viewer take over
+its input.
+
+What it protects:
+- **The token** travels only in the `Authorization` header. The page asks for it and keeps it in
+  memory: never in the URL, a cookie or browser storage. There are no cookies, so a cross-site
+  page cannot ride a session; Origin (and `Sec-Fetch-Site`) are checked on every request anyway.
+  The page itself carries no data and is served without the token, since a browser cannot send a
+  header when it navigates.
+- **View-only is enforced by the gateway, not by tmux or the page.** A viewer without the
+  take-over lock gets 403 for any input, before anything is built. The shared view client can
+  only be sent a closed set of commands (`ViewCommand`: client name, cursor info, snapshot); the
+  take-over client exists only while someone holds the lock and receives only `send-keys -H`
+  hex and `refresh-client -C` lines, so no viewer byte can become a tmux command. tmux's
+  `read-only` flag is not used: it made tmux refuse the agent's own tmux commands while anyone
+  watched. **An agent can always use its own tmux while someone watches.**
+- **Agent to viewer:** the gateway turns screen snapshots into plain text plus colour numbers. OSC
+  sequences (hyperlinks, clipboard writes, titles), DCS, APC, cursor movement, control characters
+  and bidi overrides are dropped before anything is sent; the page sets text with
+  `textContent`; its CSP allows only its own script, style and API (`default-src 'none'`). An
+  agent can garble its own viewer (for example by printing lines that mimic tmux's protocol),
+  never another agent's, and never run anything in the browser.
+- **Resources:** 4 viewers per agent and 16 in all, below rusty_serve's 64 connections, so viewers
+  cannot starve the lifecycle API (tested). A viewer that falls 256 messages behind is dropped;
+  input is capped (64 keys, 4 KiB typed, 64 KiB pasted per request).
+- **Recording:** while viewed, the agent's output and every take-over, forced take-over and
+  release are logged per agent (`/var/lib/agent-cloud/history/<id>`, root, 0700, 16 MiB kept).
+  **Keystrokes are not recorded**, because they can hold secrets typed during a take-over; a
+  take-over appears only as its start and end. What the terminal echoes is output and is recorded
+  (a typed command line appears; a password at a no-echo prompt does not).
+
+What it does not protect:
+- **A take-over holder has full control of the agent's shell**, and so of everything the agent
+  user can reach: its workspace, its Claude Code login (`/workspace/.claude`), its Git credentials.
+  Treat the token, and a take-over, as equivalent to agent access.
+- Anything the agent prints is shown and recorded, secrets included.
+- The gateway listens on loopback here; reach it through an SSH tunnel (encrypted) or a tailnet
+  address. There is no TLS of its own.
+- A browser that vanishes without closing its connection holds its seat until TCP gives up; a
+  closed one is noticed within about 5 s.
 
 ## Known gaps
 

@@ -13,16 +13,17 @@
 - [ ] Start one real agent image (shell + desktop), open its desktop, run a task end to end
 
 ## M2: Viewer
-- [ ] Decide streaming layer (ADR-006)
-- [ ] Watch and take over via one authenticated WSS
+- [x] Terminal viewer: watch an agent's tmux session and take over its input from a browser, view-only by
+  default, recorded while viewed (ADR-006; verified on BaileyServ 2026-10-20)
+- [ ] Desktop streaming layer (ADR-006, open part) on the same transport and take-over lock
 
 ## M3: Control plane
 - [x] Spawner: create, pause (stops the VM), resume, destroy (keeps the workspace) and purge, verified through
   the gateway on BaileyServ (2026-10-19)
 - [x] Startup reconcile: agents recorded running with no VM become paused and are cleaned up (`ac-ctl reconcile`,
-  run by `ac-gateway` at start); verified after a simulated VM crash, not yet across a real reboot
+  run by `ac-gateway` at start); verified after a simulated VM crash and across a real reboot (2026-10-20)
 - [x] Gateway lifecycle API with bearer auth, private-bind check (`ac-gateway`); TLS via Tailscale still pending
-- [ ] Agent API (AG-UI via `rusty_agui`) and WebSocket viewer proxy
+- [ ] Agent API (AG-UI via `rusty_agui`)
 - [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
 - [x] Fleet lifecycle and `ctr`/Kata adapter (`ac-fleet`, `ac-ctr`), tested against fakes and on the host
 

@@ -251,6 +251,26 @@ TOKEN=$(sudo cat /etc/agent-cloud/gateway.token)
 curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1
 ```
 
+**Terminal viewer** (ADR-006): served by the gateway, nothing else to install. Agents need an image with tmux
+(`images/agent-shell` has it since 2026-10-20); a paused agent picks up a re-imported image when it is resumed.
+How to use it:
+
+1. From your own machine, tunnel to the gateway (it listens on loopback):
+   `ssh -N -L 8780:127.0.0.1:8780 -p 30556 baileyrd@192.168.50.196` (in general:
+   `ssh -N -L 8780:127.0.0.1:8780 [-p <ssh-port>] <user>@<host>`). With `AC_BIND` on a tailnet address,
+   skip the tunnel and use that address instead of `localhost`.
+2. Open `http://localhost:8780/ui/<agent-id>` (for example `http://localhost:8780/ui/a1`). The page asks for the
+   gateway token (`sudo cat /etc/agent-cloud/gateway.token`) and keeps it in memory only: reloading asks again.
+3. You watch the agent's tmux session `main`, view-only. **Take over** gives you the keyboard (paste works;
+   the window follows your browser's size); **Release** hands it back. If another viewer has control you get
+   **Force take over**. Closing the tab leaves the session running; the next viewer sees its scrollback.
+4. What was shown while someone watched, with take-over events: `GET /api/v1/agents/<id>/history?limit=N`
+   (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
+
+The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off);
+a wedged one is logged (`journalctl -u ac-gateway | grep watchdog`) and freed by killing `ctr` clients, or
+reported as `"health":"unhealthy"` if that fails. Recordings live under `/var/lib/agent-cloud/history/` (0700).
+
 The gateway locks the data directory (`/var/lib/agent-cloud`), so stop it (`sudo systemctl stop ac-gateway`)
 before running `ac-ctl` against the same directory. Stopping the gateway leaves its agents running.
 

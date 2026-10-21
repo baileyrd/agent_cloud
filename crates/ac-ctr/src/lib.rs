@@ -265,8 +265,12 @@ impl<S: Spawner> CtrRuntime<S> {
         Ok(Exec::new(child, quit, Duration::from_secs(3)))
     }
 
-    /// Run `args` in agent `id` to completion with stdin the null device (which never wedges the
-    /// shim) and return its stdout. Killed with SIGKILL after `limit` (safe for the shim).
+    /// Run `args` in agent `id` to completion and return its stdout. Stdin is a pipe this process
+    /// holds, through an [`Exec`], until the exec is reaped: stdin EOF while the guest process
+    /// lives wedges the shim, and `/dev/null` is no exception (measured 2026-10-21: 125 execs of
+    /// `sleep 0.2` with `</dev/null` wedged a1; 200 with stdin held open did not). After `limit`
+    /// coreutils `timeout` sends SIGTERM (which `ctr` forwards to the guest process), and SIGKILL
+    /// 3 s later; stdin is dropped only after that.
     pub fn exec_once(
         &self,
         op: &'static str,
@@ -274,13 +278,36 @@ impl<S: Spawner> CtrRuntime<S> {
         args: &[&str],
         limit: Duration,
     ) -> Result<Vec<u8>, PortError> {
+        let fail = |cause: String| PortError { op, cause };
         let secs = limit.as_secs().max(1).to_string();
-        let mut argv = os(&["-s", "KILL", &secs, &self.cfg.ctr_bin]);
+        let mut argv = os(&["-s", "TERM", "-k", "3", &secs, &self.cfg.ctr_bin]);
         argv.extend(self.exec_argv("acexec", id));
         argv.extend(os(args));
-        match self.spawn_wait(op, OsStr::new("timeout"), &argv, None)? {
-            (status, stdout, _) if status.success() => Ok(stdout),
-            (status, stdout, stderr) => Err(failure(op, status, &stdout, &stderr)),
+        if self.cfg.trace {
+            eprintln!("ac-ctr: {op}: timeout {argv:?}");
+        }
+        let mut cmd = Command::new("timeout", "/").args(&argv);
+        cmd.stdin = Stdio::Pipe;
+        cmd.stdout = Stdio::Pipe;
+        cmd.stderr = Stdio::Pipe;
+        let child = self
+            .spawner
+            .spawn(&cmd)
+            .map_err(|e| fail(format!("spawn timeout: {e:?}")))?;
+        let mut exec = Exec::new(child, b"", Duration::from_secs(3));
+        let drain = |pipe: Option<Box<dyn platform::fs::File>>| match pipe {
+            Some(mut pipe) => read_all(pipe.as_mut()).map_err(|e| fail(format!("read: {e:?}"))),
+            None => Ok(Vec::new()),
+        };
+        // Stdout before stderr, as in `spawn_wait`: fine for these small outputs.
+        let stdout = drain(exec.take_stdout());
+        let stderr = drain(exec.take_stderr());
+        let status = exec.close_status();
+        let (stdout, stderr) = (stdout?, stderr?);
+        match status {
+            Some(status) if status.success() => Ok(stdout),
+            Some(status) => Err(failure(op, status, &stdout, &stderr)),
+            None => Err(fail("no exit status".into())),
         }
     }
 
@@ -825,21 +852,21 @@ mod tests {
     }
 
     #[test]
-    fn probe_is_a_null_stdin_exec_killed_after_2s() {
+    fn probe_is_a_held_stdin_exec_stopped_after_2s() {
         let (rt, log, root) = rt(ExitStatus::Code(0));
         assert!(rt.probe(&id()));
         let (calls, progs) = (argv(&log), programs(&log));
         assert_eq!(progs, ["timeout"]);
         assert_eq!(
-            calls[0][..8],
-            ["-s", "KILL", "2", "ctr", "-n", "agents", "task", "exec"]
+            calls[0][..10],
+            ["-s", "TERM", "-k", "3", "2", "ctr", "-n", "agents", "task", "exec"]
         );
-        assert!(calls[0][9].starts_with("acexec-a1-"), "{:?}", calls[0]);
-        assert_eq!(calls[0][10..], ["a1", "true"]);
+        assert!(calls[0][11].starts_with("acexec-a1-"), "{:?}", calls[0]);
+        assert_eq!(calls[0][12..], ["a1", "true"]);
         let log = log.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
             log[0].stdin,
-            platform_mock::process::StdioKind::Null
+            platform_mock::process::StdioKind::Pipe
         ));
         let _ = std::fs::remove_dir_all(root);
     }

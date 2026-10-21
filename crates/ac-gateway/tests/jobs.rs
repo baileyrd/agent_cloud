@@ -835,14 +835,20 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
             Some(prompt.as_bytes())
         );
         let argv = argvs(&log).pop().unwrap_or_default();
-        // timeout -s KILL 30 ctr -n agents task exec --exec-id <x> a1 sh -c <START> ac-job-start
-        // <RUN> <job> <secs> <flags...>: constants, the job id and the operator's flags only.
-        assert_eq!(argv[..4], ["timeout", "-s", "KILL", "30"]);
-        assert_eq!(argv[4..9], ["ctr", "-n", "agents", "task", "exec"]);
-        assert_eq!(argv[11..14], ["a1", "sh", "-c"]);
-        assert_eq!(argv[15], "ac-job-start");
-        assert_eq!(argv[17..19], [job.to_string(), "360".to_owned()]);
-        assert_eq!(argv[19..], flags[..]);
+        // timeout -s TERM -k 3 30 ctr -n agents task exec --exec-id <x> a1 sh -c <START>
+        // ac-job-start <RUN> <job> <secs> <flags...>: constants, the job id and the operator's
+        // flags only.
+        assert_eq!(argv[..6], ["timeout", "-s", "TERM", "-k", "3", "30"]);
+        assert_eq!(argv[6..11], ["ctr", "-n", "agents", "task", "exec"]);
+        assert_eq!(argv[13..16], ["a1", "sh", "-c"]);
+        assert_eq!(argv[17], "ac-job-start");
+        assert_eq!(argv[19..21], [job.to_string(), "360".to_owned()]);
+        assert_eq!(argv[21..], flags[..]);
+        let held = log.lock().map(|l| {
+            l.iter()
+                .all(|r| matches!(r.stdin, platform_mock::process::StdioKind::Pipe))
+        });
+        assert_eq!(held.ok(), Some(true), "every exec's stdin is held open");
         for a in &argv {
             assert!(!a.contains(prompt.as_str()), "prompt in argv");
             assert!(
@@ -907,7 +913,11 @@ fn ctr_status_kill_and_read_parse_strictly() {
         let (rt, log) = ctr(&root, out);
         assert_eq!(rt.status(&a1, &job).map_err(drop), want, "{out:?}");
         let argv = argvs(&log).pop().unwrap_or_default();
-        assert_eq!(argv[..4], ["timeout", "-s", "KILL", "10"], "a 10 s probe");
+        assert_eq!(
+            argv[..6],
+            ["timeout", "-s", "TERM", "-k", "3", "10"],
+            "a 10 s probe"
+        );
         assert_eq!(argv.last(), Some(&job.to_string()));
     }
     for (out, ok) in [("killed\n", true), ("gone\n", true), ("alive: 12\n", false)] {
@@ -918,7 +928,7 @@ fn ctr_status_kill_and_read_parse_strictly() {
     let _ = rt.read(&a1, &job, Part::Result);
     let _ = rt.read(&a1, &job, Part::Stream);
     let all = argvs(&log);
-    let tails: Vec<&[String]> = all.iter().map(|a| &a[12..]).collect();
+    let tails: Vec<&[String]> = all.iter().map(|a| &a[14..]).collect();
     assert_eq!(
         tails[0],
         [

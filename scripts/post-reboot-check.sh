@@ -105,7 +105,9 @@ restore() {
     fi
     resumed=
 }
-trap 'restore; exit "$fail"' EXIT
+HOLD= HOLDER=
+release() { [ -z "$HOLDER" ] || kill "$HOLDER" 2>/dev/null; [ -z "$HOLD" ] || rm -f "$HOLD"; }
+trap 'restore; release; exit "$fail"' EXIT
 trap 'fail=1; exit' INT TERM
 
 case $was in
@@ -119,8 +121,13 @@ case $was in
     *) bad "$AGENT not resumable (state: ${was:-unknown})"; exit "$fail" ;;
 esac
 
+# Stdin for execs: a FIFO a background sleep holds open, so no exec ever sees stdin EOF while it
+# runs. EOF on a live exec's stdin wedges the Kata shim, and /dev/null is no exception (ADR-010).
+HOLD=$(mktemp -u /tmp/ac-check-stdin.XXXXXX) && mkfifo -m 600 "$HOLD" || exit 2
+sleep 100000 > "$HOLD" &
+HOLDER=$!
 # Run a shell command in the agent as its user, with the image's environment.
-gx() { ctr -n "$NS" task exec --exec-id "chk-$1-$$" "$AGENT" sh -c "$2" </dev/null 2>&1; }
+gx() { ctr -n "$NS" task exec --exec-id "chk-$1-$$" "$AGENT" sh -c "$2" <"$HOLD" 2>&1; }
 i=0
 until gx ready true >/dev/null; do
     i=$((i + 1)); [ "$i" -lt 30 ] || { bad "$AGENT: exec never worked"; exit "$fail"; }

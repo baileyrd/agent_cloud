@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use platform::fs::File;
-use platform::process::{Child, Signal};
+use platform::process::{Child, ExitStatus, Signal};
 
 /// How [`Exec::close`] ended the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub struct Exec {
     stdin: Option<Box<dyn File>>,
     quit: Vec<u8>,
     grace: Duration,
+    status: Option<ExitStatus>,
 }
 
 impl Exec {
@@ -44,6 +45,7 @@ impl Exec {
             stdin,
             quit: quit.to_vec(),
             grace,
+            status: None,
         }
     }
 
@@ -60,6 +62,11 @@ impl Exec {
         self.child.as_mut()?.take_stdout()
     }
 
+    /// The read end of the process's stderr, if piped. Yields `Some` once.
+    pub fn take_stderr(&mut self) -> Option<Box<dyn File>> {
+        self.child.as_mut()?.take_stderr()
+    }
+
     /// The host pid of the `ctr` client.
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
@@ -68,6 +75,12 @@ impl Exec {
     /// End the process (see the module docs) and say how.
     pub fn close(mut self) -> Closed {
         self.finish()
+    }
+
+    /// End the process like [`Exec::close`] and return its exit status, if it could be reaped.
+    pub fn close_status(mut self) -> Option<ExitStatus> {
+        self.finish();
+        self.status
     }
 
     fn finish(&mut self) -> Closed {
@@ -93,7 +106,7 @@ impl Exec {
             }
         };
         // SIGKILL cannot be ignored, so this returns; for the other cases the status is stashed.
-        let _ = child.wait();
+        self.status = child.wait().ok();
         self.stdin = None;
         how
     }

@@ -5,18 +5,25 @@
 //! network after the task starts) gives the guest nothing. Instead the adapter creates a network
 //! namespace, attaches it with the CNI bridge plugin, then starts the container in it.
 
+pub mod exec;
+
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ac_domain::AgentId;
 use ac_ports::{PortError, Runtime};
 use platform::process::{Command, EnvSpec, ExitStatus, Spawner, Stdio};
 
+pub use exec::{Closed, Exec};
+
 const KATA: &str = "io.containerd.kata.v2";
 const WORKSPACE_MOUNT: &str = "/workspace";
 const CNI_PATH_ENV: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Exec ids the gateway's own long-lived execs start with, so leftovers can be found.
+pub const VIEW_EXEC_PREFIX: &str = "acview";
 
 /// Agents get no DNS: the egress proxy resolves names on the host (ADR-007). With no nameserver
 /// line the guest's resolver asks its own loopback, which fails at once instead of timing out.
@@ -152,26 +159,35 @@ impl<S: Spawner> CtrRuntime<S> {
         args: &[OsString],
         env: Option<BTreeMap<OsString, OsString>>,
     ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), PortError> {
-        let fail = |cause: String| PortError { op, cause };
-        let mut argv: Vec<OsString> = Vec::new();
-        let mut exe = program.to_owned();
-        if let Some(limit) = self.cfg.command_timeout {
-            argv.extend([
-                OsString::from("--kill-after=5"),
-                OsString::from(limit.as_secs().to_string()),
-                program.to_owned(),
-            ]);
-            exe = OsString::from("timeout");
+        match self.cfg.command_timeout {
+            Some(limit) => {
+                let secs = limit.as_secs().to_string();
+                let mut argv = os(&["--kill-after=5", &secs]);
+                argv.push(program.to_owned());
+                argv.extend_from_slice(args);
+                self.spawn_wait(op, OsStr::new("timeout"), &argv, env)
+            }
+            None => self.spawn_wait(op, program, args, env),
         }
-        argv.extend_from_slice(args);
+    }
+
+    /// Spawn `exe argv...` with stdin the null device, drain its output and wait for it.
+    fn spawn_wait(
+        &self,
+        op: &'static str,
+        exe: &OsStr,
+        argv: &[OsString],
+        env: Option<BTreeMap<OsString, OsString>>,
+    ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), PortError> {
+        let fail = |cause: String| PortError { op, cause };
         if self.cfg.trace {
-            let line: Vec<String> = std::iter::once(&exe)
-                .chain(argv.iter())
+            let line: Vec<String> = std::iter::once(exe)
+                .chain(argv.iter().map(OsString::as_os_str))
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
             eprintln!("ac-ctr: {op}: {}", line.join(" "));
         }
-        let mut cmd = Command::new(&exe, "/").args(&argv);
+        let mut cmd = Command::new(exe, "/").args(argv);
         if let Some(env) = env {
             cmd = cmd.env(EnvSpec::Explicit(env));
         }
@@ -190,6 +206,94 @@ impl<S: Spawner> CtrRuntime<S> {
         let stderr = drain(child.take_stderr())?;
         let status = child.wait().map_err(|e| fail(format!("wait: {e:?}")))?;
         Ok((status, stdout, stderr))
+    }
+
+    /// `ctr -n <ns> task exec --exec-id <tag>-<id>-<pid>-<n> <id>`, before the command. Exec ids are
+    /// unique per process and call, so a leftover from a crashed run never blocks a new one.
+    fn exec_argv(&self, tag: &str, id: &AgentId) -> Vec<OsString> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let exec_id = format!("{tag}-{id}-{}-{n}", std::process::id());
+        os(&[
+            "-n",
+            &self.cfg.namespace,
+            "task",
+            "exec",
+            "--exec-id",
+            &exec_id,
+            id.as_str(),
+        ])
+    }
+
+    /// Start `args` in agent `id` as a long-lived [`Exec`] (stdin piped; stdout piped if
+    /// `read_output`, else the null device; stderr the null device). `quit` is what makes it exit
+    /// by itself. Not wrapped in `timeout`: it lives as long as its owner wants.
+    pub fn spawn_exec(
+        &self,
+        id: &AgentId,
+        args: &[&str],
+        read_output: bool,
+        quit: &[u8],
+    ) -> Result<Exec, PortError> {
+        let mut argv = self.exec_argv(VIEW_EXEC_PREFIX, id);
+        argv.extend(os(args));
+        if self.cfg.trace {
+            eprintln!("ac-ctr: spawn_exec: {} {argv:?}", self.cfg.ctr_bin);
+        }
+        let mut cmd = Command::new(&self.cfg.ctr_bin, "/").args(&argv);
+        cmd.stdin = Stdio::Pipe;
+        cmd.stdout = if read_output {
+            Stdio::Pipe
+        } else {
+            Stdio::Null
+        };
+        cmd.stderr = Stdio::Null;
+        let child = self.spawner.spawn(&cmd).map_err(|e| PortError {
+            op: "spawn_exec",
+            cause: format!("spawn {}: {e:?}", self.cfg.ctr_bin),
+        })?;
+        Ok(Exec::new(child, quit, Duration::from_secs(3)))
+    }
+
+    /// Run `args` in agent `id` to completion with stdin the null device (which never wedges the
+    /// shim) and return its stdout. Killed with SIGKILL after `limit` (safe for the shim).
+    pub fn exec_once(
+        &self,
+        op: &'static str,
+        id: &AgentId,
+        args: &[&str],
+        limit: Duration,
+    ) -> Result<Vec<u8>, PortError> {
+        let secs = limit.as_secs().max(1).to_string();
+        let mut argv = os(&["-s", "KILL", &secs, &self.cfg.ctr_bin]);
+        argv.extend(self.exec_argv("acexec", id));
+        argv.extend(os(args));
+        match self.spawn_wait(op, OsStr::new("timeout"), &argv, None)? {
+            (status, stdout, _) if status.success() => Ok(stdout),
+            (status, stdout, stderr) => Err(failure(op, status, &stdout, &stderr)),
+        }
+    }
+
+    /// Whether agent `id` answers a trivial exec within 2 s: a wedged shim does not.
+    pub fn probe(&self, id: &AgentId) -> bool {
+        self.exec_once("probe", id, &["true"], Duration::from_secs(2))
+            .is_ok()
+    }
+
+    /// SIGKILL host `ctr task exec` clients of agent `id`: the gateway's own (`ours_only`) or
+    /// every one. SIGKILL is the signal that frees a wedged shim (SIGTERM is forwarded through it).
+    pub fn kill_exec_clients(&self, id: &AgentId, ours_only: bool) -> Result<(), PortError> {
+        // The bracket keeps a pattern from matching its own command line.
+        let pattern = if ours_only {
+            format!(
+                "--exec-id [{}]{}-{id}-",
+                &VIEW_EXEC_PREFIX[..1],
+                &VIEW_EXEC_PREFIX[1..]
+            )
+        } else {
+            format!("[t]ask exec --exec-id [^ ]+ {id}( |$)")
+        };
+        self.pkill("kill_exec_clients", &pattern)
     }
 
     /// Run `ctr -n <ns> <args...>` and return its stdout.
@@ -710,6 +814,40 @@ mod tests {
                 .map(|v| v.to_string_lossy().into_owned()),
             EnvSpec::Inherit => None,
         }
+    }
+
+    #[test]
+    fn probe_is_a_null_stdin_exec_killed_after_2s() {
+        let (rt, log, root) = rt(ExitStatus::Code(0));
+        assert!(rt.probe(&id()));
+        let (calls, progs) = (argv(&log), programs(&log));
+        assert_eq!(progs, ["timeout"]);
+        assert_eq!(
+            calls[0][..8],
+            ["-s", "KILL", "2", "ctr", "-n", "agents", "task", "exec"]
+        );
+        assert!(calls[0][9].starts_with("acexec-a1-"), "{:?}", calls[0]);
+        assert_eq!(calls[0][10..], ["a1", "true"]);
+        let log = log.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(
+            log[0].stdin,
+            platform_mock::process::StdioKind::Null
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kill_exec_clients_patterns_never_match_themselves() {
+        let (rt, log, root) = rt(ExitStatus::Code(0));
+        assert!(rt.kill_exec_clients(&id(), true).is_ok());
+        assert!(rt.kill_exec_clients(&id(), false).is_ok());
+        let calls = argv(&log);
+        assert_eq!(calls[0], ["-KILL", "-f", "--exec-id [a]cview-a1-"]);
+        assert_eq!(
+            calls[1],
+            ["-KILL", "-f", "[t]ask exec --exec-id [^ ]+ a1( |$)"]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -17,8 +17,8 @@ pub enum IdError {
 impl fmt::Display for IdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Length(n) => write!(f, "agent id length {n} not in 1..={MAX_LEN}"),
-            Self::Charset => f.write_str("agent id must match [a-z0-9][a-z0-9-]*[a-z0-9]"),
+            Self::Length(n) => write!(f, "id length {n} not in 1..={MAX_LEN}"),
+            Self::Charset => f.write_str("id must match [a-z0-9][a-z0-9-]*[a-z0-9]"),
         }
     }
 }
@@ -32,20 +32,26 @@ pub struct AgentId(String);
 impl AgentId {
     /// Parse and validate external input.
     pub fn parse(s: &str) -> Result<Self, IdError> {
-        if s.is_empty() || s.len() > MAX_LEN {
-            return Err(IdError::Length(s.len()));
-        }
-        let ok_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
-        if !s.chars().all(ok_char) || s.starts_with('-') || s.ends_with('-') {
-            return Err(IdError::Charset);
-        }
-        Ok(Self(s.to_owned()))
+        check(s).map(|()| Self(s.to_owned()))
     }
 
     /// The validated string.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// The rule every identifier follows: 1 to [`MAX_LEN`] bytes of `[a-z0-9-]`, not starting or
+/// ending with `-`.
+pub fn check(s: &str) -> Result<(), IdError> {
+    if s.is_empty() || s.len() > MAX_LEN {
+        return Err(IdError::Length(s.len()));
+    }
+    let ok_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+    if !s.chars().all(ok_char) || s.starts_with('-') || s.ends_with('-') {
+        return Err(IdError::Charset);
+    }
+    Ok(())
 }
 
 impl fmt::Display for AgentId {

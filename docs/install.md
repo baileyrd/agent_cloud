@@ -329,7 +329,7 @@ every agent the gateway lists (`GET /api/v1/agents`) is paused or destroyed and 
 containerd task or CNI lease left. Then it resumes `a1` through the gateway and, inside it, checks
 `claude auth status`, `claude -p`, the API through the proxy, a denied host (example.com) and an unreachable
 LAN address (192.168.50.1), and runs a job through the task API ("reply with exactly the word pong", expecting
-`succeeded`). It pauses `a1` again afterwards (`KEEP_A1=1` leaves it running). It takes about 45 s.
+`succeeded`). It pauses `a1` again afterwards (`KEEP_A1=1` leaves it running). It takes about 30 s.
 
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).

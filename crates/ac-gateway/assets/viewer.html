@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Agent viewer</title>
+<link rel="stylesheet" href="/ui/viewer.css">
+</head>
+<body>
+<header>
+  <strong id="agent"></strong>
+  <span id="status">Connecting…</span>
+  <span class="actions">
+    <button id="take" type="button">Take over</button>
+    <button id="force" type="button">Force take over</button>
+    <button id="release" type="button">Release</button>
+  </span>
+</header>
+<main id="term" tabindex="0">
+  <div id="scroll"></div>
+  <div id="screen"><div id="cursor"></div></div>
+</main>
+<span id="measure" aria-hidden="true">MMMMMMMMMM</span>
+<script src="/ui/viewer.js"></script>
+</body>
+</html>

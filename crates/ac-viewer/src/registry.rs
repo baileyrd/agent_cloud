@@ -104,13 +104,13 @@ impl Registry {
 
     /// Add a view-only viewer.
     pub fn join(&mut self, agent: &str, viewer: &str) -> Result<(), Full> {
+        if self.viewers(agent) >= self.per_agent {
+            return Err(Full::Agent);
+        }
         if self.count >= self.total {
             return Err(Full::Total);
         }
         let a = self.agents.entry(agent.to_owned()).or_default();
-        if a.viewers.len() >= self.per_agent {
-            return Err(Full::Agent);
-        }
         a.viewers.push(viewer.to_owned());
         self.count += 1;
         Ok(())
@@ -216,6 +216,11 @@ mod tests {
         assert_eq!(r.join("a1", "v3"), Err(Full::Agent));
         assert_eq!(r.join("a2", "v4"), Ok(()));
         assert_eq!(r.join("a3", "v5"), Err(Full::Total));
+        assert_eq!(
+            r.join("a1", "v6"),
+            Err(Full::Agent),
+            "per-agent is reported first"
+        );
         let _ = r.leave("a1", "v1");
         assert_eq!(r.join("a3", "v5"), Ok(()));
         assert_eq!(r.watching(), 3);

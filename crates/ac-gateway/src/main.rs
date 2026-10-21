@@ -4,38 +4,80 @@
 //! readable), `AC_BIND` (default 127.0.0.1:8780), `AC_IMAGE` (required),
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
-//! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check.
+//! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_PROBE_INTERVAL`
+//! (seconds between watchdog probes, default 30; 0 turns the watchdog off).
 //!
 //! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
 //! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
-//! logged and the gateway serves anyway.
+//! logged and the gateway serves anyway. It then SIGKILLs `ctr` clients an earlier gateway left
+//! and detaches their tmux control clients in every running agent.
+//!
+//! The watchdog probes each running agent with a 2 s exec. If one does not answer (a wedged
+//! Kata shim, ADR-006), it SIGKILLs the gateway's own `ctr` clients for that agent, then every
+//! `ctr` exec client of it, probing after each. If the agent still does not answer it is
+//! reported as `"health":"unhealthy"`; its VM is left running.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_fleet::Fleet;
-use ac_gateway::{bind, Api};
+use ac_gateway::viewer::{Hub, Terminal};
+use ac_gateway::web::App;
+use ac_gateway::{bind, Api, Unhealthy};
 use ac_store::EngineStore;
 use platform_linux::LinuxSpawner;
-use rusty_http::{Method, StatusCode};
-use rusty_serve::{Handler, Request, Response, Server};
+use rusty_serve::Server;
 
-type Gateway = Api<CtrRuntime<LinuxSpawner>, EngineStore>;
+type Gateway = App<CtrRuntime<LinuxSpawner>, EngineStore>;
 
-struct Http(Gateway);
+/// Probe every running agent each `interval`; see the module docs.
+fn watchdog(app: &Gateway, hub: &Hub, unhealthy: &Unhealthy, interval: Duration) {
+    let term = hub.terminal();
+    loop {
+        std::thread::sleep(interval);
+        let running = app.api().lock().map(|a| a.running()).unwrap_or_default();
+        for id in running {
+            let healthy = term.probe(&id) || recover(term, &id);
+            let mut set = unhealthy.lock().unwrap_or_else(|e| e.into_inner());
+            if healthy {
+                set.remove(id.as_str());
+            } else if set.insert(id.to_string()) {
+                eprintln!(
+                    "ac-gateway: watchdog: {id} still does not answer after killing every ctr exec \
+                     client; marked unhealthy, VM left running"
+                );
+            }
+        }
+    }
+}
 
-impl Handler for Http {
-    fn handle(&mut self, r: &Request<'_>) -> Response {
-        let method = match r.method {
-            Method::Get => "GET",
-            Method::Post => "POST",
-            Method::Delete => "DELETE",
-            _ => "OTHER",
-        };
-        let reply = self.0.handle(method, r.target, r.authorization);
-        Response::json(StatusCode::from_u16(reply.status), reply.body.into_bytes())
+fn recover(term: &dyn Terminal, id: &ac_domain::AgentId) -> bool {
+    for (ours_only, which) in [
+        (true, "the gateway's own ctr clients"),
+        (false, "every ctr exec client"),
+    ] {
+        eprintln!("ac-gateway: watchdog: {id} did not answer a 2 s probe; SIGKILL {which} for it");
+        if let Err(e) = term.kill_clients(id, ours_only) {
+            eprintln!("ac-gateway: watchdog: {id}: {e}");
+        }
+        if term.probe(id) {
+            eprintln!("ac-gateway: watchdog: {id} answers again");
+            return true;
+        }
+    }
+    false
+}
+
+/// The app behind an `Arc`, shared with the watchdog.
+struct Shared(Arc<Gateway>);
+
+impl rusty_serve::SharedHandler for Shared {
+    fn handle(&self, r: &rusty_serve::Request<'_>) -> rusty_serve::Response {
+        self.0.handle(r)
     }
 }
 
@@ -81,21 +123,22 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
-    let runtime = CtrRuntime::new(
-        LinuxSpawner,
-        CtrConfig {
-            ctr_bin: env("AC_CTR", "ctr"),
-            namespace: env("AC_NAMESPACE", "agents"),
-            image,
-            workspace_root: data.join("workspaces"),
-            workspace_owner: Some((uid, uid)),
-            network,
-            vc_root: "/run/vc".into(),
-            task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
-            command_timeout: Some(std::time::Duration::from_secs(120)),
-            trace: std::env::var_os("AC_TRACE").is_some(),
-        },
-    );
+    let cfg = CtrConfig {
+        ctr_bin: env("AC_CTR", "ctr"),
+        namespace: env("AC_NAMESPACE", "agents"),
+        image,
+        workspace_root: data.join("workspaces"),
+        workspace_owner: Some((uid, uid)),
+        network,
+        vc_root: "/run/vc".into(),
+        task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
+        command_timeout: Some(std::time::Duration::from_secs(120)),
+        trace: std::env::var_os("AC_TRACE").is_some(),
+    };
+    let interval: u64 = env("AC_PROBE_INTERVAL", "30")
+        .parse()
+        .map_err(|e| format!("AC_PROBE_INTERVAL: {e}"))?;
+    let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
     let store = EngineStore::open(&data).map_err(|e| e.to_string())?;
     let fleet = Fleet::new(runtime, store);
     match fleet.reconcile() {
@@ -106,8 +149,27 @@ fn run() -> Result<(), String> {
         }
         Err(e) => eprintln!("ac-gateway: reconcile: {e}"),
     }
-    let api = Api::new(fleet, &token).ok_or("token file is empty")?;
-    let server = Server::bind(addr, Http(api)).map_err(|e| format!("bind {addr}: {e}"))?;
+    let unhealthy = Unhealthy::default();
+    let api = Api::new(fleet, &token)
+        .ok_or("token file is empty")?
+        .with_unhealthy(Arc::clone(&unhealthy));
+    let hub = Hub::new(CtrRuntime::new(LinuxSpawner, cfg), data.join("history"));
+    for id in api.running() {
+        let term = hub.terminal();
+        let cleared = term
+            .kill_clients(&id, true)
+            .and_then(|()| term.prepare(&id));
+        if let Err(e) = cleared {
+            eprintln!("ac-gateway: {id}: clearing old viewer clients: {e}");
+        }
+    }
+    let app = Arc::new(App::new(api, hub.clone()));
+    if interval > 0 {
+        let app = Arc::clone(&app);
+        let every = Duration::from_secs(interval);
+        std::thread::spawn(move || watchdog(&app, &hub, &unhealthy, every));
+    }
+    let server = Server::bind_shared(addr, Shared(app)).map_err(|e| format!("bind {addr}: {e}"))?;
     eprintln!("ac-gateway listening on {addr}");
     server.run().map_err(|e| e.to_string())
 }

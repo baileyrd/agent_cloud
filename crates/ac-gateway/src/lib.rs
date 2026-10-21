@@ -6,6 +6,11 @@
 //! workspace; `DELETE ...?purge=true` removes it, also for an agent already destroyed).
 
 pub mod bind;
+pub mod viewer;
+pub mod web;
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use ac_domain::{AgentId, State};
 use ac_fleet::{Fleet, FleetError};
@@ -22,24 +27,73 @@ pub struct Reply {
     pub body: String,
 }
 
+/// The owner's bearer token. Checked without any other lock, so viewer requests never wait on
+/// a slow lifecycle call.
+#[derive(Clone)]
+pub struct Auth(Arc<[u8]>);
+
+impl Auth {
+    /// `None` for an empty token.
+    pub fn new(token: &str) -> Option<Self> {
+        (!token.is_empty()).then(|| Self(token.as_bytes().into()))
+    }
+
+    /// Whether an `Authorization` header carries the token (`Bearer <token>`, exactly).
+    pub fn check(&self, authorization: Option<&str>) -> bool {
+        let presented = authorization
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .unwrap_or("");
+        constant_time_eq(presented.as_bytes(), &self.0)
+    }
+}
+
+/// Agents the watchdog found wedged (by id). Shared with [`Api`], which reports them.
+pub type Unhealthy = Arc<Mutex<HashSet<String>>>;
+
 /// The authenticated lifecycle API.
 pub struct Api<R, S> {
     fleet: Fleet<R, S>,
-    token: Vec<u8>,
+    auth: Auth,
+    unhealthy: Unhealthy,
 }
 
 impl<R: Runtime, S: SessionStore> Api<R, S> {
     /// Build from a fleet and the owner's bearer token (must be non-empty).
     pub fn new(fleet: Fleet<R, S>, token: &str) -> Option<Self> {
-        (!token.is_empty()).then(|| Self {
+        Some(Self {
             fleet,
-            token: token.as_bytes().to_vec(),
+            auth: Auth::new(token)?,
+            unhealthy: Unhealthy::default(),
         })
+    }
+
+    /// Report agents in `set` as `"health":"unhealthy"`.
+    pub fn with_unhealthy(mut self, set: Unhealthy) -> Self {
+        self.unhealthy = set;
+        self
+    }
+
+    /// The token checker, for routes outside this API.
+    pub fn auth(&self) -> Auth {
+        self.auth.clone()
+    }
+
+    /// Agents recorded running, for the watchdog.
+    pub fn running(&self) -> Vec<AgentId> {
+        self.fleet
+            .list()
+            .map(|all| {
+                all.into_iter()
+                    .filter(|(_, s)| *s == State::Running)
+                    .map(|(id, _)| id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Handle one request. Of the query string, only `purge` on `DELETE` is read.
     pub fn handle(&self, method: &str, target: &str, authorization: Option<&str>) -> Reply {
-        if !self.authorized(authorization) {
+        if !self.auth.check(authorization) {
             return error(401, "unauthorized");
         }
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -74,16 +128,9 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         }
     }
 
-    fn authorized(&self, authorization: Option<&str>) -> bool {
-        let presented = authorization
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .unwrap_or("");
-        constant_time_eq(presented.as_bytes(), &self.token)
-    }
-
     fn status(&self, id: &AgentId) -> Reply {
         match self.fleet.state(id) {
-            Ok(Some(state)) => agent(id, state, 200),
+            Ok(Some(state)) => self.agent(id, state, 200),
             Ok(None) => error(404, &FleetError::NotFound(id.clone()).to_string()),
             Err(e) => map_error(&e),
         }
@@ -92,7 +139,7 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
     fn list(&self) -> Reply {
         match self.fleet.list() {
             Ok(all) => {
-                let items: Vec<String> = all.iter().map(|(id, s)| record(id, *s)).collect();
+                let items: Vec<String> = all.iter().map(|(id, s)| self.record(id, *s)).collect();
                 Reply {
                     status: 200,
                     body: format!(r#"{{"agents":[{}]}}"#, items.join(",")),
@@ -104,7 +151,7 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
 
     fn done(&self, id: &AgentId, result: Result<State, FleetError>, ok: u16) -> Reply {
         match result {
-            Ok(state) => agent(id, state, ok),
+            Ok(state) => self.agent(id, state, ok),
             Err(e) => map_error(&e),
         }
     }
@@ -122,16 +169,23 @@ fn purge(query: &str) -> Option<bool> {
     }
 }
 
-fn agent(id: &AgentId, state: State, status: u16) -> Reply {
-    Reply {
-        status,
-        body: record(id, state),
+impl<R, S> Api<R, S> {
+    fn agent(&self, id: &AgentId, state: State, status: u16) -> Reply {
+        Reply {
+            status,
+            body: self.record(id, state),
+        }
     }
-}
 
-fn record(id: &AgentId, state: State) -> String {
-    let state = format!("{state:?}").to_lowercase();
-    format!(r#"{{"id":"{id}","state":"{state}"}}"#)
+    fn record(&self, id: &AgentId, state: State) -> String {
+        let state = format!("{state:?}").to_lowercase();
+        let sick = self
+            .unhealthy
+            .lock()
+            .is_ok_and(|set| set.contains(id.as_str()));
+        let health = if sick { r#","health":"unhealthy""# } else { "" };
+        format!(r#"{{"id":"{id}","state":"{state}"{health}}}"#)
+    }
 }
 
 fn map_error(e: &FleetError) -> Reply {
@@ -143,7 +197,8 @@ fn map_error(e: &FleetError) -> Reply {
     error(status, &e.to_string())
 }
 
-fn error(status: u16, message: &str) -> Reply {
+/// A JSON error reply.
+pub fn error(status: u16, message: &str) -> Reply {
     Reply {
         status,
         body: format!(r#"{{"error":"{}"}}"#, escape(message)),
@@ -308,6 +363,19 @@ mod tests {
             assert_eq!(a.handle("GET", "/api/v1/agents/a1", h).status, 401, "{h:?}");
         }
         assert!(Api::new(Fleet::new(Rt { fail: false }, Store::default()), "").is_none());
+    }
+
+    #[test]
+    fn unhealthy_agents_are_reported() {
+        let set = Unhealthy::default();
+        let a = api(false).with_unhealthy(Arc::clone(&set));
+        let _ = call(&a, "POST", "/api/v1/agents/a1");
+        let _ = set.lock().map(|mut s| s.insert("a1".into()));
+        assert_eq!(
+            call(&a, "GET", "/api/v1/agents/a1").1,
+            r#"{"id":"a1","state":"running","health":"unhealthy"}"#
+        );
+        assert_eq!(a.running().len(), 1);
     }
 
     #[test]

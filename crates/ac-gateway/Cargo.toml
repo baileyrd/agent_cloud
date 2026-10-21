@@ -1,6 +1,6 @@
 [package]
 name = "ac-gateway"
-description = "HTTP gateway: bearer-token authenticated lifecycle API over the agent fleet."
+description = "HTTP gateway: bearer-token authenticated lifecycle API and terminal viewer over the agent fleet."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,9 @@ ac-ports = { path = "../ac-ports" }
 ac-fleet = { path = "../ac-fleet" }
 ac-ctr = { path = "../ac-ctr" }
 ac-store = { path = "../ac-store" }
+ac-history = { path = "../ac-history" }
+ac-viewer = { path = "../ac-viewer" }
+platform.workspace = true
 platform-linux.workspace = true
 rusty_serve.workspace = true
 rusty_http.workspace = true

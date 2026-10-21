@@ -163,8 +163,9 @@ fn key_bytes(name: &str, app_cursor: bool) -> Option<Vec<u8>> {
         "Down" => Some(csi(b'B')),
         "Right" => Some(csi(b'C')),
         "Left" => Some(csi(b'D')),
-        "Home" => Some(csi(b'H')),
-        "End" => Some(csi(b'F')),
+        // tmux's own key table, since panes run with TERM=tmux-256color (khome/kend).
+        "Home" => Some(tilde(1)),
+        "End" => Some(tilde(4)),
         "IC" => Some(tilde(2)),
         "DC" => Some(tilde(3)),
         "PPage" => Some(tilde(5)),
@@ -258,10 +259,10 @@ mod tests {
             bytes(keys("Enter C-c M-x BSpace Tab", false)),
             b"\r\x03\x1bx\x7f\t"
         );
-        assert_eq!(bytes(keys("Up Left Home", false)), b"\x1b[A\x1b[D\x1b[H");
+        assert_eq!(bytes(keys("Up Left Home", false)), b"\x1b[A\x1b[D\x1b[1~");
         assert_eq!(
             bytes(keys("Up End", true)),
-            b"\x1bOA\x1bOF",
+            b"\x1bOA\x1b[4~",
             "application cursor mode"
         );
         assert_eq!(

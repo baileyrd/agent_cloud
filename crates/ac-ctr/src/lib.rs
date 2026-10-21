@@ -283,16 +283,13 @@ impl<S: Spawner> CtrRuntime<S> {
     /// SIGKILL host `ctr task exec` clients of agent `id`: the gateway's own (`ours_only`) or
     /// every one. SIGKILL is the signal that frees a wedged shim (SIGTERM is forwarded through it).
     pub fn kill_exec_clients(&self, id: &AgentId, ours_only: bool) -> Result<(), PortError> {
-        // The bracket keeps a pattern from matching its own command line; no leading dash, or
-        // pkill reads the pattern as an option.
+        // Anchored to argv[0] being `ctr` (or a path to it): only ctr processes match, never a
+        // shell, editor or pkill whose command line happens to contain the same words.
+        let ctr = "^([^ ]*/)?ctr .* task exec --exec-id";
         let pattern = if ours_only {
-            format!(
-                "exec-id [{}]{}-{id}-",
-                &VIEW_EXEC_PREFIX[..1],
-                &VIEW_EXEC_PREFIX[1..]
-            )
+            format!("{ctr} {VIEW_EXEC_PREFIX}-{id}-")
         } else {
-            format!("[t]ask exec --exec-id [^ ]+ {id}( |$)")
+            format!("{ctr} [^ ]+ {id}( |$)")
         };
         self.pkill("kill_exec_clients", &pattern)
     }
@@ -838,15 +835,26 @@ mod tests {
     }
 
     #[test]
-    fn kill_exec_clients_patterns_never_match_themselves() {
+    fn kill_exec_clients_patterns_match_only_ctr() {
         let (rt, log, root) = rt(ExitStatus::Code(0));
         assert!(rt.kill_exec_clients(&id(), true).is_ok());
         assert!(rt.kill_exec_clients(&id(), false).is_ok());
         let calls = argv(&log);
-        assert_eq!(calls[0], ["-KILL", "-f", "exec-id [a]cview-a1-"]);
+        assert_eq!(
+            calls[0],
+            [
+                "-KILL",
+                "-f",
+                "^([^ ]*/)?ctr .* task exec --exec-id acview-a1-"
+            ]
+        );
         assert_eq!(
             calls[1],
-            ["-KILL", "-f", "[t]ask exec --exec-id [^ ]+ a1( |$)"]
+            [
+                "-KILL",
+                "-f",
+                "^([^ ]*/)?ctr .* task exec --exec-id [^ ]+ a1( |$)"
+            ]
         );
         let _ = std::fs::remove_dir_all(root);
     }

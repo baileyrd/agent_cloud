@@ -30,8 +30,9 @@ id="ac-smoke-$$"
 err=$(mktemp)
 # Fedora's Kata package boots the host's own kernel image as the guest kernel, so
 # the versions can match. A VM is proven by the "hypervisor" CPU flag and a fresh uptime.
+# Stdin is /dev/null: EOF from a pipe or file would wedge the Kata shim (install.md, Fedora note 8).
 out=$(ctr -n "$NS" run --rm --runtime io.containerd.kata.v2 "$IMG" "$id" \
-    sh -c 'uname -r; grep -c hypervisor /proc/cpuinfo; cut -d. -f1 /proc/uptime' 2>"$err")
+    sh -c 'uname -r; grep -c hypervisor /proc/cpuinfo; cut -d. -f1 /proc/uptime' </dev/null 2>"$err")
 guest=$(echo "$out" | sed -n 1p)
 hv=$(echo "$out" | sed -n 2p)
 guest_up=$(echo "$out" | sed -n 3p)

@@ -180,6 +180,13 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    egress proxy, both installed as boot-time units in [Host services](#host-services).
 7. **Developing on the host:** Fedora's `cargo` does not include clippy or rustfmt:
    `sudo dnf install -y clippy rustfmt`.
+8. **Never pipe or redirect a file into `ctr task exec` (or an attached `ctr run`) against a live agent.**
+   Without `-t`, `ctr` never passes stdin EOF to the guest, and when the host side of a pipe or file reaches
+   EOF while the guest process lives, the Kata shim blocks every other call on that task: new execs fail with
+   `context deadline exceeded` and the agent drops out of `ctr task ls`. SIGTERM does not help (`ctr` forwards
+   it through the stuck shim); SIGKILL of that `ctr` client does. `< /dev/null` is safe, for commands that exit
+   by themselves. To run a script, copy it into the workspace and run it there. (Measured 2026-10-20: `printf x
+   | ctr task exec ... cat` wedged, `cat </dev/null` did not; this caused an earlier a1 freeze the same day.)
 
 ## Host services
 

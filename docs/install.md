@@ -334,9 +334,15 @@ How to use it:
 4. What was shown while someone watched, with take-over and audit events: `GET /api/v1/agents/<id>/history?limit=N`
    (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
 
-The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off);
-a wedged one is logged (`journalctl -u ac-gateway | grep watchdog`) and freed by killing `ctr` clients, or
-reported as `"health":"unhealthy"` if that fails. Recordings live under `/var/lib/agent-cloud/history/` (0700).
+The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off).
+A probe answering within 10 s is healthy. Failures while the host is busy are logged "slow, host busy, not acting".
+Only 3 failures over 90 s on an idle host make it act. It first kills the gateway's own `ctr` clients for that
+agent, then foreign ones older than the failures, each with a log line. If neither frees the agent, it reports it
+as `"health":"unhealthy"` until the agent answers again (ADR-012). Every line is in the journal
+(`journalctl -u ac-gateway | grep watchdog`) and in the agent's history. The thresholds are `AC_PROBE_BUDGET`,
+`AC_PROBE_FAILURES`, `AC_PROBE_WINDOW`, `AC_BUSY_LOAD_PER_CORE`, `AC_BUSY_IO_SOME` and `AC_BUSY_CPU_SOME`. A
+create or resume that would not fit `/dev/shm` is refused with 507 (`GET /api/v1/capacity` shows the figures;
+`AC_SHM_MARGIN_MIB`, default 512). `AC_SHM_LIMIT_MIB` is for testing only and is logged as a warning. Recordings live under `/var/lib/agent-cloud/history/` (0700).
 
 The gateway locks the data directory (`/var/lib/agent-cloud`) while it runs. `ac-ctl` against the same directory
 then exits with code 3 and says so (`/var/lib/agent-cloud is in use by another process, normally ac-gateway ...:

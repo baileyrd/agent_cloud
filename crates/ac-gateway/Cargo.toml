@@ -1,0 +1,35 @@
+[package]
+name = "ac-gateway"
+description = "HTTP gateway: bearer-token authenticated lifecycle API, terminal viewer and task API over the agent fleet."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ac_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ac-gateway"
+path = "src/main.rs"
+
+[dependencies]
+ac-domain = { path = "../ac-domain" }
+ac-ports = { path = "../ac-ports" }
+ac-fleet = { path = "../ac-fleet" }
+ac-ctr = { path = "../ac-ctr" }
+ac-store = { path = "../ac-store" }
+ac-history = { path = "../ac-history" }
+ac-viewer = { path = "../ac-viewer" }
+platform.workspace = true
+platform-linux.workspace = true
+rusty_serve.workspace = true
+rusty_http.workspace = true
+rusty_json.workspace = true
+
+[dev-dependencies]
+ac-fleet = { path = "../ac-fleet" }
+platform-mock.workspace = true
+
+[lints]
+workspace = true

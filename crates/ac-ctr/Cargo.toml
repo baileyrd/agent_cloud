@@ -1,0 +1,17 @@
+[package]
+name = "ac-ctr"
+description = "Runtime adapter: one Kata microVM per agent via the containerd `ctr` CLI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ac-domain = { path = "../ac-domain" }
+ac-ports = { path = "../ac-ports" }
+platform.workspace = true
+
+[dev-dependencies]
+platform-mock.workspace = true
+
+[lints]
+workspace = true

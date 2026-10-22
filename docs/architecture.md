@@ -23,9 +23,9 @@ Built as one deployable with clear module boundaries (see [ADR-005](decisions.md
 
 | Module | Responsibility |
 |---|---|
-| Gateway | HTTPS entry point, bearer-token auth, proxies one WSS per viewer and the agent API |
+| Gateway | Entry point, bearer-token auth, lifecycle API, the terminal viewer (one streamed response per viewer, tmux control mode into the VM; ADR-006), the task API (jobs: `claude -p` in a tmux window, supervised from the host; ADR-010) |
 | Spawner | Creates, pauses and destroys agents; provisions workspace volumes |
-| Session store | PostgreSQL schema for sessions and events, TLS to the database |
+| Session store | Embedded registry on `rusty_multimodal_db_engine` (agents, lifecycle state, jobs) plus an append-only segment log per agent for events ([ADR-009](decisions.md)) |
 | Workspace volumes | One quota-limited volume per agent |
 | Secrets | Root-owned 0600 env files; never readable by the agent user |
 | Egress proxy | Allowlist for model APIs and Git hosts; everything else dropped |
@@ -47,10 +47,10 @@ Built as one deployable with clear module boundaries (see [ADR-005](decisions.md
 
 | # | Flow | Path |
 |---|---|---|
-| 1 | Prompt | Client, gateway (token), agent API in the shell container |
-| 2 | Watch / take over | Client, gateway (single WSS), capture/encode in the desktop container; input events return the same way |
+| 1 | Prompt | Client, gateway (token, job registry), prompt file at the workspace root, a short exec that opens tmux window `job-<id>` running `claude -p`; result read back by capped execs (ADR-010) |
+| 2 | Watch / take over | Terminal: client, gateway (streamed GET, POSTs for input), `ctr task exec` of `tmux -C` into the agent's session `main`. Desktop (later): capture/encode in the desktop container over the same transport |
 | 3 | Model calls | Harness, egress proxy, model API |
-| 4 | History | Agent API events, gateway, PostgreSQL |
+| 4 | History | Viewed terminal output, take-over events and job state changes, gateway, per-agent segment log |
 | 5 | Lifecycle | Gateway, spawner, containerd (Kata runtime class), workspace volume mount |
 
 ## Trust boundaries
@@ -73,5 +73,5 @@ rootfs images and networking. See [research-notes.md](research-notes.md).
 
 Xorg + dummy driver, Xfce and policy-locked Chromium mirror what was observed in
 Dots' desktop (X11 `:0`, `DUMMY0` at a custom resolution, managed Chromium policies).
-The viewer protocol is **unknown**; see [ADR-006](decisions.md) for the chosen
-starting point.
+Dots' desktop viewer protocol is **unknown**; the terminal viewer is built (ADR-006) and the desktop
+stream is to reuse its transport and take-over lock.

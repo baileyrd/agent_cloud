@@ -1,0 +1,38 @@
+# Shell-only agent image: Fedora + Claude Code, runs as an unprivileged user.
+# The container stays up (sleep) and you attach with `ctr task exec`; see README.md.
+FROM registry.fedoraproject.org/fedora:44
+
+# Pin for reproducible images: podman build --build-arg CLAUDE_CODE_VERSION=<x.y.z> ...
+ARG CLAUDE_CODE_VERSION=latest
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        nodejs npm git openssh-clients ripgrep jq procps-ng findutils which less tmux vim-minimal \
+        gcc gcc-c++ make python3 \
+    && dnf clean all
+
+# Installed globally by root: the agent user cannot modify or self-update it.
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && npm cache clean --force
+
+# No sudo, no password. The workspace volume is bind-mounted at /workspace and chowned to this uid.
+RUN useradd --uid 1000 --user-group --create-home --home-dir /home/agent --shell /bin/bash agent
+
+# Claude Code keeps .claude.json, its login and sessions in CLAUDE_CONFIG_DIR. On the persistent
+# workspace they survive pause/resume and destroy; the image layer under $HOME does not.
+ENV HOME=/home/agent \
+    CLAUDE_CONFIG_DIR=/workspace/.claude \
+    DISABLE_AUTOUPDATER=1
+# Everything goes out through ac-egress on the agent bridge (ADR-007). These variables are a
+# convenience; the host firewall is what stops direct connections. Lowercase too: curl reads only
+# a lowercase http_proxy.
+ENV HTTPS_PROXY=http://10.89.0.1:3128 https_proxy=http://10.89.0.1:3128 \
+    HTTP_PROXY=http://10.89.0.1:3128 http_proxy=http://10.89.0.1:3128 \
+    NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
+# Keep Claude Code to the model API: no telemetry or error reports, and no claude.ai connectors
+# (through the agent's login they would reach the owner's connected Gmail, Drive and so on).
+ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    ENABLE_CLAUDEAI_MCP_SERVERS=false
+USER agent
+WORKDIR /workspace
+
+CMD ["sleep", "infinity"]

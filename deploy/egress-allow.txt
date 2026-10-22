@@ -1,0 +1,16 @@
+# /etc/agent-cloud/egress-allow.txt (root, mode 0600): hosts agents may reach through ac-egress,
+# on ports 443 and 80. One entry per line; `*.example.com` matches subdomains, not the apex.
+# Reloaded on change or `systemctl reload ac-egress`. Check denials: journalctl -u ac-egress.
+
+# Claude Code, measured on 2026-10-19 (claude 2.1.302, `claude -p`, with telemetry and claude.ai
+# connectors off in the image): the model API, plus OAuth token refresh (TOKEN_URL in the CLI).
+# Not needed by the agent: claude.ai (the login page opens in your browser), console.anthropic.com,
+# statsig.anthropic.com, the Datadog log intake, and mcp-proxy.anthropic.com (claude.ai connectors,
+# kept out on purpose).
+api.anthropic.com
+platform.claude.com
+
+# Git over HTTPS.
+github.com
+api.github.com
+*.githubusercontent.com

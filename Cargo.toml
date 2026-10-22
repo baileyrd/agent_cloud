@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/ac-domain", "crates/ac-ports", "crates/ac-fleet", "crates/ac-ctr", "crates/ac-history", "crates/ac-store", "crates/ac-ctl", "crates/ac-gateway", "crates/ac-egress", "crates/ac-viewer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+# First-party reuse from rusty_mill, pinned (ADR-008). Bump the rev deliberately.
+[workspace.dependencies]
+platform = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+platform-linux = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+platform-mock = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+rusty_multimodal_db_engine = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+rusty_serve = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+rusty_http = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+# JSON request bodies (job API). No serde: its own Value and parser.
+rusty_json = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555", default-features = false, features = ["std"] }

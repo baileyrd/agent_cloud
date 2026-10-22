@@ -1,0 +1,16 @@
+[package]
+name = "ac-ctl"
+description = "Command-line driver for the agent fleet: create, pause, resume, destroy, status."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ac-domain = { path = "../ac-domain" }
+ac-fleet = { path = "../ac-fleet" }
+ac-ctr = { path = "../ac-ctr" }
+ac-store = { path = "../ac-store" }
+platform-linux.workspace = true
+
+[lints]
+workspace = true

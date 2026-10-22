@@ -1,0 +1,9 @@
+[package]
+name = "ac-viewer"
+description = "Sans-IO terminal viewer: tmux control mode, sanitised screen snapshots, input, take-over lock."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

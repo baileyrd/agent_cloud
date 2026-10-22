@@ -1,0 +1,17 @@
+[package]
+name = "ac-store"
+description = "SessionStore and JobStore adapter on rusty_multimodal_db_engine: agent registry, lifecycle state and jobs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ac-domain = { path = "../ac-domain" }
+ac-ports = { path = "../ac-ports" }
+rusty_multimodal_db_engine.workspace = true
+# The engine's record trait needs serde + a Copy id; v5 gives a stable id per slug.
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", default-features = false, features = ["std", "serde", "v5"] }
+
+[lints]
+workspace = true

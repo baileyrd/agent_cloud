@@ -1,0 +1,22 @@
+# Runs as root: it drives containerd (ctr), network namespaces and the CNI plugin.
+# No PrivateTmp/ProtectSystem/ProtectHome: they give the service its own mount namespace, and the
+# netns bind mounts `ip netns add` makes under /run/netns would then be invisible to containerd.
+[Unit]
+Description=agent-cloud gateway (lifecycle API)
+Requires=containerd.service
+Wants=ac-agentfw.service network-online.target
+After=containerd.service ac-agentfw.service network-online.target
+
+[Service]
+EnvironmentFile=/etc/agent-cloud/gateway.env
+UnsetEnvironment=AC_ALLOW_PUBLIC_BIND
+ExecStart=/usr/local/bin/ac-gateway
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=yes
+# Second line of defence for the private-bind check: no traffic to or from public addresses.
+IPAddressDeny=any
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+
+[Install]
+WantedBy=multi-user.target

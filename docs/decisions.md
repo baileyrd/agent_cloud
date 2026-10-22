@@ -240,8 +240,9 @@ token, Origin and bind rules as the rest of the API.
 layer and the VM, egress allowlist and isolation are the boundary. A job's outcome is what the agent's
 VM reports: a compromised agent can fake its own job's exit code and result, never another agent's, and
 never the registry's state or times. Output is read through execs, so a wedged agent delays collection.
-The image's PID 1 is `sleep infinity`, which never reaps, so killed jobs leave zombies until the agent
-is paused (harmless, but an init such as `tini` would clear them).
+The image's PID 1 is `tini` (running `sleep infinity`), which reaps orphans, so a killed job leaves no
+zombies (verified 2026-10-22: none after a cancel through the API, a `pkill` of `claude` and killed
+orphans; before, with `sleep infinity` as PID 1, they stayed until the agent was paused).
 **Not now:** `rusty_agui` (AG-UI events over SSE) fits a later per-job event stream that turns the
 stream-json log into `RUN_STARTED`/`TEXT_MESSAGE_*`/`TOOL_CALL_*`/`RUN_FINISHED`; it does not fit the
 control plane (AG-UI has no queue, job id or re-attach; a run is one request). Long-polling the status

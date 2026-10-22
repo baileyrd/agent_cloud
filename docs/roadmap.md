@@ -34,12 +34,13 @@
 ## M4: Safe to leave running
 - [x] Egress allowlist proxy and nftables rules (`ac-egress`, `deploy/agentfw.nft`; ADR-007), verified from an agent
   2026-10-19
+- [x] `tini` as the agent image's PID 1, so killed jobs leave no zombies; no Claude Code self-update
+  (`DISABLE_AUTOUPDATER=1`) (verified on BaileyServ 2026-10-22)
 - [ ] Per-agent CPU, memory and disk limits
 - [ ] Backups with a tested restore
 - [ ] Five-agent load test; update [sizing.md](sizing.md) with real numbers
 
 ## Later
-- An init (`tini`) as the agent image's PID 1, so killed jobs leave no zombies
 - Local model option for an offline posture
 - Memory snapshots, so pause/resume keeps running processes (today pause stops the VM)
 - Capture the Dots viewer protocol on an unfiltered network

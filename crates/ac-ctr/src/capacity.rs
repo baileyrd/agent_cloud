@@ -1,15 +1,14 @@
-//! The host side of admission control: `/dev/shm` from statfs(2) (coreutils `stat -f`; std has no
-//! statvfs and the crate takes no FFI dependency) and the guest size from the Kata configuration.
+//! The host side of admission control: `/dev/shm` from statfs(2) (`rusty_libc`, first-party; std
+//! has no statvfs) and the guest size from the Kata configuration.
 
-use std::ffi::OsStr;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use ac_domain::capacity::kata_default_memory;
 use ac_domain::GuestMemory;
 use ac_ports::{Capacity, PortError, Shm};
-use platform::process::Spawner;
-
-use crate::{os, CtrRuntime};
+use rusty_libc::fs::Statfs;
 
 /// Where the figures come from.
 #[derive(Debug, Clone)]
@@ -25,8 +24,7 @@ pub struct CapacityConfig {
 }
 
 /// [`Capacity`] read from this host.
-pub struct HostCapacity<S> {
-    rt: CtrRuntime<S>,
+pub struct HostCapacity {
     cfg: CapacityConfig,
 }
 
@@ -39,10 +37,10 @@ pub enum GuestSource {
     Kata(GuestMemory),
 }
 
-impl<S: Spawner> HostCapacity<S> {
-    /// Read `/dev/shm` with `rt`'s spawner.
-    pub fn new(rt: CtrRuntime<S>, cfg: CapacityConfig) -> Self {
-        Self { rt, cfg }
+impl HostCapacity {
+    /// Read the host as `cfg` says.
+    pub fn new(cfg: CapacityConfig) -> Self {
+        Self { cfg }
     }
 
     /// The guest size and where it came from.
@@ -63,16 +61,16 @@ impl<S: Spawner> HostCapacity<S> {
     }
 }
 
-impl<S: Spawner> Capacity for HostCapacity<S> {
+impl Capacity for HostCapacity {
     fn shm(&self) -> Result<Shm, PortError> {
-        let path = self.cfg.shm.to_string_lossy();
-        let args = os(&["-f", "-c", "%S %b %f", &path]);
-        let out = self.rt.run("statfs", OsStr::new("stat"), &args, None)?;
-        let (total, free) =
-            statfs_mib(&String::from_utf8_lossy(&out)).ok_or_else(|| PortError {
-                op: "statfs",
-                cause: format!("unexpected `stat -f` output for {path}: {out:?}"),
-            })?;
+        let path = &self.cfg.shm;
+        let fail = |cause: String| PortError {
+            op: "statfs",
+            cause: format!("{}: {cause}", path.display()),
+        };
+        let c = CString::new(path.as_os_str().as_bytes()).map_err(|e| fail(e.to_string()))?;
+        let stats = rusty_libc::fs::statfs(&c).map_err(|e| fail(e.to_string()))?;
+        let (total, free) = statfs_mib(&stats);
         Ok(limit(total, free, self.cfg.shm_limit_mib))
     }
 
@@ -81,12 +79,17 @@ impl<S: Spawner> Capacity for HostCapacity<S> {
     }
 }
 
-/// `"<block size> <blocks> <free blocks>"` as (total, free) MiB.
-fn statfs_mib(out: &str) -> Option<(u64, u64)> {
-    let mut n = out.split_whitespace().map(str::parse::<u64>);
-    let (size, blocks, free) = (n.next()?.ok()?, n.next()?.ok()?, n.next()?.ok()?);
-    let mib = |b: u64| u64::try_from((u128::from(b) * u128::from(size)) >> 20).unwrap_or(u64::MAX);
-    Some((mib(blocks), mib(free)))
+/// (total, free) MiB of a filesystem: blocks of the fragment size (the block size where there is
+/// none). Free counts every free block; tmpfs reserves none for root.
+fn statfs_mib(s: &Statfs) -> (u64, u64) {
+    let unit = if s.f_frsize > 0 {
+        s.f_frsize
+    } else {
+        s.f_bsize
+    };
+    let unit = u128::from(u64::try_from(unit).unwrap_or(0));
+    let mib = |blocks: u64| u64::try_from((u128::from(blocks) * unit) >> 20).unwrap_or(u64::MAX);
+    (mib(s.f_blocks), mib(s.f_bfree))
 }
 
 /// The testing override: with a limit, `/dev/shm` counts as that big, and what is free shrinks by
@@ -108,14 +111,46 @@ pub fn limit(total_mib: u64, free_mib: u64, limit_mib: Option<u64>) -> Shm {
 mod tests {
     use super::*;
 
+    fn stats(frsize: i64, bsize: i64, blocks: u64, free: u64) -> Statfs {
+        let mut s = Statfs::default();
+        (s.f_frsize, s.f_bsize, s.f_blocks, s.f_bfree) = (frsize, bsize, blocks, free);
+        s
+    }
+
     #[test]
-    fn statfs_output() {
-        // 4 KiB blocks: 16 GiB, 15 GiB free.
-        assert_eq!(statfs_mib("4096 4194304 3932160\n"), Some((16384, 15360)));
-        assert_eq!(statfs_mib("4096 4194304"), None);
-        assert_eq!(statfs_mib("x 1 2"), None);
-        let max = u64::MAX;
-        assert_eq!(statfs_mib(&format!("{max} {max} 0")), Some((u64::MAX, 0)));
+    fn statfs_figures() {
+        // 4 KiB fragments: 16 GiB, 15 GiB free.
+        assert_eq!(
+            statfs_mib(&stats(4096, 4096, 4_194_304, 3_932_160)),
+            (16384, 15360)
+        );
+        // No fragment size: the block size.
+        assert_eq!(statfs_mib(&stats(0, 1 << 20, 10, 3)), (10, 3));
+        // Nonsense sizes give 0; huge products saturate.
+        assert_eq!(statfs_mib(&stats(-1, -1, 10, 3)), (0, 0));
+        assert_eq!(statfs_mib(&stats(i64::MAX, 0, u64::MAX, 0)), (u64::MAX, 0));
+    }
+
+    #[test]
+    fn reads_a_real_filesystem() {
+        let host = HostCapacity::new(CapacityConfig {
+            shm: "/".into(),
+            kata_config: "/nonexistent".into(),
+            guest_mib: Some(1),
+            shm_limit_mib: None,
+        });
+        let shm = host.shm().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            shm.total_mib > 0 && shm.free_mib <= shm.total_mib,
+            "{shm:?}"
+        );
+        let missing = HostCapacity::new(CapacityConfig {
+            shm: "/nonexistent/shm".into(),
+            ..host.cfg.clone()
+        });
+        assert!(missing
+            .shm()
+            .is_err_and(|e| e.to_string().contains("/nonexistent/shm")));
     }
 
     #[test]

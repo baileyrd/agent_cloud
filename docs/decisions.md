@@ -344,7 +344,7 @@ How it works:
 - *Configured, not measured, memory.* Pages a guest touched never come back, so a long-running agent reaches
   its full size. Paused and destroyed agents do not count.
 - *Code.* The rule is `ac_domain::capacity::admit`, pure, with saturating arithmetic. The host is read through
-  `ac_ports::Capacity`: statfs of `/dev/shm` (via `stat -f`; no FFI dependency), and `default_memory` from the
+  `ac_ports::Capacity`: statfs(2) of `/dev/shm` (first-party `rusty_libc`, no dependencies of its own), and `default_memory` from the
   first `[hypervisor.*]` table of `/etc/kata-containers/configuration.toml`. If that table does not set it,
   Kata's own default of 2048 MiB is used and the startup log says so.
 - *Atomic.* `ac_fleet::Fleet` checks before any side effect. The gateway serves every lifecycle call under one

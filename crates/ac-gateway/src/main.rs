@@ -110,7 +110,7 @@ fn env_mib(key: &str) -> Result<Option<u64>, String> {
 }
 
 /// `/dev/shm` and the guest size, read from this host; says where the guest size came from.
-fn host_capacity(cfg: &CtrConfig) -> Result<HostCapacity<LinuxSpawner>, String> {
+fn host_capacity() -> Result<HostCapacity, String> {
     let capacity = CapacityConfig {
         shm: "/dev/shm".into(),
         kata_config: env("AC_KATA_CONFIG", "/etc/kata-containers/configuration.toml").into(),
@@ -124,7 +124,7 @@ fn host_capacity(cfg: &CtrConfig) -> Result<HostCapacity<LinuxSpawner>, String> 
         );
     }
     let path = capacity.kata_config.display().to_string();
-    let host = HostCapacity::new(CtrRuntime::new(LinuxSpawner, cfg.clone()), capacity);
+    let host = HostCapacity::new(capacity);
     let (mib, source) = host.guest().map_err(|e| e.to_string())?;
     let source = match source {
         GuestSource::Override => "AC_VM_MEMORY_MIB".to_owned(),
@@ -275,8 +275,8 @@ fn run() -> Result<(), String> {
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
-    let fleet = Fleet::new(runtime, Arc::clone(&store))
-        .with_admission(Box::new(host_capacity(&cfg)?), margin);
+    let fleet =
+        Fleet::new(runtime, Arc::clone(&store)).with_admission(Box::new(host_capacity()?), margin);
     match fleet.reconcile() {
         Ok(changed) => {
             for id in changed {

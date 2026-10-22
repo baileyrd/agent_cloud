@@ -63,17 +63,14 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         command_timeout: Some(std::time::Duration::from_secs(120)),
         trace: std::env::var_os("AC_TRACE").is_some(),
     };
-    let capacity = HostCapacity::new(
-        CtrRuntime::new(LinuxSpawner, cfg.clone()),
-        CapacityConfig {
-            shm: "/dev/shm".into(),
-            kata_config: std::env::var("AC_KATA_CONFIG")
-                .unwrap_or_else(|_| "/etc/kata-containers/configuration.toml".to_owned())
-                .into(),
-            guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
-            shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
-        },
-    );
+    let capacity = HostCapacity::new(CapacityConfig {
+        shm: "/dev/shm".into(),
+        kata_config: std::env::var("AC_KATA_CONFIG")
+            .unwrap_or_else(|_| "/etc/kata-containers/configuration.toml".to_owned())
+            .into(),
+        guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
+        shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
+    });
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let fleet = Fleet::new(
         CtrRuntime::new(LinuxSpawner, cfg),

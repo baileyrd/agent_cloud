@@ -16,6 +16,11 @@
   let who = null;
   let viewer = null;
   let owner = null;
+  // The window list, the one this page watches (null: whichever the agent has current), and the
+  // pick in flight (undefined: none).
+  let windows = [];
+  let target = null;
+  let picked;
   let rows = [];
   let note = '';
   let chain = Promise.resolve();
@@ -95,7 +100,7 @@
     let text;
     let cls = '';
     if (viewer === null) text = note || 'Connecting…';
-    else if (controlling()) { text = 'You have control: keys go to the agent.'; cls = 'control'; }
+    else if (controlling()) { text = 'You have control: keys go to the window shown.'; cls = 'control'; }
     else if (owner) { text = `Viewer ${owner.slice(0, 6)} has control. View only.`; cls = 'other'; }
     else text = 'View only.';
     if (note && viewer !== null) text += ` ${note}`;
@@ -107,9 +112,50 @@
     $('who').textContent = who ? `Token ${who.name}: ${who.scopes.join(', ')}` : '';
   }
 
+  // Windows of the agent's tmux session. Picking one changes what this page shows, never the
+  // agent's own window (no select-window); Ctrl-b does not reach tmux through a browser.
+  function renderWindows() {
+    const button = (label, id, title) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.title = title;
+      b.setAttribute('aria-pressed', String(target === id));
+      b.addEventListener('click', () => pick(id));
+      return b;
+    };
+    const items = windows.map((w) => {
+      const b = button(`${w.index}: ${w.name}${w.active ? ' *' : ''}`, w.id,
+        `${w.id}${w.active ? ', the agent\'s current window' : ''}${w.job ? ', a task API job' : ''}`);
+      if (w.job) b.className = 'job';
+      return b;
+    });
+    const follow = button('Follow agent', null, 'Show whichever window the agent has current (*)');
+    $('windows').replaceChildren(...(windows.length ? [follow, ...items] : []));
+  }
+
+  async function pick(id) {
+    if (viewer === null) return;
+    picked = id;
+    const r = await post('window', id === null ? 'active' : id);
+    note = r.ok ? '' : `Window not shown (${r.status}): ${(await r.json()).error}.`;
+    show();
+    term.focus();
+  }
+
+  // The server moved this page to another window: a pick, or a fallback when the window closed.
+  function retarget(id) {
+    if (target !== null && id === null && picked !== null) note = 'That window closed; showing the agent\'s.';
+    target = id;
+    picked = undefined;
+    renderWindows();
+  }
+
   function handle(m) {
     switch (m.t) {
       case 'hello': viewer = m.viewer; note = ''; break;
+      case 'windows': windows = m.list; renderWindows(); return;
+      case 'target': retarget(m.window); break;
       case 'mode': owner = m.owner; if (controlling()) resize(); break;
       case 'full': full(m); break;
       case 'delta': delta(m); break;
@@ -273,6 +319,9 @@
       }
       viewer = null;
       owner = null;
+      windows = [];
+      target = null;
+      renderWindows();
       show();
       await sleep(2000);
     }

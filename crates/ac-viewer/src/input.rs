@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::windows::PaneId;
+
 /// Keys per request.
 pub const MAX_KEYS: usize = 64;
 /// Typed text per request, in bytes.
@@ -64,15 +66,17 @@ pub enum Input {
 }
 
 impl Input {
-    /// The tmux command lines for the take-over client: `send-keys -t main -H <hex>...` or
-    /// `refresh-client -C <cols>x<rows>`, nothing else.
-    pub fn lines(&self) -> Vec<String> {
+    /// The tmux command lines for the take-over client: `send-keys -t <pane> -H <hex>...` or
+    /// `refresh-client -C <cols>x<rows>`, nothing else. `pane`: the pane the viewer watches, or
+    /// `None` for the active pane of `main` (`-t main`).
+    pub fn lines(&self, pane: Option<PaneId>) -> Vec<String> {
+        let to = pane.map_or_else(|| "main".to_owned(), |p| p.to_string());
         match self {
             Self::Bytes(Bytes(b)) => b
                 .chunks(HEX_CHUNK)
                 .map(|chunk| {
                     let hex: Vec<String> = chunk.iter().map(|x| format!("{x:02x}")).collect();
-                    format!("send-keys -t main -H {}\n", hex.join(" "))
+                    format!("send-keys -t {to} -H {}\n", hex.join(" "))
                 })
                 .collect(),
             Self::Resize(Size { cols, rows }) => vec![format!("refresh-client -C {cols}x{rows}\n")],
@@ -314,7 +318,7 @@ mod tests {
             paste(hostile, false),
             keys("Enter", false),
         ] {
-            for line in input.unwrap_or_else(|e| panic!("{e}")).lines() {
+            for line in input.unwrap_or_else(|e| panic!("{e}")).lines(None) {
                 let rest = line
                     .strip_prefix("send-keys -t main -H ")
                     .and_then(|r| r.strip_suffix('\n'))
@@ -327,15 +331,19 @@ mod tests {
             }
         }
         assert_eq!(
-            text(hostile).map(|i| i.lines()),
+            text(hostile).map(|i| i.lines(None)),
             Ok(vec![format!("send-keys -t main -H {}\n", hex(hostile))])
+        );
+        assert_eq!(
+            text(b"ls").map(|i| i.lines(PaneId::parse("%12"))),
+            Ok(vec!["send-keys -t %12 -H 6c 73\n".to_owned()])
         );
     }
 
     #[test]
     fn text_chunks_and_caps() {
         assert_eq!(
-            text(&vec![b'x'; HEX_CHUNK + 1]).map(|i| i.lines().len()),
+            text(&vec![b'x'; HEX_CHUNK + 1]).map(|i| i.lines(None).len()),
             Ok(2)
         );
         assert_eq!(text(&vec![b'x'; MAX_TEXT + 1]), Err(InputError::TooLarge));
@@ -358,7 +366,7 @@ mod tests {
     #[test]
     fn resize_bounds() {
         assert_eq!(
-            resize(120, 40).map(|i| i.lines()),
+            resize(120, 40).map(|i| i.lines(PaneId::parse("%3"))),
             Ok(vec!["refresh-client -C 120x40\n".to_owned()])
         );
         for (c, r) in [(19, 40), (501, 40), (120, 4), (120, 201)] {

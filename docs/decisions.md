@@ -77,17 +77,28 @@ process owns the registry lock); bearer-token auth and the private-bind check ar
   needed. Origin is checked on every request; caps of 4 viewers per agent and 16 in all leave
   rusty_serve's 64 connections for the API; viewer routes never take the lifecycle lock.
 - *Rendering:* the gateway turns snapshots into styled runs (SGR only) and drops every other
-  escape (OSC 8/52, titles, DCS, APC, C0/C1, bidi overrides). The page (about 250 lines of
+  escape (OSC 8/52, titles, DCS, APC, C0/C1, bidi overrides). The page (about 330 lines of
   in-repo JS, no third-party code, CSP `'self'` only) sets text with `textContent`.
 - *View-only and take-over:* view-only is the default. The guarantee rests on the gateway, not
   tmux: input from a viewer without the lock gets 403 before anything is built; the view
-  client's whole vocabulary is a closed enum (`ViewCommand`: client name, cursor info,
-  snapshot); the take-over client exists only while a viewer holds the lock and takes only
-  `Input`, whose bytes are sent as `send-keys -H` hex (key names are mapped to terminal bytes),
-  so no viewer byte can be read as a tmux command. tmux's `read-only` flag was tried and dropped:
+  client's whole vocabulary is a closed enum (`ViewCommand`: client name, list windows, cursor
+  info and snapshot of `main` or of one window id); the take-over client exists only while a
+  viewer holds the lock and takes only `Input`, whose bytes are sent as `send-keys -H` hex (key
+  names are mapped to terminal bytes), so no viewer byte can be read as a tmux command. tmux's `read-only` flag was tried and dropped:
   while such a client is attached, tmux refuses the agent's own tmux commands, even from inside
   its pane. One viewer holds the lock; a second take-over is refused unless forced; release or
   disconnect returns to view-only.
+- *Windows (2026-10-22):* `Ctrl-b` does not reach tmux from a browser (it is a browser shortcut),
+  so the page lists `main`'s windows (`list-windows`, refreshed on tmux's window notifications),
+  marking the agent's current one and `job-*` windows, and a click picks one for that viewer only
+  (`POST .../term/{viewer}/window`, body `@<n>` or `active`; `viewer:read`). The gateway never runs
+  `select-window`, which would move the agent and every viewer: it snapshots each watched window by
+  id (`display`/`capture-pane -t @<n>`), the first time by one exec for the picking viewer, and a
+  taker's input goes to that window's active pane by the pane id from the list (`send-keys -t
+  %<n>`). The only viewer text that reaches a command is a window id of exactly `@<digits>` (no
+  leading zero) that is in the latest list, parsed into a number and rendered back from it;
+  anything else is 400. A watched window that closes (a notification, or a failed capture) sends
+  its viewers back to the agent's window. Picks are capped at 4 execs at once (429 beyond).
 - *Recording:* while viewed, output chunks and take-over events go to the per-agent `ac-history`
   log (`<data>/history/<id>`, 0700, 1 MiB segments, 16 MiB kept). Keystrokes are not recorded.
   `GET .../history` returns plain text with every escape stripped.
@@ -287,7 +298,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `DELETE /api/v1/agents/{id}` (destroy; `?purge=true`, `?force=true`) | `agents:write` |
   | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output` | `jobs:read` |
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
-  | `GET .../{id}/term` (stream), `.../history` | `viewer:read` |
+  | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
 
 - *Agents:* a token restricted to some agents gets 404 for any other agent id, existing or not, before its scope

@@ -8,16 +8,27 @@
 //! bytes are sent as hex. (tmux's own `read-only` flag is not used: while such a client is
 //! attached, tmux refuses the agent's own tmux commands too.) Both wrap an [`Exec`], so their
 //! stdin never reaches EOF while they run. A viewer id works only with the token that opened it.
+//!
+//! Each viewer watches a [`Target`]: the window the agent has current (the default), or a window it
+//! picked from the list the bridge keeps (`list-windows`, refreshed on tmux's window notices). A
+//! pick never runs `select-window`, which would move the agent too: the bridge snapshots every
+//! watched window by id (`capture-pane -t @<n>`), and a taker's input goes to the active pane of
+//! the window it watches (`send-keys -t %<n>`, the pane id from that list). The only viewer text
+//! that reaches a command is a window id the server parsed into a number and found in the list.
+//! When a watched window closes, its viewers fall back to the agent's window.
+//!
 //! Routes (scopes in [`crate::access`]):
-//! - `GET /api/v1/agents/{id}/term`: NDJSON stream ([`ac_viewer::screen`] messages);
+//! - `GET /api/v1/agents/{id}/term`: NDJSON stream ([`ac_viewer::screen`] and
+//!   [`ac_viewer::windows`] messages);
 //! - `POST /api/v1/agents/{id}/term/{viewer}/{keys|text|paste|resize|takeover|release}`;
+//! - `POST /api/v1/agents/{id}/term/{viewer}/window`, body `@<n>` or `active`: watch that window;
 //! - `GET /api/v1/agents/{id}/history?limit=N`: recorded output as plain text.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +42,7 @@ use ac_viewer::record::{self, Record};
 use ac_viewer::registry::{Full, Held, Registry};
 use ac_viewer::screen::{self, Meta, Screen, DISPLAY_FORMAT};
 use ac_viewer::sgr::Line;
+use ac_viewer::windows::{self, PaneId, Target, Window, WindowId, LIST_FORMAT};
 use platform::process::Spawner;
 
 use crate::{error, Reply};
@@ -55,22 +67,27 @@ const KEEP_BYTES: u64 = 16 << 20;
 /// Records returned by the history endpoint, by default and at most.
 const HISTORY_DEFAULT: usize = 500;
 const HISTORY_MAX: usize = 5000;
+/// Window picks being captured at once (each is an exec); more get 429.
+const MAX_PICKS: usize = 4;
 
 /// The view client never sizes the window; the take-over client gets no `%output`.
 const VIEW_ATTACH: [&str; 7] = ["tmux", "-C", "attach", "-t", "main", "-f", "ignore-size"];
 const WRITER_ATTACH: [&str; 7] = ["tmux", "-C", "attach", "-t", "main", "-f", "no-output"];
 const QUIT: &[u8] = b"detach-client\n";
 
-/// The view client's whole vocabulary, rendered by [`ViewCommand::line`] from constants. There is
-/// no way to hand that client anything else, so no viewer-supplied value can reach it.
+/// The view client's whole vocabulary, rendered by [`ViewCommand::line`] from constants and, for a
+/// [`Target`], `main` or a window id rendered from its number. There is no way to hand that client
+/// anything else, so no viewer-supplied text can reach it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewCommand {
     /// The client's own name (to detach it later).
     ClientName,
-    /// Pane size, cursor and modes ([`DISPLAY_FORMAT`]).
-    CursorInfo,
-    /// The visible screen with colours.
-    Snapshot,
+    /// Pane size, cursor and modes ([`DISPLAY_FORMAT`]) of the target's active pane.
+    CursorInfo(Target),
+    /// The target's visible screen with colours.
+    Snapshot(Target),
+    /// The windows of `main` ([`LIST_FORMAT`]).
+    ListWindows,
 }
 
 impl ViewCommand {
@@ -78,8 +95,9 @@ impl ViewCommand {
     pub fn line(self) -> String {
         match self {
             Self::ClientName => "display -p '#{client_name}'\n".to_owned(),
-            Self::CursorInfo => format!("display -p -t main '{DISPLAY_FORMAT}'\n"),
-            Self::Snapshot => "capture-pane -p -e -t main\n".to_owned(),
+            Self::CursorInfo(t) => format!("display -p -t {t} '{DISPLAY_FORMAT}'\n"),
+            Self::Snapshot(t) => format!("capture-pane -p -e -t {t}\n"),
+            Self::ListWindows => format!("list-windows -t main -F '{LIST_FORMAT}'\n"),
         }
     }
 }
@@ -113,10 +131,11 @@ impl Writer {
         Self(exec)
     }
 
-    /// Send validated input: `send-keys -H` hex or `refresh-client -C` lines only.
-    pub fn send(&mut self, input: &Input) -> Result<(), String> {
+    /// Send validated input to `pane` (`None`: `main`'s active pane): `send-keys -H` hex or
+    /// `refresh-client -C` lines only.
+    pub fn send(&mut self, input: &Input, pane: Option<PaneId>) -> Result<(), String> {
         input
-            .lines()
+            .lines(pane)
             .iter()
             .try_for_each(|l| self.0.send(l.as_bytes()))
     }
@@ -138,6 +157,10 @@ pub trait Terminal: Send + Sync + 'static {
     fn attach_writer(&self, id: &AgentId) -> Result<Writer, String>;
     /// Raw `capture-pane -e` lines of the scrollback above the screen.
     fn scrollback(&self, id: &AgentId) -> Result<Vec<String>, String>;
+    /// What `target` shows, in one exec: a [`DISPLAY_FORMAT`] line, then raw `capture-pane -e`
+    /// lines of up to 1000 lines of scrollback and the screen (see [`split_capture`]). Fails if
+    /// the window is gone.
+    fn capture(&self, id: &AgentId, target: Target) -> Result<Vec<String>, String>;
     /// Detach one tmux client by name.
     fn detach(&self, id: &AgentId, client: &str) -> Result<(), String>;
     /// Whether the agent answers a trivial exec within 2 s.
@@ -181,6 +204,33 @@ impl<S: Spawner + Send + Sync + 'static> Terminal for CtrRuntime<S> {
         ];
         let out = self
             .exec_once("scrollback", id, &args, Duration::from_secs(10))
+            .map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    fn capture(&self, id: &AgentId, target: Target) -> Result<Vec<String>, String> {
+        let t = target.to_string();
+        let args = [
+            "tmux",
+            "display",
+            "-p",
+            "-t",
+            &t,
+            DISPLAY_FORMAT,
+            ";",
+            "capture-pane",
+            "-p",
+            "-e",
+            "-S",
+            "-1000",
+            "-t",
+            &t,
+        ];
+        let out = self
+            .exec_once("capture", id, &args, Duration::from_secs(10))
             .map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&out)
             .lines()
@@ -232,6 +282,7 @@ pub(crate) enum Action {
     Text,
     Paste,
     Resize,
+    Window,
 }
 
 impl Action {
@@ -243,6 +294,7 @@ impl Action {
             "text" => Self::Text,
             "paste" => Self::Paste,
             "resize" => Self::Resize,
+            "window" => Self::Window,
             _ => return None,
         })
     }
@@ -284,6 +336,7 @@ struct Inner {
     term: Box<dyn Terminal>,
     state: Mutex<State>,
     recorder: Recorder,
+    picks: AtomicUsize,
 }
 
 struct State {
@@ -297,10 +350,63 @@ struct State {
 /// A viewed agent: lives exactly as long as its bridge.
 struct View {
     gen: u64,
-    viewers: HashMap<String, SyncSender<Vec<u8>>>,
-    screen: Option<Screen>,
+    viewers: HashMap<String, Seat>,
+    /// The latest screen of each watched target ([`Target::Active`] always).
+    screens: HashMap<Target, Screen>,
+    /// The latest window list.
+    windows: Vec<Window>,
     client: Option<String>,
-    owner: Option<SyncSender<Input>>,
+    owner: Option<SyncSender<(Input, Option<PaneId>)>>,
+}
+
+/// One viewer of a view: its stream and what it watches.
+struct Seat {
+    tx: SyncSender<Vec<u8>>,
+    target: Target,
+}
+
+impl View {
+    /// The active pane of `target`: `None` for the agent's window; `Err` if the window is gone.
+    fn pane(&self, target: Target) -> Result<Option<PaneId>, Reply> {
+        match target {
+            Target::Active => Ok(None),
+            Target::Window(w) => self
+                .windows
+                .iter()
+                .find(|x| x.id == w)
+                .map(|x| Some(x.pane))
+                .ok_or_else(|| error(409, "window closed")),
+        }
+    }
+
+    /// Viewers of windows that `keep` rejects go back to the agent's window, with a full screen.
+    fn fall_back(&mut self, keep: impl Fn(WindowId) -> bool) {
+        let active = self
+            .screens
+            .get(&Target::Active)
+            .map(|s| screen::full(s, &[]));
+        for seat in self.viewers.values_mut() {
+            if let Target::Window(w) = seat.target {
+                if !keep(w) {
+                    seat.target = Target::Active;
+                    let _ = seat
+                        .tx
+                        .try_send(windows::target(Target::Active).into_bytes());
+                    if let Some(full) = &active {
+                        let _ = seat.tx.try_send(full.clone().into_bytes());
+                    }
+                }
+            }
+        }
+        self.prune();
+    }
+
+    /// Forget screens of windows nobody watches, so a later pick starts from a fresh capture.
+    fn prune(&mut self) {
+        let watched: Vec<Target> = self.viewers.values().map(|s| s.target).collect();
+        self.screens
+            .retain(|t, _| *t == Target::Active || watched.contains(t));
+    }
 }
 
 impl Hub {
@@ -329,6 +435,7 @@ impl Hub {
                     dir: history_dir,
                     logs: Mutex::new(HashMap::new()),
                 },
+                picks: AtomicUsize::new(0),
             }),
         }
     }
@@ -354,6 +461,9 @@ impl Hub {
         Some(match route {
             Route::Stream(id) => self.open(&id, who),
             Route::History(id) => self.history(&id, query),
+            Route::Action(id, viewer, Action::Window) => {
+                Answer::Json(self.pick(&id, viewer, body, who))
+            }
             Route::Action(id, viewer, action) => {
                 Answer::Json(self.action(&id, viewer, action, query, body, who))
             }
@@ -385,17 +495,25 @@ impl Hub {
             let view = st.views.entry(id.to_string()).or_insert_with(|| View {
                 gen,
                 viewers: HashMap::new(),
-                screen: None,
+                screens: HashMap::new(),
+                windows: Vec::new(),
                 client: None,
                 owner: None,
             });
             let _ = tx.try_send(screen::hello(&viewer).into_bytes());
             let _ = tx.try_send(screen::mode(owner.as_deref()).into_bytes());
+            if !view.windows.is_empty() {
+                let _ = tx.try_send(windows::message(&view.windows).into_bytes());
+            }
             // Sent under the lock, so no delta for a newer screen can overtake it.
-            if let Some(s) = &view.screen {
+            if let Some(s) = view.screens.get(&Target::Active) {
                 let _ = tx.try_send(screen::full(s, &scroll).into_bytes());
             }
-            view.viewers.insert(viewer.clone(), tx);
+            let seat = Seat {
+                tx,
+                target: Target::Active,
+            };
+            view.viewers.insert(viewer.clone(), seat);
             let start = (view.gen == gen).then_some(gen);
             st.tokens.insert(viewer.clone(), who.to_owned());
             start
@@ -425,6 +543,7 @@ impl Hub {
                 return;
             };
             view.viewers.remove(viewer);
+            view.prune();
             if event.is_some() {
                 view.owner = None;
                 broadcast(view, &screen::mode(None));
@@ -450,9 +569,7 @@ impl Hub {
         who: &str,
     ) -> Reply {
         let mut st = self.inner.lock();
-        if !st.registry.is_viewer(id.as_str(), viewer)
-            || st.tokens.get(viewer).map(String::as_str) != Some(who)
-        {
+        if !st.owns(id, viewer, who) {
             return error(404, "no such viewer");
         }
         match action {
@@ -499,7 +616,15 @@ impl Hub {
                 let Some(view) = st.views.get(id.as_str()) else {
                     return error(409, "not attached");
                 };
-                let meta = view.screen.as_ref().map(|s| s.meta);
+                let target = view
+                    .viewers
+                    .get(viewer)
+                    .map_or(Target::Active, |s| s.target);
+                let pane = match view.pane(target) {
+                    Ok(p) => p,
+                    Err(reply) => return reply,
+                };
+                let meta = view.screens.get(&target).map(|s| s.meta);
                 let input = match action {
                     Action::Keys => input::keys(
                         &String::from_utf8_lossy(body),
@@ -514,13 +639,70 @@ impl Hub {
                     Err(InputError::TooLarge) => return error(413, "input too large"),
                     Err(e) => return error(400, &e.to_string()),
                 };
-                match view.owner.as_ref().map(|tx| tx.try_send(input)) {
+                match view.owner.as_ref().map(|tx| tx.try_send((input, pane))) {
                     Some(Ok(())) => ok(r#"{"sent":true}"#),
                     Some(Err(TrySendError::Full(_))) => error(503, "input queue full"),
                     _ => error(503, "take-over client is gone"),
                 }
             }
+            Action::Window => error(500, "a window pick is not an input action"),
         }
+    }
+
+    /// Watch another window: `body` is exactly `active` (the agent's window) or the id of a window in
+    /// the latest list, else 400. One exec captures it (with scrollback) for this viewer; from then
+    /// on the bridge snapshots it with the others.
+    fn pick(&self, id: &AgentId, viewer: &str, body: &[u8], who: &str) -> Reply {
+        let target = {
+            let st = self.inner.lock();
+            if !st.owns(id, viewer, who) {
+                return error(404, "no such viewer");
+            }
+            let Some(view) = st.views.get(id.as_str()) else {
+                return error(409, "not attached");
+            };
+            match pick_target(body, &view.windows) {
+                Some(t) => t,
+                None => {
+                    return error(
+                        400,
+                        "body must be `active` or the id (@<digits>) of a window in the list",
+                    )
+                }
+            }
+        };
+        if self.inner.picks.fetch_add(1, Ordering::SeqCst) >= MAX_PICKS {
+            self.inner.picks.fetch_sub(1, Ordering::SeqCst);
+            return error(429, "too many window changes at once");
+        }
+        let captured = self.inner.term.capture(id, target);
+        self.inner.picks.fetch_sub(1, Ordering::SeqCst);
+        let Some((fresh, scroll)) = captured.ok().and_then(|raw| split_capture(&raw)) else {
+            return error(409, "window closed");
+        };
+        let mut st = self.inner.lock();
+        if !st.owns(id, viewer, who) {
+            return error(404, "no such viewer");
+        }
+        let Some(view) = st.views.get_mut(id.as_str()) else {
+            return error(409, "not attached");
+        };
+        if view.pane(target).is_err() {
+            return error(409, "window closed");
+        }
+        // A screen someone already watches is the one later deltas follow: send that one.
+        let full = screen::full(view.screens.entry(target).or_insert(fresh), &scroll);
+        if let Some(seat) = view.viewers.get_mut(viewer) {
+            seat.target = target;
+            let _ = seat.tx.try_send(windows::target(target).into_bytes());
+            let _ = seat.tx.try_send(full.into_bytes());
+        }
+        view.prune();
+        let window = match target {
+            Target::Active => "null".to_owned(),
+            Target::Window(w) => format!("\"{w}\""),
+        };
+        ok(&format!(r#"{{"window":{window}}}"#))
     }
 
     fn history(&self, id: &AgentId, query: &str) -> Answer {
@@ -534,6 +716,14 @@ impl Hub {
             Ok(records) => Answer::Text(record::render(&records)),
             Err(e) => Answer::Json(error(500, &e)),
         }
+    }
+}
+
+impl State {
+    /// Whether `viewer` watches `id` and was opened by the token named `who`.
+    fn owns(&self, id: &AgentId, viewer: &str, who: &str) -> bool {
+        self.registry.is_viewer(id.as_str(), viewer)
+            && self.tokens.get(viewer).map(String::as_str) == Some(who)
     }
 }
 
@@ -561,20 +751,66 @@ impl Inner {
         }
     }
 
-    /// A new snapshot: a full one (with scrollback) the first time, else only what changed.
-    fn publish(&self, id: &AgentId, gen: u64, next: Screen, scroll: Option<Vec<Line>>) {
+    /// A new snapshot of `target`, for the viewers watching it: a full one (with scrollback) the
+    /// first time, else only what changed.
+    fn publish(
+        &self,
+        id: &AgentId,
+        gen: u64,
+        target: Target,
+        next: Screen,
+        scroll: Option<Vec<Line>>,
+    ) {
         let mut st = self.lock();
         let Some(view) = st.views.get_mut(id.as_str()).filter(|v| v.gen == gen) else {
             return;
         };
-        let msg = match &view.screen {
+        let msg = match view.screens.get(&target) {
             Some(prev) => screen::delta(prev, &next),
             None => Some(screen::full(&next, &scroll.unwrap_or_default())),
         };
-        view.screen = Some(next);
+        view.screens.insert(target, next);
         if let Some(m) = msg {
-            broadcast(view, &m);
+            view.viewers
+                .retain(|_, s| s.target != target || s.tx.try_send(m.as_bytes().to_vec()).is_ok());
         }
+    }
+
+    /// A new window list: sent to every viewer if it changed; viewers of windows no longer in it
+    /// fall back to the agent's window.
+    fn set_windows(&self, id: &AgentId, gen: u64, list: Vec<Window>) {
+        let mut st = self.lock();
+        let Some(view) = st.views.get_mut(id.as_str()).filter(|v| v.gen == gen) else {
+            return;
+        };
+        if view.windows != list {
+            broadcast(view, &windows::message(&list));
+            view.windows = list;
+        }
+        let ids: Vec<WindowId> = view.windows.iter().map(|w| w.id).collect();
+        view.fall_back(|w| ids.contains(&w));
+    }
+
+    /// Window `w` could not be captured: it closed. Its viewers fall back to the agent's window.
+    fn gone(&self, id: &AgentId, gen: u64, w: WindowId) {
+        let mut st = self.lock();
+        if let Some(view) = st.views.get_mut(id.as_str()).filter(|v| v.gen == gen) {
+            view.windows.retain(|x| x.id != w);
+            view.fall_back(|x| x != w);
+        }
+    }
+
+    /// What to snapshot: the agent's window, then every window a viewer watches.
+    fn targets(&self, id: &AgentId, gen: u64) -> Vec<Target> {
+        let mut out = vec![Target::Active];
+        if let Some(view) = self.lock().views.get(id.as_str()).filter(|v| v.gen == gen) {
+            for seat in view.viewers.values() {
+                if !out.contains(&seat.target) {
+                    out.push(seat.target);
+                }
+            }
+        }
+        out
     }
 
     /// The bridge stopped: tell its viewers and drop them (their streams end; pages reconnect).
@@ -582,8 +818,8 @@ impl Inner {
         let mut st = self.lock();
         if st.views.get(id.as_str()).is_some_and(|v| v.gen == gen) {
             if let Some(view) = st.views.remove(id.as_str()) {
-                for tx in view.viewers.values() {
-                    let _ = tx.try_send(screen::bye(reason).into_bytes());
+                for seat in view.viewers.values() {
+                    let _ = seat.tx.try_send(screen::bye(reason).into_bytes());
                 }
             }
         }
@@ -593,7 +829,7 @@ impl Inner {
 /// Send to every viewer; one whose queue is full is dropped rather than waited for.
 fn broadcast(view: &mut View, msg: &str) {
     view.viewers
-        .retain(|_, tx| tx.try_send(msg.as_bytes().to_vec()).is_ok());
+        .retain(|_, s| s.tx.try_send(msg.as_bytes().to_vec()).is_ok());
 }
 
 /// A viewer's stream: messages, a keep-alive when idle, and on drop (the browser went away,
@@ -626,8 +862,9 @@ impl Drop for Stream {
 /// What the bridge is waiting for, in send order.
 enum Want {
     Name,
-    Meta,
-    Capture,
+    Windows,
+    Meta(Target),
+    Capture(Target),
 }
 
 fn bridge(inner: Arc<Inner>, id: AgentId, gen: u64) {
@@ -639,8 +876,9 @@ fn bridge(inner: Arc<Inner>, id: AgentId, gen: u64) {
 }
 
 /// Read the read-only client's lines until it exits or is no longer wanted. Output is recorded
-/// and triggers a snapshot; while one is in flight, further output only marks it dirty, which
-/// batches bursts without a timer. The client is closed on every way out.
+/// and triggers a snapshot of every watched target; while one is in flight, further output only
+/// marks it dirty, which batches bursts without a timer. A window notice refreshes the list and
+/// the snapshots (switching windows prints nothing). The client is closed on every way out.
 fn run_bridge(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
     inner.term.prepare(id)?;
     let scroll = inner.term.scrollback(id).map(|r| screen::lines(&r)).ok();
@@ -648,39 +886,64 @@ fn run_bridge(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
     let stdout = client.take_stdout().ok_or("control client has no stdout")?;
     let mut lines = Lines::new(stdout);
     let mut parser = Parser::default();
-    let mut wants = VecDeque::from([Want::Name]);
+    let mut wants = VecDeque::from([Want::Name, Want::Windows]);
     client.send(ViewCommand::ClientName)?;
-    snapshot(&mut client, &mut wants)?;
-    let (mut busy, mut dirty, mut meta, mut scroll) = (true, false, None, scroll);
-    while let Some(line) = lines.next_line() {
+    client.send(ViewCommand::ListWindows)?;
+    let (mut dirty, mut meta, mut scroll) = (true, None, scroll);
+    loop {
+        let capturing = wants.iter().any(|w| matches!(w, Want::Capture(_)));
+        if dirty && !capturing {
+            dirty = false;
+            for t in inner.targets(id, gen) {
+                client.send(ViewCommand::CursorInfo(t))?;
+                client.send(ViewCommand::Snapshot(t))?;
+                wants.extend([Want::Meta(t), Want::Capture(t)]);
+            }
+        }
+        let Some(line) = lines.next_line() else { break };
         if !inner.alive(id, gen) {
             break;
         }
         match parser.line(&line) {
             Some(Notice::Output(bytes)) => {
                 inner.recorder.output(id, &bytes);
-                if busy {
-                    dirty = true;
-                } else {
-                    snapshot(&mut client, &mut wants)?;
-                    busy = true;
-                }
+                dirty = true;
+            }
+            Some(Notice::Windows) => {
+                client.send(ViewCommand::ListWindows)?;
+                wants.push_back(Want::Windows);
+                dirty = true;
             }
             Some(Notice::Reply { ok, lines: reply }) => match wants.pop_front() {
                 Some(Want::Name) => inner.set_client(id, gen, reply.into_iter().next()),
-                Some(Want::Meta) => {
-                    meta = reply.first().filter(|_| ok).and_then(|l| Meta::parse(l))
-                }
-                Some(Want::Capture) => {
-                    if let (true, Some(m)) = (ok, meta.take()) {
-                        inner.publish(id, gen, Screen::from_capture(m, &reply), scroll.take());
-                    }
-                    busy = dirty;
-                    if dirty {
-                        dirty = false;
-                        snapshot(&mut client, &mut wants)?;
+                Some(Want::Windows) => {
+                    if ok {
+                        inner.set_windows(id, gen, windows::parse_list(&reply));
                     }
                 }
+                Some(Want::Meta(t)) => {
+                    meta = reply
+                        .first()
+                        .filter(|_| ok)
+                        .and_then(|l| Meta::parse(l))
+                        .map(|m| (t, m));
+                }
+                Some(Want::Capture(t)) => match (ok, meta.take()) {
+                    (true, Some((mt, m))) if mt == t => {
+                        let scroll = if t == Target::Active {
+                            scroll.take()
+                        } else {
+                            None
+                        };
+                        inner.publish(id, gen, t, Screen::from_capture(m, &reply), scroll);
+                    }
+                    // A missing window: `display` prints blanks, `capture-pane` fails.
+                    _ => {
+                        if let Target::Window(w) = t {
+                            inner.gone(id, gen, w);
+                        }
+                    }
+                },
                 None => {}
             },
             Some(Notice::Exit) => break,
@@ -690,16 +953,28 @@ fn run_bridge(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn snapshot(client: &mut ViewClient, wants: &mut VecDeque<Want>) -> Result<(), String> {
-    client.send(ViewCommand::CursorInfo)?;
-    client.send(ViewCommand::Snapshot)?;
-    wants.extend([Want::Meta, Want::Capture]);
-    Ok(())
+/// The window a pick names: exactly `active`, or a window id (`@<digits>`) in `list`.
+fn pick_target(body: &[u8], list: &[Window]) -> Option<Target> {
+    let text = std::str::from_utf8(body).ok()?;
+    if text == "active" {
+        return Some(Target::Active);
+    }
+    let w = WindowId::parse(text)?;
+    list.iter().any(|x| x.id == w).then_some(Target::Window(w))
+}
+
+/// [`Terminal::capture`] output as the screen (the last `height` lines) and the scrollback above it.
+fn split_capture(raw: &[String]) -> Option<(Screen, Vec<Line>)> {
+    let (first, rest) = raw.split_first()?;
+    let meta = Meta::parse(first)?;
+    let at = rest.len().checked_sub(usize::from(meta.height))?;
+    let (scroll, shown) = rest.split_at(at);
+    Some((Screen::from_capture(meta, shown), screen::lines(scroll)))
 }
 
 /// The take-over client: forwards the lock holder's commands until the lock is released (the
 /// sender is dropped), then closes.
-fn writer(inner: Arc<Inner>, id: AgentId, rx: Receiver<Input>) {
+fn writer(inner: Arc<Inner>, id: AgentId, rx: Receiver<(Input, Option<PaneId>)>) {
     let mut writer = match inner.term.attach_writer(&id) {
         Ok(w) => w,
         Err(e) => {
@@ -707,8 +982,8 @@ fn writer(inner: Arc<Inner>, id: AgentId, rx: Receiver<Input>) {
             return;
         }
     };
-    while let Ok(input) = rx.recv() {
-        if writer.send(&input).is_err() {
+    while let Ok((input, pane)) = rx.recv() {
+        if writer.send(&input, pane).is_err() {
             break;
         }
     }
@@ -963,6 +1238,83 @@ mod tests {
         assert_eq!(size("cols=120&rows=40"), Ok((120, 40)));
         assert_eq!(size("rows=40"), Err(InputError::BadSize));
         assert_eq!(size("cols=x&rows=40"), Err(InputError::BadSize));
+    }
+
+    fn list() -> Vec<Window> {
+        windows::parse_list(&["@0 %0 0 1 bash".to_owned(), "@3 %5 1 0 job-1".to_owned()])
+    }
+
+    #[test]
+    fn a_pick_is_active_or_a_listed_window_id_and_nothing_else() {
+        let w3 = WindowId::parse("@3").map(Target::Window);
+        assert_eq!(pick_target(b"@3", &list()), w3);
+        assert_eq!(pick_target(b"active", &list()), Some(Target::Active));
+        let huge = format!("@{}", "9".repeat(100_000));
+        for bad in [
+            "@1;kill-server",
+            "@3;kill-server",
+            "@3 ",
+            " @3",
+            "@3\n",
+            "%5",
+            "%1",
+            "",
+            "@",
+            "@7",
+            "@03",
+            &huge,
+            "@\u{0663}",
+            "\u{ff20}3",
+            "@3\u{0}",
+            "Active",
+            "main",
+            "@0\tactive",
+        ] {
+            assert_eq!(pick_target(bad.as_bytes(), &list()), None, "{bad:?}");
+        }
+        assert_eq!(pick_target(b"@3\xff", &list()), None);
+        assert_eq!(pick_target(b"@3", &[]), None, "not in the latest list");
+    }
+
+    #[test]
+    fn view_commands_name_only_main_or_a_window_number() {
+        let w = WindowId::parse("@3").map_or(Target::Active, Target::Window);
+        assert_eq!(
+            ViewCommand::Snapshot(Target::Active).line(),
+            "capture-pane -p -e -t main\n"
+        );
+        assert_eq!(
+            ViewCommand::Snapshot(w).line(),
+            "capture-pane -p -e -t @3\n"
+        );
+        assert!(ViewCommand::CursorInfo(w)
+            .line()
+            .starts_with("display -p -t @3 '#{pane_width}"));
+        assert_eq!(
+            ViewCommand::ListWindows.line(),
+            format!("list-windows -t main -F '{LIST_FORMAT}'\n")
+        );
+    }
+
+    #[test]
+    fn a_capture_splits_into_screen_and_scrollback() {
+        let raw: Vec<String> = ["3 2 0 1 1 0 0", "old 1", "old 2", "row 1", "row 2"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let (shown, scroll) = split_capture(&raw).unwrap_or_else(|| panic!("split"));
+        assert_eq!((shown.meta.width, shown.meta.height), (3, 2));
+        assert_eq!(shown.lines.len(), 2);
+        assert_eq!(scroll.len(), 2);
+        assert!(
+            split_capture(&raw[..2]).is_none(),
+            "fewer lines than the screen"
+        );
+        assert!(
+            split_capture(&["      ".to_owned()]).is_none(),
+            "a missing window's blanks"
+        );
+        assert!(split_capture(&[]).is_none());
     }
 
     #[test]

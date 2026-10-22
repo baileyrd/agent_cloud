@@ -307,6 +307,10 @@ How to use it:
 3. You watch the agent's tmux session `main`, view-only. **Take over** gives you the keyboard (paste works;
    the window follows your browser's size); **Release** hands it back. If another viewer has control you get
    **Force take over**. Closing the tab leaves the session running; the next viewer sees its scrollback.
+   The bar under the header lists the session's windows (`*` marks the agent's current one; `job-*` windows
+   from the task API are highlighted). Click one to watch it, and while you have control your keys go to it;
+   **Follow agent** goes back to whichever window the agent has current. This is per page: the agent and other
+   viewers stay where they are (no `select-window`). If the window closes the page falls back to the agent's.
 4. What was shown while someone watched, with take-over and audit events: `GET /api/v1/agents/<id>/history?limit=N`
    (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
 
@@ -330,7 +334,7 @@ reboot, the gateway logged `reconcile: a1 had no VM; marked paused` and `scripts
 
 **Task API** (ADR-010): run a prompt in an agent as a job, with an id, live status and the result. Nothing to
 install; the gateway serves it. Jobs run `claude -p` in the agent's tmux session `main`, in a window named
-`job-<id>`, so you can watch one in the viewer (select the window with `Ctrl-b <n>` after **Take over**). Settings
+`job-<id>`, so you can watch one in the viewer (click it in the window list; `job-*` windows are highlighted). Settings
 in `gateway.env` (restart the gateway after a change):
 
 - `AC_JOB_PERMISSION_MODE`: `acceptEdits` (default), `auto`, `dontAsk`, `manual` or `plan`;

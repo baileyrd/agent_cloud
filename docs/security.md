@@ -99,9 +99,13 @@ What it protects:
   header when it navigates.
 - **View-only is enforced by the gateway, not by tmux or the page.** A viewer without the
   take-over lock gets 403 for any input, before anything is built. The shared view client can
-  only be sent a closed set of commands (`ViewCommand`: client name, cursor info, snapshot); the
-  take-over client exists only while someone holds the lock and receives only `send-keys -H`
-  hex and `refresh-client -C` lines, so no viewer byte can become a tmux command. tmux's
+  only be sent a closed set of commands (`ViewCommand`: client name, list windows, cursor info and
+  snapshot of `main` or of a window); the take-over client exists only while someone holds the
+  lock and receives only `send-keys -H` hex and `refresh-client -C` lines, so no viewer byte can
+  become a tmux command. Picking a window to watch sends only a window id the gateway parsed into
+  a number and found in its own list (`@<digits>`; anything else is 400), and input then goes to
+  that window's pane by the pane id from the same list. A pick never runs `select-window`, so it
+  never moves the agent or other viewers. tmux's
   `read-only` flag is not used: it made tmux refuse the agent's own tmux commands while anyone
   watched. **An agent can always use its own tmux while someone watches.**
 - **Agent to viewer:** the gateway turns screen snapshots into plain text plus colour numbers. OSC

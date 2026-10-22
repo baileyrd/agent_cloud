@@ -56,7 +56,7 @@ const A: &str = "/api/v1/agents/{id}";
 
 /// Every route under `/api/`. Viewer input (keys, text, paste, resize) is not audited per call:
 /// it comes from the viewer whose take-over was, and a viewer id works only with the token that
-/// opened it.
+/// opened it. Picking a window changes only what that viewer sees, so it needs `viewer:read`.
 pub const ROUTES: &[Rule] = &[
     rule("GET", "/api/v1/whoami", Need::Token, None),
     rule("GET", "/api/v1/agents", S(AgentsRead), None),
@@ -97,6 +97,12 @@ pub const ROUTES: &[Rule] = &[
     ),
     rule("GET", "/api/v1/agents/{id}/term", S(ViewerRead), None),
     rule("GET", "/api/v1/agents/{id}/history", S(ViewerRead), None),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/term/{viewer}/window",
+        S(ViewerRead),
+        None,
+    ),
     rule(
         "POST",
         "/api/v1/agents/{id}/term/{viewer}/takeover",
@@ -282,6 +288,7 @@ mod tests {
             ("POST", &format!("{job}/cancel"), S(JobsWrite)),
             ("GET", "/api/v1/agents/a1/term", S(ViewerRead)),
             ("GET", "/api/v1/agents/a1/history", S(ViewerRead)),
+            ("POST", &format!("{term}/window"), S(ViewerRead)),
             ("POST", &format!("{term}/takeover"), S(ViewerControl)),
             ("POST", &format!("{term}/release"), S(ViewerControl)),
             ("POST", &format!("{term}/keys"), S(ViewerControl)),
@@ -293,7 +300,7 @@ mod tests {
         }
         assert_eq!(
             ROUTES.len(),
-            20,
+            21,
             "a new route needs a row above and in ADR-011"
         );
     }

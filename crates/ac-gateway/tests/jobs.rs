@@ -617,6 +617,9 @@ impl ac_gateway::viewer::Terminal for NoTerm {
     fn scrollback(&self, _: &AgentId) -> Result<Vec<String>, String> {
         Err("none".into())
     }
+    fn capture(&self, _: &AgentId, _: ac_viewer::windows::Target) -> Result<Vec<String>, String> {
+        Err("none".into())
+    }
     fn detach(&self, _: &AgentId, _: &str) -> Result<(), String> {
         Ok(())
     }

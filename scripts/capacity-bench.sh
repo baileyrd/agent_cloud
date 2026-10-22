@@ -1,24 +1,24 @@
 #!/bin/bash
 # Measure how many agents this host runs at once, what limits it, and what one agent costs.
-#   sudo scripts/capacity-bench.sh [--max-n N] [--estimate] [--claude-token FILE] [--small-mem MB]
+#   sudo scripts/capacity-bench.sh [--max-n N] [--estimate] [--small-mem MB]
 # --max-n caps the staircase N = 1 2 3 4 6 8 (default 6). --estimate prints the prediction and exits.
-# --claude-token: a root-only file holding a `claude setup-token` token, copied into each bench
-# workspace so `claude -p "say ok"` can log in (without it the job runs logged out: a lower bound).
+# No Claude Code calls: the load is synthetic (Claude's own footprint is measured separately, on a
+# logged-in agent; docs/sizing.md).
 # --small-mem: default_memory (MB) for one extra agent at the end (default 2048, 0 skips it); the Kata
 # config is restored byte for byte afterwards, on every exit path.
-# Agents are bench-<n> only, created and destroyed (purged) through the gateway API with the owner
-# token; a1, a2 and other workspaces are never touched. A watchdog stops the run on the first
+# Agents are bench-<n> only (n <= 24), created and destroyed (purged) through the gateway API with a
+# throwaway token scoped to agents:read,agents:write for bench-1..bench-24, revoked on exit; a1, a2
+# and other workspaces are never touched. A watchdog stops the run on the first
 # threshold (see trip()); the reason is in $OUT/abort. Raw samples: /var/tmp/ac-bench-<date>/*.csv.
 # Exit: 0 done, 3 a threshold ended the run, 2 setup error, 1 cleanup left something behind.
 set -u
-MAX_N=6 ESTIMATE=0 CLAUDE_TOKEN= SMALL_MEM=2048 ARGS="$*"
+MAX_N=6 ESTIMATE=0 SMALL_MEM=2048 ARGS="$*"
 while [ $# -gt 0 ]; do
     case $1 in
         --max-n) MAX_N=$2; shift ;;
         --estimate) ESTIMATE=1 ;;
-        --claude-token) CLAUDE_TOKEN=$2; shift ;;
         --small-mem) SMALL_MEM=$2; shift ;;
-        *) echo "usage: $0 [--max-n N] [--estimate] [--claude-token FILE] [--small-mem MB]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--max-n N] [--estimate] [--small-mem MB]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -40,7 +40,7 @@ kib() { awk -v k="$1" '/^[A-Za-z]/ && $1 == k":" { print $2 }' /proc/meminfo; }
 vmstat() { awk -v k="$1" '$1 == k { print $2 }' /proc/vmstat; }
 psi() { sed -n "s/^$2 avg10=\([0-9.]*\).*/\1/p" "/proc/pressure/$1"; }  # psi memory some -> 0.00
 
-# The gateway API with the owner token (on curl's stdin). api <method> <path> -> "<status> <body>".
+# The gateway API with the bench token (on curl's stdin). api <method> <path> -> "<status> <body>".
 api() {
     printf 'Authorization: Bearer %s\n' "$TOKEN" |
         curl -sS -m "${API_SECS:-300}" -H @- -X "$1" -w ' %{http_code}' "$URL/api/v1$2" 2>&1 |
@@ -71,10 +71,20 @@ estimate() {
 echo "== estimate"
 estimate
 [ "$ESTIMATE" = 1 ] && exit 0
-[ "$(id -u)" = 0 ] || { echo "run as root (ctr, smaps_rollup, the owner token)" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "run as root (ctr, smaps_rollup, the tokens file)" >&2; exit 2; }
 URL=http://$(val AC_BIND)
-TOKEN=$(cat /etc/agent-cloud/owner.token 2>/dev/null)
-[ -n "$TOKEN" ] || { echo "no /etc/agent-cloud/owner.token" >&2; exit 2; }
+GW=$(command -v ac-gateway || echo /usr/local/bin/ac-gateway)
+[ -z "$(val AC_TOKENS)" ] || export AC_TOKENS="$(val AC_TOKENS)"
+for old in $("$GW" token list | awk '$1 ~ /^capacity-bench-/ { print $1 }'); do
+    "$GW" token revoke "$old" >/dev/null && echo "revoked leftover token $old; not running (start again)" >&2
+    STALE=1
+done
+[ -z "${STALE:-}" ] || exit 2
+TNAME=capacity-bench-$$
+TOKEN=$("$GW" token create "$TNAME" --scopes agents:read,agents:write --agents "$(seq -s, -f 'bench-%g' 1 24)") ||
+    { echo "token create failed" >&2; exit 2; }
+trap '"$GW" token revoke "$TNAME" >/dev/null' EXIT  # until the full cleanup trap below
+sleep 2  # the gateway re-reads the tokens file within a second of a change
 
 OUT=/var/tmp/ac-bench-$(date +%Y%m%d-%H%M%S)
 mkdir -p -m 700 "$OUT" || exit 2
@@ -85,7 +95,7 @@ echo "$ARGS" > "$OUT/args"
 
 # --- preflight ---------------------------------------------------------------------------------
 r=$(API_SECS=10 api GET /whoami)
-case $r in 200\ *'"admin"'*) ;; *) echo "owner token: $r" >&2; exit 2 ;; esac
+case $r in 200\ *"\"$TNAME\""*) ;; *) echo "bench token: $r" >&2; exit 2 ;; esac
 r=$(API_SECS=10 api GET /agents)
 case $r in 200\ *) ;; *) echo "list agents: $r" >&2; exit 2 ;; esac
 # Purged agents stay in the registry as destroyed (their ids are reusable); any other state is in use.
@@ -121,7 +131,7 @@ echo "ts,phase,n,memavail_mib,swap_used_mib,swap_pages_s,psi_mem_some,psi_mem_fu
 echo "idle 0" > "$OUT/phase"
 trip() { echo "$1" > "$OUT/abort"; echo "ABORT: $1"; kill -USR1 "$MAIN"; exit 0; }
 sampler() {
-    local busy0 total0 sw0 eg0 oom0 t0 over= miss=0 i=0 line busy total sw eg t
+    local busy0 total0 sw0 eg0 oom0 t0 over= miss=0 i=0 line busy total sw eg t ph lim
     read -r busy0 total0 < <(awk '/^cpu / { print $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9 }' /proc/stat)
     sw0=$(( $(vmstat pswpin) + $(vmstat pswpout) )) oom0=$(vmstat oom_kill)
     eg0=$(sed 's/^.*) //' /proc/$EGRESS_PID/stat | awk '{ print $12 + $13 }') t0=$EPOCHREALTIME
@@ -131,7 +141,8 @@ sampler() {
         sw=$(( $(vmstat pswpin) + $(vmstat pswpout) ))
         eg=$(sed 's/^.*) //' /proc/$EGRESS_PID/stat 2>/dev/null | awk '{ print $12 + $13 }')
         t=$EPOCHREALTIME
-        line=$(awk -v ph="$(cat "$OUT/phase")" -v ma="$(kib MemAvailable)" -v st="$(kib SwapTotal)" \
+        ph=$(cat "$OUT/phase")
+        line=$(awk -v ph="$ph" -v ma="$(kib MemAvailable)" -v st="$(kib SwapTotal)" \
             -v sf="$(kib SwapFree)" -v sw=$((sw - sw0)) -v ms="$(psi memory some)" -v mf="$(psi memory full)" \
             -v is="$(psi io some)" -v io="$(psi io full)" -v cs="$(psi cpu some)" -v l="$(cut -d' ' -f1 /proc/loadavg)" \
             -v b=$((busy - busy0)) -v tt=$((total - total0)) -v er="$(awk '/^VmRSS/ { print $2 }' /proc/$EGRESS_PID/status 2>/dev/null)" \
@@ -146,7 +157,9 @@ sampler() {
         [ "${sps%.*}" -le "$SWAP_PAGES_S" ] || trip "swap in+out ${sps} pages/s > $SWAP_PAGES_S"
         awk -v v="$mf" 'BEGIN { exit !(v > 10) }' && trip "memory PSI full avg10 $mf > 10"
         awk -v v="$ms" 'BEGIN { exit !(v > 40) }' && trip "memory PSI some avg10 $ms > 40"
-        awk -v v="$iof" 'BEGIN { exit !(v > 40) }' && trip "io PSI full avg10 $iof > 40"
+        # io pressure only slows the host: 80 while the disk writers run, 40 otherwise.
+        lim=40; [ "${ph%% *}" = load ] && lim=80
+        awk -v v="$iof" -v m=$lim 'BEGIN { exit !(v > m) }' && trip "io PSI full avg10 $iof > $lim"
         [ "$(vmstat oom_kill)" = "$oom0" ] || trip "host OOM kill ($(dmesg | grep -iE 'killed process|out of memory' | tail -n 1))"
         if awk -v v="$l" -v c="$CORES" 'BEGIN { exit !(v > 2 * c) }'; then
             [ -n "$over" ] || over=$t
@@ -190,12 +203,7 @@ nap() { sleep "$1" & wait $!; }
 # The load programs, copied into each bench workspace (owned like the workspace).
 LOAD=$OUT/load.py
 cat > "$LOAD" <<'PY'
-import os, resource, subprocess, sys, threading, time
-
-def avail():
-    for l in open("/proc/meminfo"):
-        if l.startswith("MemAvailable:"):
-            return int(l.split()[1])
+import os, sys, time
 
 def cpu(secs):
     end, n = time.monotonic() + secs, 0
@@ -259,39 +267,13 @@ def disk(secs):
     print(f"disk_r_mib={r >> 20} disk_r_mibs={r / 1048576 / rt:.1f} read_max_ms={rmax * 1000:.0f} "
           f"disk_w_mib={n} disk_w_mibs={n / w:.1f} fsync_max_ms={fmax * 1000:.0f}")
 
-def claude(_):
-    env = dict(os.environ)
-    try:
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = open("/workspace/.bench/oauth").read().strip()
-    except OSError:
-        pass
-    total, base, low, done = 0, avail(), [avail()], []
-    for l in open("/proc/meminfo"):
-        if l.startswith("MemTotal:"):
-            total = int(l.split()[1])
-    def watch():
-        while not done:
-            low[0] = min(low[0], avail())
-            time.sleep(0.1)
-    w = threading.Thread(target=watch)
-    w.start()
-    t = time.monotonic()
-    p = subprocess.run(["claude", "-p", "say ok"], stdin=subprocess.DEVNULL, capture_output=True,
-                       text=True, env=env, timeout=180)
-    done.append(1)
-    w.join()
-    rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    out = (p.stdout or p.stderr).strip().replace(" ", "_")[:40]
-    print(f"claude_rc={p.returncode} claude_s={time.monotonic() - t:.1f} claude_maxrss_mib={rss / 1024:.0f} "
-          f"guest_used_before_mib={(total - base) / 1024:.0f} guest_used_peak_mib={(total - low[0]) / 1024:.0f} "
-          f"claude_out={out}")
-
 globals()[sys.argv[1]](int(sys.argv[2]) if len(sys.argv) > 2 else 0)
 PY
 
 # create <id>: through the API; records the API call time and boot (create call to first exec).
 create() {
     local t0 r
+    [ "${1#bench-}" -le 24 ] || { echo "$1: beyond the bench token's agents"; return 1; }
     t0=$(now)
     r=$(api POST "/agents/$1")
     case $r in 201\ *) ;; *) echo "create $1: $r"; return 1 ;; esac
@@ -306,7 +288,6 @@ create() {
     local ws=$DATA/workspaces/$1
     install -d -o "$(stat -c %u "$ws")" -g "$(stat -c %g "$ws")" -m 700 "$ws/.bench"
     install -o "$(stat -c %u "$ws")" -g "$(stat -c %g "$ws")" -m 600 "$LOAD" "$ws/.bench/load.py"
-    [ -z "$CLAUDE_TOKEN" ] || install -o "$(stat -c %u "$ws")" -m 600 "$CLAUDE_TOKEN" "$ws/.bench/oauth"
 }
 destroy() {  # 404: already gone
     local r
@@ -407,6 +388,7 @@ cleanup() {
         echo "ac-egress, ac-gateway, nftables, firewalld zones, links and netns as before"
     else echo "HOST STATE CHANGED:"; cat "$OUT/state.diff"; fail=1; fi
     rm -f "$HOLD"
+    "$GW" token revoke "$TNAME" >/dev/null && echo "token $TNAME revoked" || fail=1
     summary
     [ "$fail" = 0 ] || exit 1
     [ -s "$OUT/abort" ] && exit 3
@@ -492,8 +474,6 @@ for n in "${STEPS[@]}"; do
     if [ "$n" = "$LAST" ]; then
         echo "net $n" > "$OUT/phase"
         guest_all net "curl -sS -m 8 -o /dev/null -I -w 'http=%{http_code} connect_s=%{time_connect} tls_s=%{time_appconnect} total_s=%{time_total}' https://api.anthropic.com"
-        echo "claude $n" > "$OUT/phase"
-        guest_all claude 'timeout -k 5 200 python3 /workspace/.bench/load.py claude'
         NEXT=$((NEXT + 1))
         load_phase "bench-$((NEXT - 1))"
     else
@@ -520,7 +500,7 @@ wait "${pids[@]}"
 for ((k = NEXT - 4; k < NEXT; k++)); do destroy "bench-$k"; done
 [ -s "$OUT/abort" ] && exit 3
 
-# One agent at a smaller default_memory: boot, guest memory, claude and the 1 GiB toucher.
+# One agent at a smaller default_memory: boot, guest memory and the 1 GiB toucher.
 if [ "$SMALL_MEM" != 0 ]; then
     echo "== default_memory $SMALL_MEM $(date +%T)"
     sed "s/^default_memory = $VM_MIB\$/default_memory = $SMALL_MEM/" "$OUT/configuration.toml.orig" > "$OUT/configuration.toml.small"
@@ -533,7 +513,7 @@ if [ "$SMALL_MEM" != 0 ]; then
         cat "$OUT/configuration.toml.orig" > "$KATA"  # only new VMs read it; restore at once
         ev small_boot_s "$id" 1 "$BOOT"
         gx "$id" 'free -m' | tee "$OUT/guest-free-small.txt"
-        guest_all small 'timeout -k 5 200 python3 /workspace/.bench/load.py claude; timeout -k 5 100 python3 /workspace/.bench/load.py mem 20'
+        guest_all small 'timeout -k 5 100 python3 /workspace/.bench/load.py mem 20'
         destroy "$id"
         AGENTS=()
     fi

@@ -1,7 +1,9 @@
 //! `ac-ctl`: drive the agent fleet from the shell.
 //!
-//! Exit codes: 0 ok, 1 operation failed (or `status` of an unknown agent), 2 bad usage.
-//! `reconcile` prints one `<id> paused` line per agent it changed.
+//! Exit codes: 0 ok, 1 operation failed (or `status` of an unknown agent), 2 bad usage, 3 the
+//! data directory is in use by another process (normally `ac-gateway`, which holds it while it
+//! runs): use the gateway's API instead, or stop it. `reconcile` prints one `<id> paused` line
+//! per agent it changed.
 
 mod args;
 
@@ -9,9 +11,28 @@ use std::process::ExitCode;
 
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_fleet::{Fleet, FleetError};
+use ac_ports::PortError;
 use ac_store::EngineStore;
 use args::{Action, Cli, Job, USAGE};
 use platform_linux::LinuxSpawner;
+
+/// Exit code when another process holds the data directory.
+const IN_USE: u8 = 3;
+/// Where `ac-gateway.service` reads `AC_BIND` from.
+const GATEWAY_ENV: &str = "/etc/agent-cloud/gateway.env";
+
+/// The gateway's address: `AC_BIND`, else the last `AC_BIND=` line of `gateway_env` (the
+/// service's settings), else its default.
+fn gateway_bind(var: Option<String>, gateway_env: Option<String>) -> String {
+    var.or_else(|| {
+        gateway_env?
+            .lines()
+            .rev()
+            .find_map(|l| l.trim().strip_prefix("AC_BIND="))
+            .map(str::to_owned)
+    })
+    .unwrap_or_else(|| "127.0.0.1:8780".to_owned())
+}
 
 fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     let network = if cli.network {
@@ -71,9 +92,48 @@ fn main() -> ExitCode {
             println!("{line}");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("ac-ctl: {e}");
-            ExitCode::FAILURE
-        }
+        Err(e) => match e
+            .downcast_ref::<PortError>()
+            .filter(|p| p.op == ac_store::IN_USE)
+        {
+            Some(held) => {
+                let bind = gateway_bind(
+                    std::env::var("AC_BIND").ok(),
+                    std::fs::read_to_string(GATEWAY_ENV).ok(),
+                );
+                eprintln!(
+                    "ac-ctl: {}, normally ac-gateway, which holds it while it runs: use the \
+                     gateway API at http://{bind} with a token (see docs/install.md), or stop \
+                     ac-gateway (sudo systemctl stop ac-gateway; its agents keep running)",
+                    held.cause
+                );
+                ExitCode::from(IN_USE)
+            }
+            None => {
+                eprintln!("ac-ctl: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_bind_from_env_then_file_then_default() {
+        let file =
+            || Some("# x\nAC_TOKEN_FILE=/t\nAC_BIND=10.0.0.1:1\n AC_BIND=100.64.0.2:8780\n".into());
+        assert_eq!(
+            gateway_bind(Some("127.0.0.1:9".into()), file()),
+            "127.0.0.1:9"
+        );
+        assert_eq!(gateway_bind(None, file()), "100.64.0.2:8780");
+        assert_eq!(
+            gateway_bind(None, Some("#AC_BIND=x\n".into())),
+            "127.0.0.1:8780"
+        );
+        assert_eq!(gateway_bind(None, None), "127.0.0.1:8780");
     }
 }

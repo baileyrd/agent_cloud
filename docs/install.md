@@ -318,8 +318,11 @@ The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `g
 a wedged one is logged (`journalctl -u ac-gateway | grep watchdog`) and freed by killing `ctr` clients, or
 reported as `"health":"unhealthy"` if that fails. Recordings live under `/var/lib/agent-cloud/history/` (0700).
 
-The gateway locks the data directory (`/var/lib/agent-cloud`), so stop it (`sudo systemctl stop ac-gateway`)
-before running `ac-ctl` against the same directory. Stopping the gateway leaves its agents running.
+The gateway locks the data directory (`/var/lib/agent-cloud`) while it runs. `ac-ctl` against the same directory
+then exits with code 3 and says so (`/var/lib/agent-cloud is in use by another process, normally ac-gateway ...:
+use the gateway API at http://<AC_BIND> with a token ..., or stop ac-gateway`); it never goes through the API on
+its own. Use the API with a token that has `agents:read`/`agents:write`, or stop the gateway
+(`sudo systemctl stop ac-gateway`) first. Stopping the gateway leaves its agents running.
 
 **After a host reboot** the registry still records agents as running, but containerd has no task for them.
 The gateway reconciles once at startup and logs each agent it changes

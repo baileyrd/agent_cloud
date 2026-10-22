@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ac-domain = { path = "../ac-domain" }
+ac-ports = { path = "../ac-ports" }
 ac-fleet = { path = "../ac-fleet" }
 ac-ctr = { path = "../ac-ctr" }
 ac-store = { path = "../ac-store" }

@@ -1,6 +1,8 @@
 #!/bin/sh
 # Collect host specs and estimate how many agents fit, using the measured model in docs/sizing.md.
 # Read-only. Usage: scripts/capacity.sh [workspace-dir]   (default /var/lib/agent-cloud)
+# With a token (AC_TOKEN, or run as root for /etc/agent-cloud/owner.token) it also prints the running
+# gateway's admission figures (ADR-012).
 set -u
 WS=${1:-/var/lib/agent-cloud}
 [ -d "$WS" ] || WS=/
@@ -43,3 +45,20 @@ awk -v m="$mem_gib" -v shm="$shm_gib" -v c="$cores" -v vm="${vm_mib:-2048}" -v v
     printf "running agents : %d  (RAM %d, /dev/shm %d; idle CPU is not the limit)\n", (ram < sh ? ram : sh), ram, sh
     printf "CPU-busy at once: %d  (rotational disk: 2, see sizing.md)\n", busy
 }'
+
+echo "== Gateway admission (GET /api/v1/capacity)"
+bind=$(sed -n 's/^AC_BIND=//p' /etc/agent-cloud/gateway.env 2>/dev/null | tail -n 1)
+token=${AC_TOKEN:-$(cat /etc/agent-cloud/owner.token 2>/dev/null)}
+if [ -z "$token" ]; then
+    echo "no token: set AC_TOKEN or run as root to show the gateway's figures"
+else
+    cap=$(printf 'Authorization: Bearer %s\n' "$token" | curl -sS -m 10 -H @- "http://${bind:-127.0.0.1:8780}/api/v1/capacity" 2>&1)
+    num() { printf '%s' "$cap" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p"; }
+    if [ -n "$(num shm_total_mib)" ]; then
+        printf 'committed %s of %s MiB /dev/shm (free %s, margin %s); %s agent(s) at %s MiB; %s more fit\n' \
+            "$(num committed_mib)" "$(num shm_total_mib)" "$(num shm_free_mib)" "$(num margin_mib)" \
+            "$(num running_agents)" "$(num guest_mib)" "$(num max_more_agents)"
+    else
+        echo "no figures: $cap"
+    fi
+fi

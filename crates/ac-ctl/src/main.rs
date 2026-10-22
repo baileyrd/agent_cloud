@@ -3,12 +3,15 @@
 //! Exit codes: 0 ok, 1 operation failed (or `status` of an unknown agent), 2 bad usage, 3 the
 //! data directory is in use by another process (normally `ac-gateway`, which holds it while it
 //! runs): use the gateway's API instead, or stop it. `reconcile` prints one `<id> paused` line
-//! per agent it changed.
+//! per agent it changed. `create` and `resume` are refused when the guest would not fit `/dev/shm`
+//! (ADR-012; the gateway's `AC_SHM_MARGIN_MIB`, `AC_VM_MEMORY_MIB`, `AC_KATA_CONFIG` and
+//! `AC_SHM_LIMIT_MIB` apply here too).
 
 mod args;
 
 use std::process::ExitCode;
 
+use ac_ctr::capacity::{CapacityConfig, HostCapacity};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::PortError;
@@ -34,28 +37,49 @@ fn gateway_bind(var: Option<String>, gateway_env: Option<String>) -> String {
     .unwrap_or_else(|| "127.0.0.1:8780".to_owned())
 }
 
+/// An optional MiB figure from the environment.
+fn env_mib(key: &str) -> Result<Option<u64>, String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.parse::<u64>().map_err(|e| format!("{key}={v}: {e}")))
+        .transpose()
+}
+
 fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     let network = if cli.network {
         Some(Network::defaults(&cli.data)?)
     } else {
         None
     };
-    let runtime = CtrRuntime::new(
-        LinuxSpawner,
-        CtrConfig {
-            ctr_bin: cli.ctr.clone(),
-            namespace: cli.namespace.clone(),
-            image: cli.image.clone(),
-            workspace_root: cli.workspaces.clone(),
-            workspace_owner: Some((cli.uid, cli.uid)),
-            network,
-            vc_root: "/run/vc".into(),
-            task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
-            command_timeout: Some(std::time::Duration::from_secs(120)),
-            trace: std::env::var_os("AC_TRACE").is_some(),
+    let cfg = CtrConfig {
+        ctr_bin: cli.ctr.clone(),
+        namespace: cli.namespace.clone(),
+        image: cli.image.clone(),
+        workspace_root: cli.workspaces.clone(),
+        workspace_owner: Some((cli.uid, cli.uid)),
+        network,
+        vc_root: "/run/vc".into(),
+        task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
+        command_timeout: Some(std::time::Duration::from_secs(120)),
+        trace: std::env::var_os("AC_TRACE").is_some(),
+    };
+    let capacity = HostCapacity::new(
+        CtrRuntime::new(LinuxSpawner, cfg.clone()),
+        CapacityConfig {
+            shm: "/dev/shm".into(),
+            kata_config: std::env::var("AC_KATA_CONFIG")
+                .unwrap_or_else(|_| "/etc/kata-containers/configuration.toml".to_owned())
+                .into(),
+            guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
+            shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
         },
     );
-    let fleet = Fleet::new(runtime, EngineStore::open(&cli.data)?);
+    let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
+    let fleet = Fleet::new(
+        CtrRuntime::new(LinuxSpawner, cfg),
+        EngineStore::open(&cli.data)?,
+    )
+    .with_admission(Box::new(capacity), margin);
     let (action, id) = match &cli.job {
         Job::Agent(action, id) => (*action, id),
         Job::Reconcile => {

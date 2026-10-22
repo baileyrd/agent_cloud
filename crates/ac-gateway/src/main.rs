@@ -11,6 +11,10 @@
 //! (seconds between watchdog probes, default 30; 0 turns the watchdog off). Jobs (ADR-010):
 //! `AC_JOB_PERMISSION_MODE` (default `acceptEdits`), `AC_JOB_ALLOWED_TOOLS` (comma-separated,
 //! default [`jobs::DEFAULT_TOOLS`]), `AC_JOB_UNSAFE=1` (`--dangerously-skip-permissions` instead).
+//! Admission (ADR-012): `AC_SHM_MARGIN_MIB` (MiB of `/dev/shm` kept free, default 512),
+//! `AC_VM_MEMORY_MIB` (guest size, instead of `default_memory` in `AC_KATA_CONFIG`, default
+//! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
+//! this big; logged as a warning at startup).
 //!
 //! It refuses to start without a token, or with a tokens file that is unreadable, too open, owned
 //! by someone else or malformed. A bad later version is logged and the previous tokens stay.
@@ -33,7 +37,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ac_ctr::capacity::{CapacityConfig, GuestSource, HostCapacity};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
+use ac_domain::GuestMemory;
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
@@ -98,6 +104,42 @@ impl rusty_serve::SharedHandler for Shared {
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+/// An optional MiB figure from the environment.
+fn env_mib(key: &str) -> Result<Option<u64>, String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.parse::<u64>().map_err(|e| format!("{key}={v}: {e}")))
+        .transpose()
+}
+
+/// `/dev/shm` and the guest size, read from this host; says where the guest size came from.
+fn host_capacity(cfg: &CtrConfig) -> Result<HostCapacity<LinuxSpawner>, String> {
+    let capacity = CapacityConfig {
+        shm: "/dev/shm".into(),
+        kata_config: env("AC_KATA_CONFIG", "/etc/kata-containers/configuration.toml").into(),
+        guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
+        shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
+    };
+    if let Some(l) = capacity.shm_limit_mib {
+        eprintln!(
+            "ac-gateway: WARNING: AC_SHM_LIMIT_MIB={l} is set (testing only): admission treats \
+             /dev/shm as {l} MiB, not its real size"
+        );
+    }
+    let path = capacity.kata_config.display().to_string();
+    let host = HostCapacity::new(CtrRuntime::new(LinuxSpawner, cfg.clone()), capacity);
+    let (mib, source) = host.guest().map_err(|e| e.to_string())?;
+    let source = match source {
+        GuestSource::Override => "AC_VM_MEMORY_MIB".to_owned(),
+        GuestSource::Kata(GuestMemory::Configured(_)) => format!("default_memory in {path}"),
+        GuestSource::Kata(GuestMemory::KataDefault) => {
+            format!("Kata's default: {path} does not set default_memory")
+        }
+    };
+    eprintln!("ac-gateway: admission: guests count {mib} MiB each ({source})");
+    Ok(host)
 }
 
 fn read_token(path: &str) -> Result<String, String> {
@@ -235,9 +277,11 @@ fn run() -> Result<(), String> {
         std::env::var("AC_JOB_ALLOWED_TOOLS").ok().as_deref(),
         env("AC_JOB_UNSAFE", "") == "1",
     )?;
+    let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
-    let fleet = Fleet::new(runtime, Arc::clone(&store));
+    let fleet = Fleet::new(runtime, Arc::clone(&store))
+        .with_admission(Box::new(host_capacity(&cfg)?), margin);
     match fleet.reconcile() {
         Ok(changed) => {
             for id in changed {
@@ -245,6 +289,20 @@ fn run() -> Result<(), String> {
             }
         }
         Err(e) => eprintln!("ac-gateway: reconcile: {e}"),
+    }
+    match fleet.capacity() {
+        Ok(Some(r)) => eprintln!(
+            "ac-gateway: admission: /dev/shm {} MiB ({} free), {} agent(s) running commit {} MiB, \
+             margin {} MiB, {} more fit",
+            r.shm_total_mib,
+            r.shm_free_mib,
+            r.running_agents,
+            r.committed_mib,
+            r.margin_mib,
+            r.max_more_agents
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("ac-gateway: admission: {e}"),
     }
     let hub = Hub::new(
         CtrRuntime::new(LinuxSpawner, cfg.clone()),

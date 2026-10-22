@@ -5,6 +5,7 @@
 //! network after the task starts) gives the guest nothing. Instead the adapter creates a network
 //! namespace, attaches it with the CNI bridge plugin, then starts the container in it.
 
+pub mod capacity;
 pub mod exec;
 
 use std::collections::BTreeMap;

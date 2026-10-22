@@ -38,6 +38,23 @@ pub trait Runtime {
     fn running(&self) -> Result<Vec<AgentId>, PortError>;
 }
 
+/// `/dev/shm`, where every guest's RAM lives (Kata's `memory-backend-file`), in MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shm {
+    /// Size of the filesystem.
+    pub total_mib: u64,
+    /// Free now.
+    pub free_mib: u64,
+}
+
+/// What admission control reads from the host.
+pub trait Capacity {
+    /// `/dev/shm` now.
+    fn shm(&self) -> Result<Shm, PortError>;
+    /// The memory each guest is configured with, in MiB.
+    fn guest_mib(&self) -> Result<u64, PortError>;
+}
+
 /// Durable record of agents and their lifecycle state.
 pub trait SessionStore {
     /// Current state, or `None` if the agent is unknown.

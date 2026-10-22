@@ -60,6 +60,7 @@ const A: &str = "/api/v1/agents/{id}";
 pub const ROUTES: &[Rule] = &[
     rule("GET", "/api/v1/whoami", Need::Token, None),
     rule("GET", "/api/v1/agents", S(AgentsRead), None),
+    rule("GET", "/api/v1/capacity", S(AgentsRead), None),
     rule("GET", A, S(AgentsRead), None),
     rule("POST", A, S(AgentsWrite), Some("create")),
     rule("DELETE", A, S(AgentsWrite), Some("destroy")),
@@ -276,6 +277,7 @@ mod tests {
         for (method, path, want) in [
             ("GET", "/api/v1/whoami", Need::Token),
             ("GET", "/api/v1/agents", S(AgentsRead)),
+            ("GET", "/api/v1/capacity", S(AgentsRead)),
             ("GET", "/api/v1/agents/a1", S(AgentsRead)),
             ("POST", "/api/v1/agents/a1", S(AgentsWrite)),
             ("DELETE", "/api/v1/agents/a1", S(AgentsWrite)),
@@ -300,7 +302,7 @@ mod tests {
         }
         assert_eq!(
             ROUTES.len(),
-            21,
+            22,
             "a new route needs a row above and in ADR-011"
         );
     }

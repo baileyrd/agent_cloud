@@ -17,6 +17,7 @@ pub mod bind;
 pub mod jobs;
 pub mod tokens;
 pub mod viewer;
+pub mod watchdog;
 pub mod web;
 
 use std::collections::HashSet;

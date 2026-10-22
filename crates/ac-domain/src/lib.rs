@@ -2,6 +2,7 @@
 
 pub mod allowlist;
 pub mod capacity;
+pub mod health;
 pub mod id;
 pub mod job;
 pub mod lifecycle;

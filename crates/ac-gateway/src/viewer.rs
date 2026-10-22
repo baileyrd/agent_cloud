@@ -163,8 +163,6 @@ pub trait Terminal: Send + Sync + 'static {
     fn capture(&self, id: &AgentId, target: Target) -> Result<Vec<String>, String>;
     /// Detach one tmux client by name.
     fn detach(&self, id: &AgentId, client: &str) -> Result<(), String>;
-    /// Whether the agent answers a trivial exec within 2 s.
-    fn probe(&self, id: &AgentId) -> bool;
     /// SIGKILL host exec clients of the agent: ours only, or all.
     fn kill_clients(&self, id: &AgentId, ours_only: bool) -> Result<(), String>;
 }
@@ -243,10 +241,6 @@ impl<S: Spawner + Send + Sync + 'static> Terminal for CtrRuntime<S> {
         self.exec_once("detach", id, &args, Duration::from_secs(10))
             .map(drop)
             .map_err(|e| e.to_string())
-    }
-
-    fn probe(&self, id: &AgentId) -> bool {
-        CtrRuntime::probe(self, id)
     }
 
     fn kill_clients(&self, id: &AgentId, ours_only: bool) -> Result<(), String> {

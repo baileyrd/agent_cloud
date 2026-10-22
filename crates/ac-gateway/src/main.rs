@@ -8,9 +8,16 @@
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
 //! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_PROBE_INTERVAL`
-//! (seconds between watchdog probes, default 30; 0 turns the watchdog off). Jobs (ADR-010):
+//! (seconds between watchdog probes, default 30; 0 turns the watchdog off). Watchdog thresholds
+//! (ADR-012; defaults in [`Thresholds`]): `AC_PROBE_BUDGET` (seconds one probe may take, 10),
+//! `AC_PROBE_FAILURES` (consecutive failures before acting, 3), `AC_PROBE_WINDOW` (seconds they must
+//! span, 90), `AC_BUSY_LOAD_PER_CORE` (1.0), `AC_BUSY_IO_SOME` (20), `AC_BUSY_CPU_SOME` (50). Jobs (ADR-010):
 //! `AC_JOB_PERMISSION_MODE` (default `acceptEdits`), `AC_JOB_ALLOWED_TOOLS` (comma-separated,
 //! default [`jobs::DEFAULT_TOOLS`]), `AC_JOB_UNSAFE=1` (`--dangerously-skip-permissions` instead).
+//! Admission (ADR-012): `AC_SHM_MARGIN_MIB` (MiB of `/dev/shm` kept free, default 512),
+//! `AC_VM_MEMORY_MIB` (guest size, instead of `default_memory` in `AC_KATA_CONFIG`, default
+//! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
+//! this big; logged as a warning at startup).
 //!
 //! It refuses to start without a token, or with a tokens file that is unreadable, too open, owned
 //! by someone else or malformed. A bad later version is logged and the previous tokens stay.
@@ -22,10 +29,10 @@
 //! which ticks every second. It then SIGKILLs `ctr` clients an earlier gateway left
 //! and detaches their tmux control clients in every running agent.
 //!
-//! The watchdog probes each running agent with a 2 s exec. If one does not answer (a wedged
-//! Kata shim, ADR-006), it SIGKILLs the gateway's own `ctr` clients for that agent, then every
-//! `ctr` exec client of it, probing after each. If the agent still does not answer it is
-//! reported as `"health":"unhealthy"`; its VM is left running.
+//! The watchdog ([`ac_gateway::watchdog`]) probes each running agent. It acts only on sustained
+//! failures while the host is not busy, then kills the gateway's own exec clients, then stale
+//! foreign ones, then reports the agent `"health":"unhealthy"` (its VM left running), re-probing
+//! after each step.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -33,11 +40,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ac_ctr::capacity::{CapacityConfig, GuestSource, HostCapacity};
+use ac_ctr::host::{Monotonic, ProcPressure};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
+use ac_domain::health::Thresholds;
+use ac_domain::GuestMemory;
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
-use ac_gateway::viewer::{Hub, Terminal};
+use ac_gateway::viewer::Hub;
+use ac_gateway::watchdog::Watchdog;
 use ac_gateway::web::App;
 use ac_gateway::{bind, Api, Unhealthy};
 use ac_store::EngineStore;
@@ -49,42 +61,31 @@ const TOKENS: &str = "/etc/agent-cloud/tokens";
 
 type Gateway = App<CtrRuntime<LinuxSpawner>, Arc<EngineStore>>;
 
-/// Probe every running agent each `interval`; see the module docs.
-fn watchdog(app: &Gateway, hub: &Hub, unhealthy: &Unhealthy, interval: Duration) {
-    let term = hub.terminal();
-    loop {
-        std::thread::sleep(interval);
-        let running = app.api().lock().map(|a| a.running()).unwrap_or_default();
-        for id in running {
-            let healthy = term.probe(&id) || recover(term, &id);
-            let mut set = unhealthy.lock().unwrap_or_else(|e| e.into_inner());
-            if healthy {
-                set.remove(id.as_str());
-            } else if set.insert(id.to_string()) {
-                eprintln!(
-                    "ac-gateway: watchdog: {id} still does not answer after killing every ctr exec \
-                     client; marked unhealthy, VM left running"
-                );
-            }
+/// The watchdog's thresholds: [`Thresholds::default`], each overridable from the environment.
+fn thresholds() -> Result<Thresholds, String> {
+    let d = Thresholds::default();
+    let num = |key: &str, default: f64| -> Result<f64, String> {
+        match std::env::var(key) {
+            Ok(v) => v
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .ok_or_else(|| format!("{key}={v}: want a number >= 0")),
+            Err(_) => Ok(default),
         }
-    }
-}
-
-fn recover(term: &dyn Terminal, id: &ac_domain::AgentId) -> bool {
-    for (ours_only, which) in [
-        (true, "the gateway's own ctr clients"),
-        (false, "every ctr exec client"),
-    ] {
-        eprintln!("ac-gateway: watchdog: {id} did not answer a 2 s probe; SIGKILL {which} for it");
-        if let Err(e) = term.kill_clients(id, ours_only) {
-            eprintln!("ac-gateway: watchdog: {id}: {e}");
-        }
-        if term.probe(id) {
-            eprintln!("ac-gateway: watchdog: {id} answers again");
-            return true;
-        }
-    }
-    false
+    };
+    let secs = |key: &str, default: Duration| -> Result<Duration, String> {
+        Ok(Duration::from_secs_f64(num(key, default.as_secs_f64())?))
+    };
+    let failures = num("AC_PROBE_FAILURES", f64::from(d.failures))?;
+    Ok(Thresholds {
+        probe_budget: secs("AC_PROBE_BUDGET", d.probe_budget)?.max(Duration::from_secs(1)),
+        failures: (failures as u32).max(1),
+        window: secs("AC_PROBE_WINDOW", d.window)?,
+        load_per_core: num("AC_BUSY_LOAD_PER_CORE", d.load_per_core)?,
+        io_some: num("AC_BUSY_IO_SOME", d.io_some)?,
+        cpu_some: num("AC_BUSY_CPU_SOME", d.cpu_some)?,
+    })
 }
 
 /// The app behind an `Arc`, shared with the watchdog.
@@ -98,6 +99,42 @@ impl rusty_serve::SharedHandler for Shared {
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+/// An optional MiB figure from the environment.
+fn env_mib(key: &str) -> Result<Option<u64>, String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.parse::<u64>().map_err(|e| format!("{key}={v}: {e}")))
+        .transpose()
+}
+
+/// `/dev/shm` and the guest size, read from this host; says where the guest size came from.
+fn host_capacity() -> Result<HostCapacity, String> {
+    let capacity = CapacityConfig {
+        shm: "/dev/shm".into(),
+        kata_config: env("AC_KATA_CONFIG", "/etc/kata-containers/configuration.toml").into(),
+        guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
+        shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
+    };
+    if let Some(l) = capacity.shm_limit_mib {
+        eprintln!(
+            "ac-gateway: WARNING: AC_SHM_LIMIT_MIB={l} is set (testing only): admission treats \
+             /dev/shm as {l} MiB, not its real size"
+        );
+    }
+    let path = capacity.kata_config.display().to_string();
+    let host = HostCapacity::new(capacity);
+    let (mib, source) = host.guest().map_err(|e| e.to_string())?;
+    let source = match source {
+        GuestSource::Override => "AC_VM_MEMORY_MIB".to_owned(),
+        GuestSource::Kata(GuestMemory::Configured(_)) => format!("default_memory in {path}"),
+        GuestSource::Kata(GuestMemory::KataDefault) => {
+            format!("Kata's default: {path} does not set default_memory")
+        }
+    };
+    eprintln!("ac-gateway: admission: guests count {mib} MiB each ({source})");
+    Ok(host)
 }
 
 fn read_token(path: &str) -> Result<String, String> {
@@ -235,9 +272,11 @@ fn run() -> Result<(), String> {
         std::env::var("AC_JOB_ALLOWED_TOOLS").ok().as_deref(),
         env("AC_JOB_UNSAFE", "") == "1",
     )?;
+    let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
-    let fleet = Fleet::new(runtime, Arc::clone(&store));
+    let fleet =
+        Fleet::new(runtime, Arc::clone(&store)).with_admission(Box::new(host_capacity()?), margin);
     match fleet.reconcile() {
         Ok(changed) => {
             for id in changed {
@@ -245,6 +284,20 @@ fn run() -> Result<(), String> {
             }
         }
         Err(e) => eprintln!("ac-gateway: reconcile: {e}"),
+    }
+    match fleet.capacity() {
+        Ok(Some(r)) => eprintln!(
+            "ac-gateway: admission: /dev/shm {} MiB ({} free), {} agent(s) running commit {} MiB, \
+             margin {} MiB, {} more fit",
+            r.shm_total_mib,
+            r.shm_free_mib,
+            r.running_agents,
+            r.committed_mib,
+            r.margin_mib,
+            r.max_more_agents
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("ac-gateway: admission: {e}"),
     }
     let hub = Hub::new(
         CtrRuntime::new(LinuxSpawner, cfg.clone()),
@@ -255,7 +308,7 @@ fn run() -> Result<(), String> {
         Jobs::new(
             store.clone(),
             store,
-            CtrRuntime::new(LinuxSpawner, cfg),
+            CtrRuntime::new(LinuxSpawner, cfg.clone()),
             data.join("jobs"),
             claude,
         )
@@ -284,7 +337,31 @@ fn run() -> Result<(), String> {
     if interval > 0 {
         let app = Arc::clone(&app);
         let every = Duration::from_secs(interval);
-        std::thread::spawn(move || watchdog(&app, &hub, &unhealthy, every));
+        let t = thresholds()?;
+        eprintln!(
+            "ac-gateway: watchdog: every {interval}s; acts after {} failed probes over {}s (budget \
+             {}s each) while load <= {} x cores, io PSI some <= {}, cpu PSI some <= {}",
+            t.failures,
+            t.window.as_secs(),
+            t.probe_budget.as_secs(),
+            t.load_per_core,
+            t.io_some,
+            t.cpu_some
+        );
+        let notes = hub.clone();
+        let mut dog = Watchdog::new(
+            CtrRuntime::new(LinuxSpawner, cfg),
+            ProcPressure,
+            Monotonic::new(),
+            t,
+            unhealthy,
+            Box::new(move |id, line| notes.note(id, line)),
+        );
+        std::thread::spawn(move || loop {
+            std::thread::sleep(every);
+            let running = app.api().lock().map(|a| a.running()).unwrap_or_default();
+            dog.check(&running);
+        });
     }
     let server = Server::bind_shared(addr, Shared(app)).map_err(|e| format!("bind {addr}: {e}"))?;
     eprintln!("ac-gateway listening on {addr}");

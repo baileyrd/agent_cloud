@@ -68,9 +68,9 @@ process owns the registry lock); bearer-token auth and the private-bind check ar
   default `KillMode=control-group` sends SIGTERM to the gateway and its `ctr` children together,
   and `ctr` forwards it, so a restart is clean. At startup the gateway SIGKILLs leftover `ctr`
   clients and detaches stale control clients. A watchdog probes running agents every 30 s
-  (`AC_PROBE_INTERVAL`) with a 2 s exec; on failure it SIGKILLs our `ctr` clients, then every
-  `ctr` exec client of that agent, and if it still fails marks it `"health":"unhealthy"` without
-  touching the VM.
+  (`AC_PROBE_INTERVAL`) and acts only on sustained failures on a host that is not busy, through a
+  logged ladder (ADR-012; the first version used a 2 s probe and killed every client on one
+  failure, which mistook slow agents for wedged ones under load).
 - *Transport:* rusty_serve has no WebSocket upgrade, so a `fetch()`-streamed chunked GET carries
   NDJSON (a full snapshot with scrollback on connect, then changed lines and the cursor), and
   POSTs carry input, resize and take-over. `fetch` sends `Authorization`, so no ticket is
@@ -293,6 +293,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   |---|---|
   | `GET /api/v1/whoami` (name, scopes, agents; no secrets) | any valid token |
   | `GET /api/v1/agents` (lists only the token's agents) | `agents:read` |
+  | `GET /api/v1/capacity` (admission figures, ADR-012; counts only, no ids) | `agents:read` |
   | `GET /api/v1/agents/{id}` | `agents:read` |
   | `POST /api/v1/agents/{id}` (create) | `agents:write` |
   | `POST /api/v1/agents/{id}/pause`, `.../resume` | `agents:write` |
@@ -323,3 +324,79 @@ those VMs) but cannot pause, destroy, watch or type into them, nor see other age
 powerful as the old token. Tokens do not expire; revoke them. There is still no TLS of the gateway's own.
 **Not now:** expiry and per-token rate limits; per-address failure limits (needs the peer address from
 rusty_serve); scopes narrower than these seven.
+
+## ADR-012: Admission against /dev/shm; a watchdog that tells slow from wedged
+**Status:** accepted (2026-10-22).
+**Context:** The capacity benchmark (sizing.md) found two failures that were not the agents' fault.
+- *Memory.* Kata starts QEMU with `memory-backend-file,mem-path=/dev/shm,share=on` (verified on a running
+  agent: fd `/dev/shm/qemu_back_mem.dimm1.* (deleted)`, a shared 4 GiB mapping). Guest RAM is a file in
+  `/dev/shm`, half of RAM by default, and touched guest pages are never given back. At N=6 `/dev/shm` filled and
+  four VMs died with `kvm run failed Bad address` while 9.6 GiB of RAM was still free.
+- *Watchdog.* Under load the first watchdog's 2 s probe failed for slow agents. On one failure it SIGKILLed
+  every exec client of the agent, a running job's included, and marked it unhealthy.
+
+**Decision, admission.** A create or resume is admitted only if both hold:
+- *Size:* (configured memory of every agent `Running` or `Creating`) + (the new guest's) + margin ≤ `/dev/shm`
+  size.
+- *Free space:* (the new guest's configured memory) + margin ≤ `/dev/shm` free now.
+
+How it works:
+- *Configured, not measured, memory.* Pages a guest touched never come back, so a long-running agent reaches
+  its full size. Paused and destroyed agents do not count.
+- *Code.* The rule is `ac_domain::capacity::admit`, pure, with saturating arithmetic. The host is read through
+  `ac_ports::Capacity`: statfs(2) of `/dev/shm` (first-party `rusty_libc`, no dependencies of its own), and `default_memory` from the
+  first `[hypervisor.*]` table of `/etc/kata-containers/configuration.toml`. If that table does not set it,
+  Kata's own default of 2048 MiB is used and the startup log says so.
+- *Atomic.* `ac_fleet::Fleet` checks before any side effect. The gateway serves every lifecycle call under one
+  lock, so a check and its create cannot interleave with another's (tested).
+- *Refusal.* **507** with `{"error","rule":"total"|"free","needed_mib","available_mib","more_agents"}`. `ac-ctl`
+  prints the same message. The owner token gets no exception.
+- *Visibility.* `GET /api/v1/capacity` (`agents:read`) returns `shm_total_mib`, `shm_free_mib`, `guest_mib`,
+  `running_agents`, `committed_mib`, `margin_mib` and `max_more_agents`: counts only, never ids. Both
+  `scripts/capacity.sh` and `scripts/post-reboot-check.sh` print it. The check script fails when committed
+  exceeds the size.
+- *Settings.* `AC_SHM_MARGIN_MIB` (default 512) and `AC_VM_MEMORY_MIB` (overrides the configured size).
+  `AC_SHM_LIMIT_MIB` is for testing only: admission treats `/dev/shm` as that big, and the gateway logs a
+  WARNING at startup.
+- *Host.* `/dev/shm` is sized MemTotal − 8 GiB through `/etc/fstab` (`deploy/dev-shm.fstab`, install.md note 9).
+
+**Decision, watchdog.** What tells slow and wedged apart:
+- *A wedged shim* (stdin EOF reached a live exec, ADR-006) never answers again however idle the host is.
+  Probes fail fast (measured: 2.0 s, `context deadline exceeded`), `ctr task ls` drops the agent, and only
+  SIGKILL of the offending `ctr` client frees it.
+- *A slow agent* answers within a generous budget, or fails only while the host is busy (measured: 4.8–8.6 s
+  answers with 3 agents under load, load 5.6, io PSI some 28).
+
+The watchdog therefore works as follows (`ac_domain::health`, pure; driver in `ac_gateway::watchdog`, with the
+probe, process list, kill, pressure and clock as ports faked in tests):
+- *Healthy.* A probe answering within `AC_PROBE_BUDGET` (10 s) is healthy, and a slow answer is logged with the
+  pressure.
+- *Busy host.* A failure while the host is busy is logged "slow, host busy, not acting" and restarts the
+  streak. Busy means 1-minute load > `AC_BUSY_LOAD_PER_CORE` (1.0) × cores, or `/proc/pressure/io` some avg10
+  > `AC_BUSY_IO_SOME` (20), or cpu some avg10 > `AC_BUSY_CPU_SOME` (50).
+- *Escalation.* It acts only after `AC_PROBE_FAILURES` (3) consecutive failures spanning `AC_PROBE_WINDOW`
+  (90 s) on an idle host. Then, re-probing after each rung and stopping as soon as the agent answers:
+  1. SIGKILL the gateway's own exec clients of the agent. "Own" means an exec-id prefix in
+     `ac_domain::health::OWN_EXEC_PREFIXES` (`acprobe` probes, `acview` viewer bridge, `acexec` one-shots); that
+     list is the one definition.
+  2. SIGKILL foreign clients of the agent that were already running when it stopped answering; a younger one
+     cannot be the cause and is left. Every kill and every client left alone gets its own line: pid, exec-id,
+     age, command line, why.
+  3. Mark it unhealthy: shown as `"health":"unhealthy"` in its status, cleared by the next answer or when it
+     stops running. It never blocks a lifecycle call and does not re-run the ladder while marked.
+- *Logging.* Every line goes to the journal and to the agent's history. Live result: a deliberate wedge
+  (`printf x | ctr task exec ... cat`) was found 115 s after it started, rung 1 left the foreign client, and
+  rung 2 killed it. The agent answered again 117.5 s after the wedge.
+
+**Consequences:**
+- Fewer guests run than RAM alone would allow: 3 × 4096 MiB here, or 7 at 2048. That is the honest number,
+  because the alternative is VMs dying.
+- A wedge is recovered in about 2 minutes instead of 30 s. A wedge during sustained load waits until the load
+  drops.
+- An operator's own `ctr task exec` on an agent that has been failing for 90 s may be killed at rung 2, with a
+  log line naming it.
+
+**Not now:**
+- Giving guest memory back (free page reporting, virtio-mem).
+- Per-agent memory sizes; admission assumes every guest has the current `default_memory`.
+- A probe that bypasses `ctr`.

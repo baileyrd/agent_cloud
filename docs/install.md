@@ -142,7 +142,8 @@ user, backups.
 2. Confirm the workspace survives `DELETE /api/v1/agents/{id}` and is removed by `DELETE ...?purge=true`
    (checked on BaileyServ 2026-10-19: destroy, re-create, file still there; purge, directory gone).
 3. Confirm a second agent cannot see the first one's files.
-4. Spawn five agents; record RAM and CPU to calibrate [sizing.md](sizing.md).
+4. Measure capacity: `sudo scripts/capacity-bench.sh --estimate`, then without `--estimate` (about 25 min,
+   guarded by abort thresholds; it creates and purges `bench-*` agents only). Results: [sizing.md](sizing.md).
 
 ## Rough effort
 
@@ -192,6 +193,25 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    exec runs). The gateway's `exec_once` holds a pipe open the same way, and `scripts/post-reboot-check.sh` uses
    the FIFO. To run a script, copy it into the workspace and run it there. (Measured 2026-10-20: `printf x |
    ctr task exec ... cat` wedged; this caused an earlier a1 freeze the same day.)
+9. **Size `/dev/shm` for the guests.** Kata keeps each guest's RAM in a file under `/dev/shm`
+   (`memory-backend-file,mem-path=/dev/shm`). The default size is half of RAM; when it fills, guests die with
+   `kvm run failed Bad address` while RAM is still free (measured, [sizing.md](sizing.md)). Make it MemTotal
+   minus an 8 GiB host reserve, in [`deploy/dev-shm.fstab`](../deploy/dev-shm.fstab). Recompute `size=` for
+   another host with `awk '/MemTotal/ {printf "%dM\n", $2/1024 - 8192}' /proc/meminfo`, then:
+   ```
+   findmnt /dev/shm                                         # note its options; keep them in the line
+   findmnt --verify --tab-file deploy/dev-shm.fstab         # the line parses
+   sudo cp -a /etc/fstab /etc/fstab.ac-bak
+   grep -v '^#' deploy/dev-shm.fstab | sudo tee -a /etc/fstab >/dev/null
+   sudo findmnt --verify                                    # the whole fstab still parses
+   sudo mount -o remount,size=15717M /dev/shm               # live; at boot systemd-remount-fs applies fstab
+   findmnt /dev/shm; df -h /dev/shm
+   ```
+   Running guests are unaffected by a remount that grows it. The gateway's admission control (ADR-012) reads the
+   new size at once. To undo: `sudo cp -a /etc/fstab.ac-bak /etc/fstab` (or delete the `/dev/shm` line) and
+   `sudo mount -o remount,size=50% /dev/shm`. `systemd-fstab-generator` makes no unit for `/dev/shm` (it leaves
+   kernel API filesystems to `systemd-remount-fs.service`), so there is no `dev-shm.mount` to check; only a
+   reboot exercises the boot path.
 
 ## Host services
 
@@ -314,9 +334,15 @@ How to use it:
 4. What was shown while someone watched, with take-over and audit events: `GET /api/v1/agents/<id>/history?limit=N`
    (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
 
-The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off);
-a wedged one is logged (`journalctl -u ac-gateway | grep watchdog`) and freed by killing `ctr` clients, or
-reported as `"health":"unhealthy"` if that fails. Recordings live under `/var/lib/agent-cloud/history/` (0700).
+The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off).
+A probe answering within 10 s is healthy. Failures while the host is busy are logged "slow, host busy, not acting".
+Only 3 failures over 90 s on an idle host make it act. It first kills the gateway's own `ctr` clients for that
+agent, then foreign ones older than the failures, each with a log line. If neither frees the agent, it reports it
+as `"health":"unhealthy"` until the agent answers again (ADR-012). Every line is in the journal
+(`journalctl -u ac-gateway | grep watchdog`) and in the agent's history. The thresholds are `AC_PROBE_BUDGET`,
+`AC_PROBE_FAILURES`, `AC_PROBE_WINDOW`, `AC_BUSY_LOAD_PER_CORE`, `AC_BUSY_IO_SOME` and `AC_BUSY_CPU_SOME`. A
+create or resume that would not fit `/dev/shm` is refused with 507 (`GET /api/v1/capacity` shows the figures;
+`AC_SHM_MARGIN_MIB`, default 512). `AC_SHM_LIMIT_MIB` is for testing only and is logged as a warning. Recordings live under `/var/lib/agent-cloud/history/` (0700).
 
 The gateway locks the data directory (`/var/lib/agent-cloud`) while it runs. `ac-ctl` against the same directory
 then exits with code 3 and says so (`/var/lib/agent-cloud is in use by another process, normally ac-gateway ...:

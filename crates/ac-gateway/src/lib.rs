@@ -7,23 +7,30 @@
 //! workspace; `DELETE ...?purge=true` removes it, also for an agent already destroyed). Pause and destroy of
 //! an agent with a queued or running job are refused (409) unless `?force=true`, which interrupts the job
 //! first (ADR-010).
+//!
+//! Admission (ADR-012): a create or resume whose guest would not fit `/dev/shm` is refused with
+//! 507 and `{"error","rule","needed_mib","available_mib","more_agents"}`; `GET /api/v1/capacity`
+//! reports the figures.
 
 pub mod access;
 pub mod bind;
 pub mod jobs;
 pub mod tokens;
 pub mod viewer;
+pub mod watchdog;
 pub mod web;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use ac_domain::{AgentId, State};
+use ac_domain::{AgentId, Shortfall, State};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::{Runtime, SessionStore};
 use tokens::Agents;
 
 const PREFIX: &str = "/api/v1/agents/";
+/// What admission control sees.
+pub const CAPACITY: &str = "/api/v1/capacity";
 
 /// A rendered response: status code and JSON body.
 #[derive(Debug, PartialEq, Eq)]
@@ -111,6 +118,12 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
     /// `DELETE` are read.
     pub fn handle(&self, method: &str, target: &str, agents: &Agents) -> Reply {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if path == CAPACITY {
+            return match method {
+                "GET" => self.capacity(),
+                _ => error(405, "method not allowed"),
+            };
+        }
         if path == PREFIX.trim_end_matches('/') {
             return match method {
                 "GET" => self.list(agents),
@@ -149,6 +162,26 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             },
             (_, None | Some("pause" | "resume")) => error(405, "method not allowed"),
             _ => error(404, "not found"),
+        }
+    }
+
+    fn capacity(&self) -> Reply {
+        match self.fleet.capacity() {
+            Ok(Some(r)) => Reply {
+                status: 200,
+                body: format!(
+                    r#"{{"shm_total_mib":{},"shm_free_mib":{},"guest_mib":{},"running_agents":{},"committed_mib":{},"margin_mib":{},"max_more_agents":{}}}"#,
+                    r.shm_total_mib,
+                    r.shm_free_mib,
+                    r.guest_mib,
+                    r.running_agents,
+                    r.committed_mib,
+                    r.margin_mib,
+                    r.max_more_agents
+                ),
+            },
+            Ok(None) => error(404, "admission control is off"),
+            Err(e) => map_error(&e),
         }
     }
 
@@ -240,9 +273,28 @@ fn map_error(e: &FleetError) -> Reply {
     let status = match e {
         FleetError::NotFound(_) => 404,
         FleetError::AlreadyExists(_) | FleetError::Illegal(_) => 409,
+        FleetError::NoCapacity(s) => return no_capacity(s),
         FleetError::Port(_) => 500,
     };
     error(status, &e.to_string())
+}
+
+/// 507: the guest does not fit `/dev/shm`. The body carries the figures besides the message.
+fn no_capacity(s: &Shortfall) -> Reply {
+    let rule = match s.rule {
+        ac_domain::capacity::Rule::Total => "total",
+        ac_domain::capacity::Rule::Free => "free",
+    };
+    Reply {
+        status: 507,
+        body: format!(
+            r#"{{"error":"{}","rule":"{rule}","needed_mib":{},"available_mib":{},"more_agents":{}}}"#,
+            escape(&s.to_string()),
+            s.needed_mib,
+            s.available_mib,
+            s.more
+        ),
+    }
 }
 
 /// A JSON error reply.
@@ -484,6 +536,110 @@ mod tests {
         assert_eq!(call(&a, "PUT", "/api/v1/agents/a1").0, 405);
         assert_eq!(call(&a, "POST", "/api/v1/agents/a1/explode").0, 404);
         assert_eq!(call(&a, "GET", "/other").0, 404);
+    }
+
+    /// `/dev/shm` of 9000 MiB, all free; guests of 4096 MiB.
+    struct Shm9000;
+    impl ac_ports::Capacity for Shm9000 {
+        fn shm(&self) -> Result<ac_ports::Shm, PortError> {
+            Ok(ac_ports::Shm {
+                total_mib: 9000,
+                free_mib: 9000,
+            })
+        }
+        fn guest_mib(&self) -> Result<u64, PortError> {
+            Ok(4096)
+        }
+    }
+
+    #[test]
+    fn third_agent_is_refused_with_507_and_a_paused_one_does_not_count() {
+        let fleet =
+            Fleet::new(Rt { fail: false }, Store::default()).with_admission(Box::new(Shm9000), 512);
+        let a = Api::new(fleet);
+        assert_eq!(
+            call(&a, "GET", CAPACITY).1,
+            r#"{"shm_total_mib":9000,"shm_free_mib":9000,"guest_mib":4096,"running_agents":0,"committed_mib":0,"margin_mib":512,"max_more_agents":2}"#
+        );
+        assert_eq!(call(&a, "POST", "/api/v1/agents/adm-1").0, 201);
+        assert_eq!(call(&a, "POST", "/api/v1/agents/adm-2").0, 201);
+        let (status, body) = call(&a, "POST", "/api/v1/agents/adm-3");
+        assert_eq!(status, 507);
+        assert!(
+            body.ends_with(
+                r#","rule":"total","needed_mib":12800,"available_mib":9000,"more_agents":0}"#
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("needs 12800 MiB, /dev/shm size is 9000 MiB; 0 more"),
+            "{body}"
+        );
+        assert_eq!(call(&a, "GET", "/api/v1/agents/adm-3").0, 404);
+        assert!(call(&a, "GET", CAPACITY)
+            .1
+            .contains(r#""running_agents":2,"committed_mib":8192"#));
+        assert_eq!(call(&a, "POST", "/api/v1/agents/adm-1/pause").0, 200);
+        assert_eq!(call(&a, "POST", "/api/v1/agents/adm-3").0, 201);
+        assert_eq!(call(&a, "POST", "/api/v1/agents/adm-1/resume").0, 507);
+        assert_eq!(call(&a, "POST", CAPACITY).0, 405);
+        assert_eq!(call(&api(false), "GET", CAPACITY).0, 404);
+    }
+
+    /// A runtime whose create takes a while, so two creates overlap unless serialized.
+    struct Slow(Mutex<Vec<String>>);
+    impl Runtime for Slow {
+        fn create(&self, id: &AgentId) -> Result<(), PortError> {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.0
+                .lock()
+                .map(|mut v| v.push(id.to_string()))
+                .map_err(|_| PortError {
+                    op: "create",
+                    cause: "poisoned".into(),
+                })
+        }
+        fn pause(&self, _: &AgentId) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn resume(&self, _: &AgentId) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn running(&self) -> Result<Vec<AgentId>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The gateway serves every lifecycle call under one lock (`App`'s `Mutex<Api>`), so of two
+    /// creates racing for the last slot exactly one is admitted.
+    #[test]
+    fn two_concurrent_creates_cannot_both_pass() {
+        let fleet = Fleet::new(Slow(Mutex::new(Vec::new())), Store::default())
+            .with_admission(Box::new(Shm9000), 512);
+        let a = Arc::new(Mutex::new(Api::new(fleet)));
+        let _ = a
+            .lock()
+            .map(|a| a.handle("POST", "/api/v1/agents/adm-1", &Agents::All));
+        let racers: Vec<_> = ["adm-2", "adm-3"]
+            .into_iter()
+            .map(|id| {
+                let a = Arc::clone(&a);
+                std::thread::spawn(move || {
+                    a.lock()
+                        .map(|a| {
+                            a.handle("POST", &format!("/api/v1/agents/{id}"), &Agents::All)
+                                .status
+                        })
+                        .unwrap_or(0)
+                })
+            })
+            .collect();
+        let mut got: Vec<u16> = racers.into_iter().map(|t| t.join().unwrap_or(0)).collect();
+        got.sort_unstable();
+        assert_eq!(got, [201, 507]);
     }
 
     #[test]

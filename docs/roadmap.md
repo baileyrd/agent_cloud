@@ -43,7 +43,16 @@
   (`DISABLE_AUTOUPDATER=1`) (verified on BaileyServ 2026-10-22)
 - [ ] Per-agent CPU, memory and disk limits
 - [ ] Backups with a tested restore
-- [ ] Five-agent load test; update [sizing.md](sizing.md) with real numbers
+- [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
+  (BaileyServ, 2026-10-22)
+- [x] The watchdog tells slow from wedged: it acts only on sustained failures on an idle host, through a logged
+  ladder (ADR-012; verified 2026-10-22)
+- [x] Admission control: no create or resume beyond what `/dev/shm` holds; `/dev/shm` sized MemTotal − 8 GiB
+  (ADR-012; verified 2026-10-22)
+- [ ] Guests never return memory: try free page reporting or virtio-mem
+- [ ] Decide `default_memory` (4096 today; 2048 measured enough for Claude Code) after a real-build measurement
+- [ ] Measure on an SSD (every figure in sizing.md is from one rotational disk)
+- [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s)
 
 ## Later
 - Local model option for an offline posture

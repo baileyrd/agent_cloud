@@ -323,9 +323,6 @@ impl Terminal for Fake {
         w.outputs.retain(|tx| tx.send(b"%exit\n".to_vec()).is_ok());
         Ok(())
     }
-    fn probe(&self, _: &AgentId) -> bool {
-        true
-    }
     fn kill_clients(&self, _: &AgentId, _: bool) -> Result<(), String> {
         Ok(())
     }

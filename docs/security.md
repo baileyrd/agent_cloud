@@ -48,7 +48,11 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [x] No `ctr task exec` ever gets stdin EOF while its guest process lives, from a pipe, a file or
   `/dev/null` (it wedges the Kata shim); every gateway exec holds its stdin open (verified 2026-10-21:
   `/dev/null` wedged a1 at the 126th exec, held stdin passed 200 and 300); the watchdog recovers a wedge
-  where killing `ctr` clients frees it
+  where killing `ctr` clients frees it, acting only on sustained failures on an idle host and logging every
+  pid it kills (ADR-012; verified 2026-10-22: a deliberate wedge recovered in 117.5 s, and nothing was killed
+  with 3 agents under load)
+- [x] A create or resume whose guest would not fit `/dev/shm` is refused (507), for every token; guest RAM lives
+  there and a full `/dev/shm` kills VMs (ADR-012, verified 2026-10-22)
 - [x] Task API: job state in the host registry, agent output served as inert text, prompts never in an
   argv, permission mode and tool list set by the operator (verified 2026-10-21, see [Task API](#task-api))
 - [x] One token per caller with the least scopes and agents it needs; tokens stored only as SHA-256 digests in

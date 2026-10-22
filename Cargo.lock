@@ -22,6 +22,7 @@ dependencies = [
  "ac-ports",
  "platform",
  "platform-mock",
+ "rusty_libc",
 ]
 
 [[package]]
@@ -262,6 +263,11 @@ dependencies = [
 [[package]]
 name = "rusty_json"
 version = "0.1.0"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+
+[[package]]
+name = "rusty_libc"
+version = "0.0.1"
 source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
 
 [[package]]

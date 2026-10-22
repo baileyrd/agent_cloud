@@ -3,7 +3,9 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
+use ac_domain::health::{ExecClient, Pressure};
 use ac_domain::{AgentId, Job, JobId, State};
 
 /// Adapter failure with context; adapters map their own errors into this.
@@ -36,6 +38,45 @@ pub trait Runtime {
     fn destroy(&self, id: &AgentId, purge: bool) -> Result<(), PortError>;
     /// Agents whose VM is up: the runtime has a task for them that has not stopped.
     fn running(&self) -> Result<Vec<AgentId>, PortError>;
+}
+
+/// `/dev/shm`, where every guest's RAM lives (Kata's `memory-backend-file`), in MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shm {
+    /// Size of the filesystem.
+    pub total_mib: u64,
+    /// Free now.
+    pub free_mib: u64,
+}
+
+/// What admission control reads from the host.
+pub trait Capacity {
+    /// `/dev/shm` now.
+    fn shm(&self) -> Result<Shm, PortError>;
+    /// The memory each guest is configured with, in MiB.
+    fn guest_mib(&self) -> Result<u64, PortError>;
+}
+
+/// What the watchdog asks of the runtime (ADR-012).
+pub trait Watch {
+    /// Whether agent `id` answers a trivial exec within `budget`.
+    fn probe(&self, id: &AgentId, budget: Duration) -> bool;
+    /// The host `ctr task exec` clients of agent `id`.
+    fn exec_clients(&self, id: &AgentId) -> Result<Vec<ExecClient>, PortError>;
+    /// SIGKILL these processes.
+    fn kill(&self, pids: &[u32]) -> Result<(), PortError>;
+}
+
+/// How loaded the host is.
+pub trait HostLoad {
+    /// Load average and pressure now.
+    fn pressure(&self) -> Result<Pressure, PortError>;
+}
+
+/// A monotonic clock.
+pub trait Clock {
+    /// Time since some fixed start.
+    fn now(&self) -> Duration;
 }
 
 /// Durable record of agents and their lifecycle state.

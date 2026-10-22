@@ -623,9 +623,6 @@ impl ac_gateway::viewer::Terminal for NoTerm {
     fn detach(&self, _: &AgentId, _: &str) -> Result<(), String> {
         Ok(())
     }
-    fn probe(&self, _: &AgentId) -> bool {
-        true
-    }
     fn kill_clients(&self, _: &AgentId, _: bool) -> Result<(), String> {
         Ok(())
     }

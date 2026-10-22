@@ -9,6 +9,7 @@ license.workspace = true
 ac-domain = { path = "../ac-domain" }
 ac-ports = { path = "../ac-ports" }
 platform.workspace = true
+rusty_libc.workspace = true
 
 [dev-dependencies]
 platform-mock.workspace = true

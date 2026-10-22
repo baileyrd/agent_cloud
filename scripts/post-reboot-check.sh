@@ -2,7 +2,7 @@
 # After a host reboot: the units, firewall and agents came back as expected, and agent a1
 # resumes through the gateway with a working login and egress (ADR-007), runs a job through the
 # task API (ADR-010) with a throwaway jobs-only token that cannot pause it (ADR-011), and leaves
-# no zombies (tini is PID 1). Run as root:
+# no zombies (tini is PID 1); committed guest memory fits /dev/shm (ADR-012). Run as root:
 #   sudo scripts/post-reboot-check.sh
 # Leaves the system as found: if it resumed a1, it pauses it again (KEEP_A1=1 leaves it running);
 # the throwaway token is revoked on every way out.
@@ -71,6 +71,19 @@ api() {
 list=$(api GET "") || list=
 agents=$(printf '%s' "$list" | grep -o '"id":"[^"]*","state":"[^"]*"' | sed 's/"id":"\([^"]*\)","state":"\([^"]*\)"/\1 \2/')
 [ -n "$agents" ] && pass "gateway lists $(echo "$agents" | wc -l) agent(s)" || bad "gateway list: ${list:-no answer}"
+
+# Admission (ADR-012): guests running or creating, at their configured size, must fit /dev/shm.
+cap=$(printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")" |
+    curl -sS -m 30 -H @- -w ' %{http_code}' "http://$BIND/api/v1/capacity" 2>&1) || cap=
+num() { printf '%s' "$cap" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p"; }
+total=$(num shm_total_mib) committed=$(num committed_mib)
+case $cap in
+    *' 200')
+        figures="committed $committed of /dev/shm $total MiB (free $(num shm_free_mib), guest $(num guest_mib), $(num running_agents) running, margin $(num margin_mib), $(num max_more_agents) more fit)"
+        if [ -n "$total" ] && [ "${committed:-x}" -le "$total" ] 2>/dev/null; then pass "capacity: $figures"
+        else bad "capacity over /dev/shm: $figures"; fi ;;
+    *) bad "GET /api/v1/capacity: ${cap:-no answer}" ;;
+esac
 
 leases_of() {
     for f in "$LEASES"/[0-9]*; do

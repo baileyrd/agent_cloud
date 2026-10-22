@@ -5,7 +5,9 @@
 //! network after the task starts) gives the guest nothing. Instead the adapter creates a network
 //! namespace, attaches it with the CNI bridge plugin, then starts the container in it.
 
+pub mod capacity;
 pub mod exec;
+pub mod host;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -22,8 +24,10 @@ pub use exec::{Closed, Exec};
 const KATA: &str = "io.containerd.kata.v2";
 const WORKSPACE_MOUNT: &str = "/workspace";
 const CNI_PATH_ENV: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-/// Exec ids the gateway's own long-lived execs start with, so leftovers can be found.
-pub const VIEW_EXEC_PREFIX: &str = "acview";
+/// Exec ids the gateway's own long-lived execs start with, so leftovers can be found. Every own
+/// prefix is listed in [`ac_domain::health::OWN_EXEC_PREFIXES`].
+pub use ac_domain::health::VIEW_EXEC_PREFIX;
+use ac_domain::health::{ONCE_EXEC_PREFIX, OWN_EXEC_PREFIXES, PROBE_EXEC_PREFIX};
 
 /// Agents get no DNS: the egress proxy resolves names on the host (ADR-007). With no nameserver
 /// line the guest's resolver asks its own loopback, which fails at once instead of timing out.
@@ -278,10 +282,22 @@ impl<S: Spawner> CtrRuntime<S> {
         args: &[&str],
         limit: Duration,
     ) -> Result<Vec<u8>, PortError> {
+        self.exec_tagged(op, ONCE_EXEC_PREFIX, id, args, limit)
+    }
+
+    /// [`Self::exec_once`] with exec ids starting `tag`.
+    fn exec_tagged(
+        &self,
+        op: &'static str,
+        tag: &str,
+        id: &AgentId,
+        args: &[&str],
+        limit: Duration,
+    ) -> Result<Vec<u8>, PortError> {
         let fail = |cause: String| PortError { op, cause };
         let secs = limit.as_secs().max(1).to_string();
         let mut argv = os(&["-s", "TERM", "-k", "3", &secs, &self.cfg.ctr_bin]);
-        argv.extend(self.exec_argv("acexec", id));
+        argv.extend(self.exec_argv(tag, id));
         argv.extend(os(args));
         if self.cfg.trace {
             eprintln!("ac-ctr: {op}: timeout {argv:?}");
@@ -311,20 +327,22 @@ impl<S: Spawner> CtrRuntime<S> {
         }
     }
 
-    /// Whether agent `id` answers a trivial exec within 2 s: a wedged shim does not.
-    pub fn probe(&self, id: &AgentId) -> bool {
-        self.exec_once("probe", id, &["true"], Duration::from_secs(2))
+    /// Whether agent `id` answers a trivial exec within `budget`: a wedged shim never does. The
+    /// exec id starts [`PROBE_EXEC_PREFIX`].
+    pub fn probe(&self, id: &AgentId, budget: Duration) -> bool {
+        self.exec_tagged("probe", PROBE_EXEC_PREFIX, id, &["true"], budget)
             .is_ok()
     }
 
-    /// SIGKILL host `ctr task exec` clients of agent `id`: the gateway's own (`ours_only`) or
-    /// every one. SIGKILL is the signal that frees a wedged shim (SIGTERM is forwarded through it).
+    /// SIGKILL host `ctr task exec` clients of agent `id`: the gateway's own (`ours_only`, by
+    /// exec-id prefix) or every one. SIGKILL is the signal that frees a wedged shim (SIGTERM is
+    /// forwarded through it).
     pub fn kill_exec_clients(&self, id: &AgentId, ours_only: bool) -> Result<(), PortError> {
         // Anchored to argv[0] being `ctr` (or a path to it): only ctr processes match, never a
         // shell, editor or pkill whose command line happens to contain the same words.
         let ctr = "^([^ ]*/)?ctr .* task exec --exec-id";
         let pattern = if ours_only {
-            format!("{ctr} {VIEW_EXEC_PREFIX}-{id}-")
+            format!("{ctr} ({})-{id}-", OWN_EXEC_PREFIXES.join("|"))
         } else {
             format!("{ctr} [^ ]+ {id}( |$)")
         };
@@ -852,16 +870,16 @@ mod tests {
     }
 
     #[test]
-    fn probe_is_a_held_stdin_exec_stopped_after_2s() {
+    fn probe_is_a_held_stdin_exec_stopped_after_its_budget() {
         let (rt, log, root) = rt(ExitStatus::Code(0));
-        assert!(rt.probe(&id()));
+        assert!(rt.probe(&id(), Duration::from_secs(2)));
         let (calls, progs) = (argv(&log), programs(&log));
         assert_eq!(progs, ["timeout"]);
         assert_eq!(
             calls[0][..10],
             ["-s", "TERM", "-k", "3", "2", "ctr", "-n", "agents", "task", "exec"]
         );
-        assert!(calls[0][11].starts_with("acexec-a1-"), "{:?}", calls[0]);
+        assert!(calls[0][11].starts_with("acprobe-a1-"), "{:?}", calls[0]);
         assert_eq!(calls[0][12..], ["a1", "true"]);
         let log = log.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(
@@ -882,7 +900,7 @@ mod tests {
             [
                 "-KILL",
                 "-f",
-                "^([^ ]*/)?ctr .* task exec --exec-id acview-a1-"
+                "^([^ ]*/)?ctr .* task exec --exec-id (acprobe|acview|acexec)-a1-"
             ]
         );
         assert_eq!(

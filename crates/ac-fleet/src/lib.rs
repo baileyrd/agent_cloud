@@ -1,11 +1,12 @@
 //! Applies the lifecycle state machine through the ports. Pure orchestration:
 //! every check happens before any side effect, so an illegal request never
-//! reaches the runtime.
+//! reaches the runtime. With [`Fleet::with_admission`], a create or resume is also refused when
+//! its guest would not fit `/dev/shm` ([`ac_domain::capacity::admit`]).
 
 use std::fmt;
 
-use ac_domain::{AgentId, Command, State, TransitionError};
-use ac_ports::{PortError, Runtime, SessionStore};
+use ac_domain::{capacity, AgentId, Command, Shortfall, State, TransitionError};
+use ac_ports::{Capacity, PortError, Runtime, SessionStore};
 
 /// Why a fleet operation failed.
 #[derive(Debug)]
@@ -16,6 +17,8 @@ pub enum FleetError {
     NotFound(AgentId),
     /// The lifecycle forbids this command now.
     Illegal(TransitionError),
+    /// Its guest would not fit `/dev/shm`; nothing was changed.
+    NoCapacity(Shortfall),
     /// The runtime or store failed; state is left as last persisted.
     Port(PortError),
 }
@@ -26,6 +29,7 @@ impl fmt::Display for FleetError {
             Self::AlreadyExists(id) => write!(f, "agent {id} already exists"),
             Self::NotFound(id) => write!(f, "agent {id} not found"),
             Self::Illegal(e) => e.fmt(f),
+            Self::NoCapacity(e) => e.fmt(f),
             Self::Port(e) => e.fmt(f),
         }
     }
@@ -45,16 +49,66 @@ impl From<TransitionError> for FleetError {
     }
 }
 
+/// Admission against `/dev/shm`: where to read it, and the margin to keep free.
+struct Admission {
+    capacity: Box<dyn Capacity + Send>,
+    margin_mib: u64,
+}
+
+/// What admission sees now (`GET /api/v1/capacity`), in MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Report {
+    /// `/dev/shm` size.
+    pub shm_total_mib: u64,
+    /// `/dev/shm` free.
+    pub shm_free_mib: u64,
+    /// Configured memory of one guest.
+    pub guest_mib: u64,
+    /// Agents running or being created.
+    pub running_agents: u64,
+    /// Their guests at configured size.
+    pub committed_mib: u64,
+    /// How many more guests would be admitted now.
+    pub max_more_agents: u64,
+    /// The margin kept free.
+    pub margin_mib: u64,
+}
+
 /// The set of agents, driven through a runtime and a store.
 pub struct Fleet<R, S> {
     runtime: R,
     store: S,
+    admission: Option<Admission>,
 }
 
 impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     /// Compose a fleet from its two adapters.
     pub fn new(runtime: R, store: S) -> Self {
-        Self { runtime, store }
+        Self {
+            runtime,
+            store,
+            admission: None,
+        }
+    }
+
+    /// Refuse a create or resume whose guest would not fit `/dev/shm` with `margin_mib` to spare.
+    /// Every guest running or being created counts at its configured size, since touched guest
+    /// pages are never given back. The caller serializes lifecycle calls (the gateway holds one
+    /// lock across them), so the check and the start cannot interleave with another's.
+    pub fn with_admission(mut self, capacity: Box<dyn Capacity + Send>, margin_mib: u64) -> Self {
+        self.admission = Some(Admission {
+            capacity,
+            margin_mib,
+        });
+        self
+    }
+
+    /// What admission sees now; `None` without admission control.
+    pub fn capacity(&self) -> Result<Option<Report>, FleetError> {
+        match &self.admission {
+            Some(a) => Ok(Some(self.report(a, None)?)),
+            None => Ok(None),
+        }
     }
 
     /// Current state of an agent, `None` if unknown.
@@ -78,6 +132,7 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         if matches!(self.store.state(id)?, Some(State::Running | State::Paused)) {
             return Err(FleetError::AlreadyExists(id.clone()));
         }
+        self.admit(id)?;
         self.store.set_state(id, State::Creating)?;
         self.runtime.create(id)?;
         self.persist(id, State::Creating, Command::Ready)
@@ -90,6 +145,12 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
 
     /// Start a paused agent.
     pub fn resume(&self, id: &AgentId) -> Result<State, FleetError> {
+        let from = self
+            .store
+            .state(id)?
+            .ok_or_else(|| FleetError::NotFound(id.clone()))?;
+        from.apply(Command::Resume)?;
+        self.admit(id)?;
         self.step(id, Command::Resume, |r| r.resume(id))
     }
 
@@ -118,6 +179,50 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
             }
         }
         Ok(changed)
+    }
+
+    /// Admit `id`'s guest on top of every other running or creating one.
+    fn admit(&self, id: &AgentId) -> Result<(), FleetError> {
+        let Some(a) = &self.admission else {
+            return Ok(());
+        };
+        let r = self.report(a, Some(id))?;
+        capacity::admit(
+            r.committed_mib,
+            r.guest_mib,
+            r.shm_total_mib,
+            r.shm_free_mib,
+            a.margin_mib,
+        )
+        .map_err(FleetError::NoCapacity)
+    }
+
+    /// The figures, counting every agent running or creating except `without`.
+    fn report(&self, a: &Admission, without: Option<&AgentId>) -> Result<Report, FleetError> {
+        let shm = a.capacity.shm()?;
+        let guest_mib = a.capacity.guest_mib()?;
+        let running = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|(id, s)| matches!(s, State::Running | State::Creating) && Some(id) != without)
+            .count() as u64;
+        let committed_mib = running.saturating_mul(guest_mib);
+        Ok(Report {
+            shm_total_mib: shm.total_mib,
+            shm_free_mib: shm.free_mib,
+            guest_mib,
+            running_agents: running,
+            committed_mib,
+            max_more_agents: capacity::more(
+                committed_mib,
+                guest_mib,
+                shm.total_mib,
+                shm.free_mib,
+                a.margin_mib,
+            ),
+            margin_mib: a.margin_mib,
+        })
     }
 
     fn step(
@@ -343,6 +448,79 @@ mod tests {
         let _ = fleet.create(&id());
         assert!(matches!(fleet.resume(&id()), Err(FleetError::Illegal(_))));
         assert_eq!(*rt.calls.borrow(), ["create"]);
+    }
+
+    /// `/dev/shm` of 9000 MiB, all free, guests of 4096 MiB.
+    struct Shm9000;
+    impl Capacity for Shm9000 {
+        fn shm(&self) -> Result<ac_ports::Shm, PortError> {
+            Ok(ac_ports::Shm {
+                total_mib: 9000,
+                free_mib: 9000,
+            })
+        }
+        fn guest_mib(&self) -> Result<u64, PortError> {
+            Ok(4096)
+        }
+    }
+
+    #[test]
+    fn admission_counts_running_and_creating_guests_at_configured_size() {
+        let rt = FakeRuntime::default();
+        let fleet = Fleet::new(&rt, FakeStore::default()).with_admission(Box::new(Shm9000), 512);
+        assert!(matches!(fleet.create(&agent("x1")), Ok(State::Running)));
+        assert!(matches!(fleet.create(&agent("x2")), Ok(State::Running)));
+        // 3 x 4096 + 512 > 9000: refused before any runtime call or state change.
+        let third = fleet.create(&agent("x3"));
+        assert!(
+            matches!(
+                third,
+                Err(FleetError::NoCapacity(Shortfall {
+                    needed_mib: 12800,
+                    available_mib: 9000,
+                    more: 0,
+                    ..
+                }))
+            ),
+            "{third:?}"
+        );
+        assert_eq!(fleet.state(&agent("x3")).ok().flatten(), None);
+        // A paused agent does not count; resuming it is checked like a create.
+        let _ = fleet.pause(&agent("x1"));
+        assert!(matches!(fleet.create(&agent("x3")), Ok(State::Running)));
+        assert!(matches!(
+            fleet.resume(&agent("x1")),
+            Err(FleetError::NoCapacity(_))
+        ));
+        assert_eq!(
+            fleet.state(&agent("x1")).ok().flatten(),
+            Some(State::Paused)
+        );
+        assert_eq!(*rt.calls.borrow(), ["create", "create", "pause", "create"]);
+        let report = fleet.capacity().ok().flatten();
+        assert_eq!(
+            report.map(|r| (r.running_agents, r.committed_mib, r.max_more_agents)),
+            Some((2, 8192, 0))
+        );
+    }
+
+    #[test]
+    fn a_failed_create_is_retried_without_counting_itself_twice() {
+        let failing = FakeRuntime {
+            fail: true,
+            ..Default::default()
+        };
+        let first = Fleet::new(&failing, FakeStore::default());
+        let _ = first.create(&agent("x1"));
+        let _ = first.create(&agent("x2"));
+        let working = FakeRuntime::default();
+        let retry = Fleet::new(&working, first.store).with_admission(Box::new(Shm9000), 512);
+        // x1 and x2 are both Creating (8192 committed): x1's retry counts only x2 besides itself.
+        assert!(matches!(retry.create(&agent("x1")), Ok(State::Running)));
+        assert!(matches!(
+            retry.create(&agent("x3")),
+            Err(FleetError::NoCapacity(_))
+        ));
     }
 
     #[test]

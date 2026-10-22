@@ -45,12 +45,13 @@
 - [ ] Backups with a tested restore
 - [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
   (BaileyServ, 2026-10-22)
-- [ ] Watchdog false positives under load: at N=3 and N=6 a busy agent missed the 2 s probe and the
-  watchdog SIGKILLed exec clients, a running job's included (sizing.md). Probe with a longer timeout or
-  only when the host is not saturated
-- [ ] Guests never return memory and their RAM lives in `/dev/shm` (11.7 GiB here, filled at N=6): set
-  `default_memory` to 2048 (measured enough for Claude Code), size `/dev/shm` to the running agents, and
-  try free page reporting or virtio-mem
+- [x] The watchdog tells slow from wedged: it acts only on sustained failures on an idle host, through a logged
+  ladder (ADR-012; verified 2026-10-22)
+- [x] Admission control: no create or resume beyond what `/dev/shm` holds; `/dev/shm` sized MemTotal − 8 GiB
+  (ADR-012; verified 2026-10-22)
+- [ ] Guests never return memory: try free page reporting or virtio-mem
+- [ ] Decide `default_memory` (4096 today; 2048 measured enough for Claude Code) after a real-build measurement
+- [ ] Measure on an SSD (every figure in sizing.md is from one rotational disk)
 - [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s)
 
 ## Later

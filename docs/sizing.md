@@ -4,7 +4,9 @@ Measured on BaileyServ on 2026-10-22 with [`scripts/capacity-bench.sh`](../scrip
 Raw samples (2 s host CSV, per-VM CSV, events) are in `/var/tmp/ac-bench-<date>/` on the host. This replaces
 the earlier estimates. What changed: an agent costs far less than estimated when fresh (0.5 GiB, not 2 GiB),
 but the guest never returns memory, so a long-running agent drifts toward its full `default_memory`. On this
-host the first limits are the single rotational disk and a 12 GiB `/dev/shm`, not RAM.
+host the first limits are the single rotational disk and `/dev/shm`, not RAM. Since then `/dev/shm` has been
+enlarged to MemTotal − 8 GiB (15.3 GiB here), and the gateway refuses a create or resume that would not fit it
+(ADR-012). The rule: **N × `default_memory` + 512 MiB must fit `/dev/shm`.**
 
 ## How it was measured
 
@@ -39,7 +41,7 @@ host the first limits are the single rotational disk and a 12 GiB `/dev/shm`, no
 | CPU | Intel Core i5-3550 (Ivy Bridge, 4 cores, no SMT, 3.3–3.7 GHz) |
 | RAM | 23.3 GiB usable; 21.9 GiB available with a1 and a2 paused; 8 GiB zram swap (compressed RAM, not disk) |
 | Disk | One rotational drive, `ST1000LM024`, 1 TB; btrfs with `compress=zstd:1` |
-| `/dev/shm` | tmpfs, 11.7 GiB (the default: half of RAM) |
+| `/dev/shm` | tmpfs, 11.7 GiB during these runs (the default: half of RAM); 15.3 GiB since (MemTotal − 8 GiB, ADR-012) |
 | Kernel | 7.2.11-200.fc44 |
 | Kata | `default_vcpus = 1`, `default_memory = 4096`, `default_maxmemory = 8192`, `memory_slots = 10`, `enable_virtio_mem = false`, virtio-fs with `cache=auto` |
 | Idle load | 0.0–0.2 |
@@ -69,7 +71,8 @@ cache counts as touched. A long-running agent therefore tends toward `default_me
 (which stops the VM) and resume reset it.
 
 **Guest RAM lives in `/dev/shm`.** Kata starts QEMU with `memory-backend-file,mem-path=/dev/shm,share=on`, which
-virtio-fs needs. The total memory that all running guests have touched cannot exceed `/dev/shm`, 11.7 GiB here.
+virtio-fs needs. The total memory that all running guests have touched cannot exceed `/dev/shm`, 11.7 GiB during
+these runs.
 At N=6 it filled, and four VMs stopped with `kvm run failed Bad address` (see below). This ceiling sits below
 host RAM: MemAvailable was still 9.6 GiB at that moment.
 
@@ -164,16 +167,23 @@ vCPUs per agent would only make them compete for cores sooner. Two vCPUs weren't
 
 | Workload | Running at once | Why |
 |---|---|---|
-| (a) Idle-heavy (mostly waiting on the model API) | **4**, with `default_memory = 2048`. At 4096: 4 today (measured, with `/dev/shm` at 76%), but only 2 can ever fill their memory | Worst case is total memory touched ≤ `/dev/shm` 11.7 GiB. 4 × 2.2 GiB fits with room to spare. Idle CPU is ~5% of a core each, so CPU is not the limit. |
+| (a) Idle-heavy (mostly waiting on the model API) | **4**, with `default_memory = 2048`; admission allows up to 7. At 4096: **3**, the most admission allows since `/dev/shm` is 15.3 GiB | Worst case is total memory touched ≤ `/dev/shm`. Idle CPU is ~5% of a core each, so CPU is not the limit. |
 | (b) CPU or disk heavy (builds, tests) | **2**, at most 3 | The disk's total is split evenly, and fsyncs pass 1 s from N=3. The watchdog first misfired at N=3. CPU saturates at N=4. |
 
 **Paused agents** cost no RAM or CPU: pause stops the VM, and resume takes ~3.7 s. Provision as many as the disk
 holds, and keep the running count at the figures above.
 
-**Two host changes would raise the idle-heavy limit.** Neither was tested:
-- Size `/dev/shm` to at least the sum of the running agents' `default_memory`. Above RAM it would spill into
-  zram.
-- Enable a way for guests to return memory: free page reporting or virtio-mem.
+**Since these runs (ADR-012).**
+- *`/dev/shm` resized.* It is now MemTotal − 8 GiB: 15717 MiB here, through `/etc/fstab`, see install.md.
+- *Admission control.* The gateway counts every running or creating guest at its configured `default_memory`,
+  and refuses (507) a create or resume unless the total plus the new guest plus 512 MiB fits `/dev/shm`. The new
+  guest plus 512 MiB must also fit what is free. Admission counts the configured size, not what a guest uses,
+  because touched pages never come back.
+- *Running agents now.* At `default_memory = 4096`, 3 agents run (3 × 4096 + 512 = 12800 ≤ 15717) and a fourth
+  is refused instead of crashing a VM. At 2048 it would be 7.
+- *Checking.* `GET /api/v1/capacity` and `scripts/capacity.sh` show the figures.
+
+Still open: a way for guests to return memory, such as free page reporting or virtio-mem.
 
 ## What this implies for hardware
 
@@ -211,7 +221,8 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
 - N=8. The staircase stopped at N=6, as `--max-n 6` intended, and the N=6 load already failed.
 - The proxy under real model traffic. Only 6 concurrent HEAD requests went through it, and its CPU was
   sampled at 2 s granularity.
-- `/dev/shm` resized, free page reporting, virtio-mem.
+- Free page reporting, virtio-mem. The `/dev/shm` resize and admission were checked live (ADR-012), but the
+  staircase was not re-run with them.
 - A create while the load runs at N = 2–4; it was measured only at N=1 and N=6.
 - A truly parallel create storm. The gateway serializes creates.
 

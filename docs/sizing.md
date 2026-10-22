@@ -6,7 +6,9 @@ the earlier estimates. What changed: an agent costs far less than estimated when
 but the guest never returns memory, so a long-running agent drifts toward its full `default_memory`. On this
 host the first limits are the single rotational disk and `/dev/shm`, not RAM. Since then `/dev/shm` has been
 enlarged to MemTotal − 8 GiB (15.3 GiB here), and the gateway refuses a create or resume that would not fit it
-(ADR-012). The rule: **N × `default_memory` + 512 MiB must fit `/dev/shm`.**
+(ADR-012). The rule: **N × `default_memory` + 512 MiB must fit `/dev/shm`.** A real build (a release
+and a test build of this repo, offline, in an agent) was measured since: it needs far less than 2048 MiB of
+guest memory, and with more than one at once CPU, not the disk, is the limit ([Real builds](#real-builds)).
 
 ## How it was measured
 
@@ -106,6 +108,120 @@ ran 3 times.
 - The model below adds **~190 MiB per concurrent Claude job** to each synthetic-loaded agent. Through the
   never-returned rule, the guest's page cache from reading files adds a little more over time.
 
+## Real builds
+
+Measured on 2026-10-22 with [`scripts/real-build-bench.sh`](../scripts/real-build-bench.sh); raw data in
+`/var/tmp/ac-rb-<date>/` (`runs.csv` per build, `host.csv`, `pss.csv`, and the guest's 1 s samples).
+
+**Workload.** This repo, built offline from a clean target dir in a fresh agent. There are 10 workspace
+crates and 44 vendored dependencies, including the rusty_mill git dependency.
+- *Release:* `cargo build --release --workspace --offline --locked`. This includes the link step.
+- *Test:* `cargo test --workspace --no-run --offline --locked`. Debug profile, an 840 MiB target dir.
+
+**Image.** A measurement-only image: the shipped one plus Fedora's gcc, rust and cargo 1.99.0. The sources
+and `cargo vendor` output were copied into `/workspace`. The egress allowlist was unchanged (same sha256),
+and `ac-egress` logged no allow or deny line during any run.
+
+**Runs.**
+- One agent per memory size, at 1 vCPU. Each size ran the release build 3 times back to back, then the test
+  build 3 times.
+- *Cold* is release run 1: the host page cache was dropped before the boot and again before the build. The
+  first test run follows three release builds, so its sources were already warm.
+- **Every cell is one run of the script**: the cold figure is 1 build and each warm figure is 2.
+
+**What was measured.**
+- *Guest memory*, sampled every second. "Used" is MemTotal − MemFree − Buffers − Cached − SReclaimable, as
+  `free` counts it.
+- *Biggest process:* `getrusage(RUSAGE_CHILDREN).ru_maxrss`, the figure `time -v` reports.
+- *OOM:* the guest's `/proc/vmstat` `oom_kill` count. Guest `dmesg` cannot be read: `dmesg_restrict = 1`,
+  and container root lacks CAP_SYSLOG. The container cgroup has no `memory.events`.
+- *Host:* the VM's PSS (QEMU, virtiofsd, shim) every 2 s, plus `/dev/shm` used after each build.
+- *Guest swap:* the guest has none.
+
+| Guest memory | Build | Run | Wall (s) | Guest used peak (MiB) | Min MemAvailable (MiB, % of guest) | OOM | Exit | VM PSS peak / end (MiB) | `/dev/shm` after (MiB) |
+|---|---|---|---|---|---|---|---|---|---|
+| 2048 (1888 visible) | release | cold | 118.1 | 257 | 1439 (76%) | 0 | 0 | 869 / 869 | 751 |
+| | release | warm ×2 | 85.7, 85.7 | 242, 267 | 1429–1454 (76–77%) | 0 | 0 | 870–871 / 870 | 752 |
+| | test | first | 126.1 | 264 | 1430 (76%) | 0 | 0 | 1076 / 1076 | 956 |
+| | test | warm ×2 | 124.0, 124.1 | 267, 286 | 1409–1427 (75–76%) | 0 | 0 | 1079 / 1079 | 958–959 |
+| 3072 (2893) | release | cold | 118.0 | 256 | 2377 (82%) | 0 | 0 | 945 / 945 | 827 |
+| | release | warm ×2 | 85.4, 85.4 | 250, 256 | 2377–2383 (82%) | 0 | 0 | 946–947 / 947 | 828–829 |
+| | test | first | 126.2 | 291 | 2341 (81%) | 0 | 0 | 1135 / 1135 | 1015 |
+| | test | warm ×2 | 124.0, 123.7 | 299, 303 | 2328–2332 (80–81%) | 0 | 0 | 1151–1152 / 1152 | 1031–1032 |
+| 4096 (3901) | release | cold | 118.1 | 260 | 3374 (86%) | 0 | 0 | 959 / 959 | 841 |
+| | release | warm ×2 | 85.9, 86.0 | 295, 295 | 3339 (86%) | 0 | 0 | 960 / 960 | 842 |
+| | test | first | 127.0 | 310 | 3323 (85%) | 0 | 0 | 1157 / 1157 | 1037 |
+| | test | warm ×2 | 125.1, 125.0 | 292, 314 | 3318–3340 (85–86%) | 0 | 0 | 1173 / 1173 | 1053–1054 |
+| 2048, **2 vCPUs** | release | cold | 84.2 | 344 | 1351 (72%) | 0 | 0 | 954 / 954 | 836 |
+| | release | warm ×2 | 52.6, 50.9 | 309, 395 | 1300–1386 (69–73%) | 0 | 0 | 955–978 / 978 | 837–860 |
+| | test | first | 77.6 | 467 | 1227 (65%) | 0 | 0 | 1249 / 1249 | 1129 |
+| | test | warm ×2 | 75.0, 75.1 | 460, 468 | 1226–1234 (65%) | 0 | 0 | 1256–1262 / 1262 | 1136–1143 |
+
+- **The build barely touches guest memory.** Guest used never passed 314 MiB at 1 vCPU, or 468 MiB at 2
+  (cargo then runs 2 rustc jobs). The biggest process was always rustc, at 243–289 MiB maxrss; the linker never
+  exceeded it. Guest page cache peaked at ~360 MiB. More guest memory changes nothing in time or use.
+- **`/dev/shm` plateaus.** Build after build of the same kind, it grows by 0–2 MiB, or 23 MiB once at
+  2 vCPUs. It steps up once, by ~200 MiB, to the test build's larger working set, then stays. A build agent's
+  host cost here ends at 0.85–1.23 GiB of PSS, not at `default_memory`. A bigger build would push it further,
+  since touched pages never come back.
+- **Cold costs ~38% at 1 vCPU.** A cold release build took 118 s against 86 s warm. The cold boot took 18–19 s
+  against 3.5 s warm. During cold builds the disk reached 99% busy with io PSI full 38–47; during warm release
+  builds the disk was 2–3% busy on average. After every build the host spent another 10–32 s writing the output
+  back at ~99% disk busy.
+- **2 vCPUs cut the time by ~40%**: release 51.8 s, test 75.1 s warm. Guest used rose by ~150 MiB, and
+  MemAvailable stayed at ≥ 65%.
+- **Host during one build:** MemAvailable ≥ 20.7 GiB, memory PSI 0, load ≤ 2.4, no swap, no host OOM. The
+  gateway watchdog logged nothing about the bench agents.
+- **For comparison:** natively on the host (not in a VM), with an empty `CARGO_HOME`, `-j1` builds the release
+  in 70 s (maxrss 305 MiB) and the test in 72 s. At `-j4` the release takes 19 s. A 1-vCPU agent is ~23%
+  slower than native `-j1` on warm runs.
+
+**Rule.** A size is clean when every run exits 0 with no OOM kill and the minimum MemAvailable is at least 15%
+of guest RAM. **2048 MiB is the smallest clean size measured.** Its lowest figure was 65%, at 2 vCPUs. Nothing
+below 2048 was tried.
+
+### Builds at once (2048 MiB)
+
+There were 2 agents, then 3, each from a fresh boot. All ran the release build at once, twice: cold, then
+warm. The baseline is the single-build figure at the same vCPU count. These are 1 run per step. The N=1 host
+columns cover the whole single-agent run (release and test builds); "—" was not computed.
+
+| vCPUs | N | Cold (s) | vs alone | Warm (s) | vs alone | Builds per hour, warm | Host CPU busy (mean) | CPU PSI some (max) | Disk busy (mean) | io PSI full (max) | Load (max) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 118.1 | — | 85.7 | — | 42 | 26% | 0.7 | 11% | 47 | 2.0 |
+| 1 | 2 | 130.8 | +11% | 97.6–97.7 | +14% | 74 | 48% | 2.2 | 15% | 42 | 2.7 |
+| 1 | 3 | 151.3–151.4 | +28% | 127.8–128.9 | +50% | 84 | 67% | 15.4 | 20% | 50 | 4.2 |
+| 2 | 1 | 84.2 | — | 51.8 | — | 70 | — | — | — | 41 | 2.4 |
+| 2 | 2 | 106.8–107.2 | +27% | 77.0–77.6 | +49% | 93 | 72% | 23.7 | 20% | 43 | 5.8 |
+| 2 | 3 | 156.8–157.0 | +86% | 136.6–138.1 | +166% | 78 | 82% | 59.9 | 15% | 47 | 7.0 |
+
+- **CPU is the limit, not the disk.** In warm runs the disk averaged 15–20% busy while CPU PSI rose with every
+  agent added. Each 1-vCPU build costs about one host core, the vCPU plus its virtiofsd. The disk only
+  saturates in the cold phase, where io PSI full reached 42–50 whatever the N.
+- **2 vCPUs win up to 2 builds at once and lose at 3.** At 3 builds, 6 vCPUs share 4 cores: it is 7% slower
+  than 1 vCPU, CPU PSI reaches 60 and load 7. That is close to the bench's abort (load > 8 for 60 s).
+- **Memory was never close.** Each agent's guest used peaked at 224–380 MiB, and its PSS ended at 0.81–0.94
+  GiB. Host MemAvailable was ≥ 19.1 GiB with 3 builds running.
+- No threshold tripped in the final runs. Three earlier attempts were stopped by the io PSI limit of 40, each
+  outside a build: twice a `journalctl --since` reading the 1 GiB journal from a cold cache, and once a
+  journal follower's start-up scan before the bench. The script now follows the journal from the start
+  instead.
+
+### Admission capacity
+
+Admission counts every guest at `default_memory`: N × size + 512 MiB must fit in `/dev/shm`. The VMM's own
+~0.15 GiB per VM is not in `/dev/shm`; it comes out of the 8 GiB host reserve. So N = floor((`/dev/shm` −
+512) / size). The 15717 MiB column matches what `GET /api/v1/capacity` reported (`max_more_agents` 7, 4
+and 3).
+
+| `default_memory` | `/dev/shm` 15717 MiB (this host, 24 GiB RAM) | 24 GiB (32 GiB RAM) | 40 GiB (48 GiB RAM) |
+|---|---|---|---|
+| 2048 | 7 | 11 | 19 |
+| 3072 | 4 | 7 | 13 |
+| 4096 | 3 | 5 | 9 |
+
+The RAM column assumes `/dev/shm` = MemTotal − 8 GiB (ADR-012).
+
 ## Concurrency staircase (run 11:31, 1 run per step)
 
 All agents ran the load at once. "Per agent" figures give min–max across the agents.
@@ -155,20 +271,25 @@ The proxy was never a bottleneck in what was measured.
 ## Recommended settings for this host
 
 **Memory.** The most effective lever is `default_memory`, because it caps what each agent eventually costs
-the host. Claude Code itself peaks at ~190 MiB and the guest's own use at ~475 MiB. A guest with
-`default_memory = 2048` (1888 MiB visible) booted in 3.57 s, and the 1 GiB toucher passed in 2.1 s (1 run).
-So 2048 MiB is enough for Claude Code plus moderate tools, and 3072 MiB leaves room for builds.
+the host.
+- Claude Code itself peaks at ~190 MiB, and the guest's own use at ~475 MiB.
+- A release or test build of this repo peaks at 314 MiB used at 1 vCPU and 468 MiB at 2, with at least 65%
+  of a 2048 MiB guest still available ([Real builds](#real-builds)).
+- **Proposal: `default_memory = 2048`.** That admits 7 agents here instead of 3. 3072 and 4096 changed neither
+  the build time nor its memory use.
+- Claude Code's own install documentation still asks for 4 GB. Builds much bigger than this repo were not
+  measured: those, and not Claude Code, are the reason to keep more.
 
-**4096 MiB is not needed for Claude Code.** It is only worth keeping for agents that run large builds; those
-weren't measured. Claude Code's own install documentation still asks for 4 GB.
-
-**vCPUs.** Keep `default_vcpus = 1` on this 4-core host. Every loaded agent kept its one core busy, and two
-vCPUs per agent would only make them compete for cores sooner. Two vCPUs weren't measured.
+**vCPUs. Proposal: `default_vcpus = 2`.**
+- A build is ~40% faster with 2 vCPUs (release 52 s against 86 s warm), and 2 builds at once still finish
+  sooner than with 1 vCPU (77 s against 98 s).
+- At 3 builds at once, 6 vCPUs on 4 cores is 7% slower than 1 vCPU, and CPU PSI reaches 60.
+- Idle vCPUs cost nothing measurable. If 3 or more builds at once is the normal case on this host, keep 1.
 
 | Workload | Running at once | Why |
 |---|---|---|
 | (a) Idle-heavy (mostly waiting on the model API) | **4**, with `default_memory = 2048`; admission allows up to 7. At 4096: **3**, the most admission allows since `/dev/shm` is 15.3 GiB | Worst case is total memory touched ≤ `/dev/shm`. Idle CPU is ~5% of a core each, so CPU is not the limit. |
-| (b) CPU or disk heavy (builds, tests) | **2**, at most 3 | The disk's total is split evenly, and fsyncs pass 1 s from N=3. The watchdog first misfired at N=3. CPU saturates at N=4. |
+| (b) Builds and tests | **2**; 3 runs, 1.5× slower | Real builds: +14% (2 at once) and +50% (3 at once) at 1 vCPU, limited by CPU, not disk or memory. A disk-heavy synthetic job splits the disk evenly, with fsyncs over 1 s from N=3. |
 
 **Paused agents** cost no RAM or CPU: pause stops the VM, and resume takes ~3.7 s. Provision as many as the disk
 holds, and keep the running count at the figures above.
@@ -189,9 +310,14 @@ Still open: a way for guests to return memory, such as free page reporting or vi
 
 Planning numbers, from the measurements above:
 - **RAM per running agent.** `default_memory` + 0.15 GiB at worst; that is where a long-running agent ends up.
+  An agent that has built this repo (release and test) costs ~1.2 GiB. Budget `default_memory` + 0.15 GiB per
+  concurrent build agent anyway, because pages are never returned.
 - **Host reserve.** ~4 GiB: this host used ~1.5 GiB idle, plus page cache for the disk.
 - **`/dev/shm`.** At least N × `default_memory`; the default is half of RAM.
-- **Cores.** One core per CPU-busy agent, plus one for the host. An idle agent needs ~0.05 core.
+- **Cores.** One core per CPU-busy agent, plus one for the host. An idle agent needs ~0.05 core. A 1-vCPU
+  build uses about one host core, the vCPU plus its virtiofsd. At 3 builds on 4 cores each is 1.5× slower.
+- **Build time on this CPU** (i5-3550, 1 vCPU): this repo's release build takes 86 s warm and 118 s cold, the
+  test build 124 s. With 2 vCPUs: 52 s and 75 s.
 
 | Running agents | RAM at 2 GiB per guest | RAM at 4 GiB per guest | Cores, mostly idle | Cores, all CPU-busy | Disk |
 |---|---|---|---|---|---|
@@ -201,7 +327,10 @@ Planning numbers, from the measurements above:
 
 The i5-3550 platform tops out at 32 GiB. Ivy Bridge also limits guests to 36-bit addresses (64 GiB).
 
-**Disk class.** The rotational disk is the first limit for disk-heavy agents. Its total throughput is fixed,
+**Disk class.** For real builds of this size the disk is not the first limit: in warm builds it averaged
+15–20% busy while CPU PSI climbed. It costs at the cold start: an 18–19 s boot instead of 3.5 s, a release
+build 38% slower, and io PSI full at 40–50 in every cold build. **For build agents, cores come before an SSD.**
+For disk-heavy synthetic jobs, the rotational disk is the first limit. Its total throughput is fixed,
 so per-agent throughput falls as 1/N and fsync latency rises past 1 s from N=3. Boots after a cache drop
 took ~10 s against ~4 s warm. A boot while six agents were busy failed.
 
@@ -210,12 +339,17 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
   on these 4 cores, as the next limit.
 - For idle-heavy agents, no. Their limit is `/dev/shm` and RAM; the N=6 failure was memory backing, not
   disk.
+- For build agents like this repo's, only at the start. It should remove most of the 38% cold-build penalty
+  and the 15 s cold-boot penalty, but not the CPU-bound slowdown of builds at once. That is an inference.
 - Cold boots should approach the ~4 s warm figure. That is an inference: no SSD was measured.
 
 ## Not measured
 
 - Any SSD or NVMe disk; everything here is one rotational disk.
-- More than one vCPU per agent; real builds (cargo, npm), their memory peak and their disk pattern.
+- Builds other than this repo's Rust build: npm, C++ or bigger Rust projects with heavier links. The
+  conclusion that 2048 MiB is enough holds only for builds of this size.
+- Real builds on an SSD; hours-long growth in a build agent; many builds of different projects in one agent.
+- Memory give-back: a build agent keeps its peak until it is paused.
 - Claude Code jobs in several agents at once. The model adds a1's single-job peak to each agent.
 - Long runs: hours of drift, many jobs in one agent, Chromium or desktop agents.
 - N=8. The staircase stopped at N=6, as `--max-n 6` intended, and the N=6 load already failed.

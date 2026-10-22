@@ -43,7 +43,15 @@
   (`DISABLE_AUTOUPDATER=1`) (verified on BaileyServ 2026-10-22)
 - [ ] Per-agent CPU, memory and disk limits
 - [ ] Backups with a tested restore
-- [ ] Five-agent load test; update [sizing.md](sizing.md) with real numbers
+- [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
+  (BaileyServ, 2026-10-22)
+- [ ] Watchdog false positives under load: at N=3 and N=6 a busy agent missed the 2 s probe and the
+  watchdog SIGKILLed exec clients, a running job's included (sizing.md). Probe with a longer timeout or
+  only when the host is not saturated
+- [ ] Guests never return memory and their RAM lives in `/dev/shm` (11.7 GiB here, filled at N=6): set
+  `default_memory` to 2048 (measured enough for Claude Code), size `/dev/shm` to the running agents, and
+  try free page reporting or virtio-mem
+- [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s)
 
 ## Later
 - Local model option for an offline posture

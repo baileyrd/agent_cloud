@@ -70,7 +70,7 @@ Details: [docs/architecture.md](docs/architecture.md).
 | [docs/architecture.md](docs/architecture.md) | Components, data flows, trust boundaries |
 | [docs/install.md](docs/install.md) | Phased install runbook with checkpoints |
 | [docs/security.md](docs/security.md) | Threat model and hardening checklist |
-| [docs/sizing.md](docs/sizing.md) | Hardware and per-agent capacity estimates |
+| [docs/sizing.md](docs/sizing.md) | Per-agent footprint and capacity, measured on BaileyServ; hardware per 4/8/16 agents |
 | [docs/decisions.md](docs/decisions.md) | Architecture decision records |
 | [docs/research-notes.md](docs/research-notes.md) | Evidence behind the design and open unknowns |
 | [docs/roadmap.md](docs/roadmap.md) | Milestones and open questions |

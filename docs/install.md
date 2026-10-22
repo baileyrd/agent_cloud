@@ -142,7 +142,8 @@ user, backups.
 2. Confirm the workspace survives `DELETE /api/v1/agents/{id}` and is removed by `DELETE ...?purge=true`
    (checked on BaileyServ 2026-10-19: destroy, re-create, file still there; purge, directory gone).
 3. Confirm a second agent cannot see the first one's files.
-4. Spawn five agents; record RAM and CPU to calibrate [sizing.md](sizing.md).
+4. Measure capacity: `sudo scripts/capacity-bench.sh --estimate`, then without `--estimate` (about 25 min,
+   guarded by abort thresholds; it creates and purges `bench-*` agents only). Results: [sizing.md](sizing.md).
 
 ## Rough effort
 

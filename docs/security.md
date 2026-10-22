@@ -14,7 +14,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
 | Agent attacks the viewer's browser | Only sanitised text and SGR colours reach the page; strict CSP; see [Viewer](#viewer) |
 | Network attacker reaches the API | Gateway on a private bind only (loopback, RFC 1918, tailnet), scoped bearer tokens ([API tokens](#api-tokens)); no public port |
-| A caller's token is stolen | Each caller has its own token, limited to scopes and agents, revocable alone; see [API tokens](#api-tokens) |
+| A jobs token is stolen (`jobs:read,jobs:write` for some agents) | It runs prompts, so code as the agent user, in those agents only; it cannot pause, destroy, watch or type into them, and other agents answer 404. Revoke it alone (`ac-gateway token revoke`); see [API tokens](#api-tokens) |
+| The admin token is stolen | Full control of every agent (create, destroy, purge, jobs, take-over), not the host. Keep it on the host (root, 0600), give every other caller a narrower token, revoke and re-issue it if it leaks |
 | Runaway agent starves the host | Per-agent CPU/memory caps, disk quotas, concurrent-build limit |
 | Destructive commands | Command guard in the shell container (a backstop, not a boundary) |
 
@@ -52,7 +53,10 @@ may execute untrusted code or be steered by prompt injection from web content.
   argv, permission mode and tool list set by the operator (verified 2026-10-21, see [Task API](#task-api))
 - [x] One token per caller with the least scopes and agents it needs; tokens stored only as SHA-256 digests in
   a root-only 0600 file; every route mapped to a scope by a table a test checks (ADR-011, see
-  [API tokens](#api-tokens))
+  [API tokens](#api-tokens); verified 2026-10-22: a jobs token for a1 ran a job, got 403 on pause and take-over,
+  404 for a2, and 401 within 2 s of its revoke)
+- [x] The agent image's PID 1 is `tini`, which reaps orphans, so killed jobs leave no zombies; Claude Code never
+  self-updates (`DISABLE_AUTOUPDATER=1`) (verified 2026-10-22)
 
 ## Credentials for model access
 
@@ -78,7 +82,7 @@ What a stolen token gives its holder (on the private bind, until revoked):
 | Token | Can | Cannot |
 |---|---|---|
 | `jobs:read,jobs:write` for `a1` | Run prompts in a1, which with the default tool list means running code as a1's agent user inside a1's VM (see [Task API](#task-api)); read a1's job output; cancel a1's jobs | Pause, resume, destroy or purge any agent; watch or type into any terminal; read terminal history; see that other agents exist (404 for every other id, the list shows only a1) |
-| `viewer:read` | Watch the listed agents' terminals live and read their history, which shows whatever the agents printed, secrets included | Type, take over, run jobs or change any agent's state |
+| `viewer:read` | Watch the listed agents' terminals live (any of their tmux windows) and read their history, which shows whatever the agents printed, secrets included | Type, take over, run jobs or change any agent's state; picking a window changes only its own view |
 | `viewer:control` (with `viewer:read`) | Take over the listed agents' shells: everything their agent users can do, including their logins | Change agent state or run jobs through the API (its shell access makes this moot inside those agents) |
 | `admin` (or the legacy `AC_TOKEN_FILE` token) | Everything on every agent: create, destroy and purge workspaces, run jobs, take over shells | Reach the host beyond what the agents' VMs and the egress allowlist allow |
 

@@ -175,7 +175,8 @@ registry outgrows RAM.
 id, live status and the result, without exec-ing into the VM. Everything inside the VM and its workspace
 is writable by the agent, so a prompt-injected agent can tamper with any file it writes there.
 **Decision:** Jobs are part of `ac-gateway` (`jobs.rs`), under `/api/v1/agents/{id}/jobs`, with the same
-token, Origin and bind rules as the rest of the API.
+Origin and bind rules as the rest of the API; since ADR-011 a caller needs a token with `jobs:read` or
+`jobs:write` for the agent, not the owner's.
 - *Routes:* `POST .../jobs` `{"prompt", "timeout_secs"?, "idempotency_key"?}` answers 202 with the job;
   `GET .../jobs` (the agent's retained jobs, newest first); `GET .../jobs/{job}[?wait=N]` (N <= 30 s:
   long-poll until the state changes; 8 waiters at most, then 429); `GET .../jobs/{job}/output` (the final

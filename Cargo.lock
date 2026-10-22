@@ -9,6 +9,7 @@ dependencies = [
  "ac-ctr",
  "ac-domain",
  "ac-fleet",
+ "ac-ports",
  "ac-store",
  "platform-linux",
 ]
@@ -58,9 +59,12 @@ dependencies = [
  "platform",
  "platform-linux",
  "platform-mock",
+ "rusty_atomic_file",
+ "rusty_crypto_key",
  "rusty_http",
  "rusty_json",
  "rusty_serve",
+ "rusty_sha2",
 ]
 
 [[package]]
@@ -224,9 +228,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusty_atomic_file"
+version = "0.1.0"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+
+[[package]]
 name = "rusty_base64"
 version = "0.1.0"
 source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+
+[[package]]
+name = "rusty_crypto_key"
+version = "0.1.0"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+dependencies = [
+ "rusty_atomic_file",
+]
 
 [[package]]
 name = "rusty_hex"
@@ -275,6 +292,14 @@ version = "0.1.0"
 source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
 dependencies = [
  "rusty_http",
+]
+
+[[package]]
+name = "rusty_sha2"
+version = "0.1.0"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+dependencies = [
+ "rusty_crypto_key",
 ]
 
 [[package]]

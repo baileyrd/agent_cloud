@@ -1,9 +1,11 @@
 #!/bin/sh
 # After a host reboot: the units, firewall and agents came back as expected, and agent a1
-# resumes through the gateway with a working login and egress (ADR-007) and runs a job through
-# the task API (ADR-010). Run as root:
+# resumes through the gateway with a working login and egress (ADR-007), runs a job through the
+# task API (ADR-010) with a throwaway jobs-only token that cannot pause it (ADR-011), and leaves
+# no zombies (tini is PID 1). Run as root:
 #   sudo scripts/post-reboot-check.sh
-# Leaves the system as found: if it resumed a1, it pauses it again (KEEP_A1=1 leaves it running).
+# Leaves the system as found: if it resumed a1, it pauses it again (KEEP_A1=1 leaves it running);
+# the throwaway token is revoked on every way out.
 set -u
 fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -56,7 +58,10 @@ binds ac-gateway
 # --- agents ---------------------------------------------------------------------------------
 val() { sed -n "s/^$1=//p" "$ENV" | tail -n 1; }
 BIND=$(val AC_BIND)
+[ -z "$(val AC_TOKENS)" ] || export AC_TOKENS="$(val AC_TOKENS)" 
+# An admin token: the legacy AC_TOKEN_FILE, else the owner token from docs/install.md.
 TOKEN_FILE=$(val AC_TOKEN_FILE)
+[ -n "$TOKEN_FILE" ] || TOKEN_FILE=/etc/agent-cloud/owner.token
 # The token goes to curl on stdin, not on its command line. $3: an optional (constant) JSON body.
 api() {
     printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")" |
@@ -105,8 +110,11 @@ restore() {
     fi
     resumed=
 }
-HOLD= HOLDER=
-release() { [ -z "$HOLDER" ] || kill "$HOLDER" 2>/dev/null; [ -z "$HOLD" ] || rm -f "$HOLD"; }
+HOLD= HOLDER= TNAME=
+release() {
+    [ -z "$HOLDER" ] || kill "$HOLDER" 2>/dev/null; [ -z "$HOLD" ] || rm -f "$HOLD"
+    [ -z "$TNAME" ] || ac-gateway token revoke "$TNAME" >/dev/null 2>&1; TNAME=
+}
 trap 'restore; release; exit "$fail"' EXIT
 trap 'fail=1; exit' INT TERM
 
@@ -168,10 +176,35 @@ case $out in
     *) pass "$LAN_HOST unreachable, direct and via the proxy" ;;
 esac
 
-# --- task API: one job end to end ------------------------------------------------------------
+# --- task API: one job end to end, submitted with a throwaway jobs-only token -----------------
+# The token goes to curl on stdin. tok <method> <path> [body]: prints "<status> <body>".
+tok() {
+    printf 'Authorization: Bearer %s\n' "$TOKEN" |
+        curl -sS -m 60 -H @- -X "$1" ${3:+--data-binary "$3"} -w ' %{http_code}' "http://$BIND/api/v1/agents$2" |
+        sed 's/^\(.*\) \([0-9]*\)$/\2 \1/'
+}
+TNAME=post-reboot-check-$$
+TOKEN=$(ac-gateway token create "$TNAME" --scopes jobs:read,jobs:write --agents "$AGENT" 2>/dev/null) || TOKEN=
+if [ -n "$TOKEN" ]; then pass "token $TNAME created (jobs:read,jobs:write for $AGENT)"; else bad "token create"; TNAME=; fi
+sleep 2  # the gateway re-reads the tokens file within a second of a change
 st() { sed -n 's/.*"state":"\([a-z_]*\)".*/\1/p'; }
-r=$(api POST "/$AGENT/jobs" '{"prompt":"reply with exactly the word pong","timeout_secs":180}')
+r=$(tok POST "/$AGENT/jobs" '{"prompt":"reply with exactly the word pong","timeout_secs":180}')
+case $r in 202\ *) pass "jobs token: job POST 202" ;; *) bad "jobs token: job POST: $r" ;; esac
+r=${r#* }
 job=$(printf '%s' "$r" | sed -n 's/.*"job_id":"\([a-z0-9-]*\)".*/\1/p')
+for spec in "403 POST /$AGENT/pause" "403 POST /$AGENT/term/0011223344556677/takeover" "404 GET /a2/jobs"; do
+    set -- $spec
+    c=$(tok "$2" "$3" | cut -d' ' -f1)
+    if [ "$c" = "$1" ]; then pass "jobs token: $2 $3 -> $c"; else bad "jobs token: $2 $3 -> $c, want $1"; fi
+done
+c=$(tok GET "/$AGENT/jobs/$job" | cut -d' ' -f1)
+[ "$c" = 200 ] && pass "jobs token: GET its job -> 200" || bad "jobs token: GET job -> $c"
+if [ -n "$TNAME" ] && ac-gateway token revoke "$TNAME" >/dev/null 2>&1; then
+    TNAME=
+    sleep 2
+    c=$(tok GET "/$AGENT/jobs/$job" | cut -d' ' -f1)
+    [ "$c" = 401 ] && pass "revoked token refused (401)" || bad "revoked token still answers $c"
+fi
 if [ -z "$job" ]; then
     bad "job submit: ${r:-no answer}"
 else
@@ -186,5 +219,11 @@ else
         *) bad "job $job ${state:-?}: $(echo "$out" | head -c 200 | tr '\n' ' ')" ;;
     esac
 fi
+
+# --- no zombies: tini is PID 1 and reaps orphans ---------------------------------------------
+out=$(gx init 'ps -o comm= -p 1; ps -eo pid=,ppid=,stat=,comm= | awk "\$2 == 1 && \$3 ~ /^Z/" | wc -l')
+init=$(echo "$out" | sed -n 1p) orphans=$(echo "$out" | sed -n 2p | tr -d ' ')
+[ "$init" = tini ] && pass "$AGENT PID 1 is tini" || bad "$AGENT PID 1 is ${init:-?}, want tini (rebuild the image, pause/resume)"
+[ "$orphans" = 0 ] && pass "$AGENT: no zombies left to PID 1" || bad "$AGENT: $orphans zombie(s) under PID 1"
 
 exit "$fail"

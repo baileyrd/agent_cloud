@@ -1,4 +1,5 @@
-//! tmux control mode (`tmux -C`), one line at a time: pane output and command replies.
+//! tmux control mode (`tmux -C`), one line at a time: pane output, command replies, and notices
+//! that the session's windows changed.
 //!
 //! A reply is the lines between `%begin <time> <n> <flags>` and an `%end`/`%error` with the same
 //! three words. Captured pane lines appear raw inside a reply, so a hostile program can print a
@@ -18,9 +19,26 @@ pub enum Notice {
         /// The reply's lines.
         lines: Vec<String>,
     },
+    /// A window was added, closed, renamed or made current, or a window's active pane or layout
+    /// changed: the window list (and what `main` shows) may differ now.
+    Windows,
     /// The client is detaching, or the server is gone (`%exit`).
     Exit,
 }
+
+/// Notifications that mean [`Notice::Windows`]. (Outside a reply block every line is tmux's own:
+/// pane output arrives escaped in `%output`, so a program cannot forge one.)
+const WINDOW_NOTICES: [&str; 9] = [
+    "%window-add ",
+    "%window-close ",
+    "%window-renamed ",
+    "%window-pane-changed ",
+    "%unlinked-window-add ",
+    "%unlinked-window-close ",
+    "%unlinked-window-renamed ",
+    "%session-window-changed ",
+    "%layout-change ",
+];
 
 /// Lines kept per reply; the rest are dropped.
 pub const MAX_REPLY_LINES: usize = 2048;
@@ -62,6 +80,12 @@ impl Parser {
         }
         if line == b"%exit" || line.starts_with(b"%exit ") {
             return Some(Notice::Exit);
+        }
+        if WINDOW_NOTICES
+            .iter()
+            .any(|n| line.starts_with(n.as_bytes()))
+        {
+            return Some(Notice::Windows);
         }
         None
     }
@@ -171,6 +195,27 @@ mod tests {
         assert!(ok);
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[3], "%exit");
+    }
+
+    #[test]
+    fn window_changes_are_noticed_outside_replies_only() {
+        let mut p = Parser::default();
+        let got = feed(
+            &mut p,
+            "%window-add @3\n%window-close @3\n%unlinked-window-close @9\n%window-renamed @1 job-x\n\
+             %session-window-changed $0 @1\n%window-pane-changed @1 %4\n%layout-change @1 b25d,80x24,0,0,0\n\
+             %window-addx\n%output %0 %window-add @7\n%begin 1 1 1\n%window-close @0\n%end 1 1 1",
+        );
+        assert_eq!(got.len(), 9, "{got:?}");
+        assert!(got[..7].iter().all(|n| *n == Notice::Windows), "{got:?}");
+        assert_eq!(got[7], Notice::Output(b"%window-add @7".to_vec()));
+        assert_eq!(
+            got[8],
+            Notice::Reply {
+                ok: true,
+                lines: vec!["%window-close @0".into()]
+            }
+        );
     }
 
     #[test]

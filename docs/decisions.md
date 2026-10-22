@@ -77,17 +77,28 @@ process owns the registry lock); bearer-token auth and the private-bind check ar
   needed. Origin is checked on every request; caps of 4 viewers per agent and 16 in all leave
   rusty_serve's 64 connections for the API; viewer routes never take the lifecycle lock.
 - *Rendering:* the gateway turns snapshots into styled runs (SGR only) and drops every other
-  escape (OSC 8/52, titles, DCS, APC, C0/C1, bidi overrides). The page (about 250 lines of
+  escape (OSC 8/52, titles, DCS, APC, C0/C1, bidi overrides). The page (about 330 lines of
   in-repo JS, no third-party code, CSP `'self'` only) sets text with `textContent`.
 - *View-only and take-over:* view-only is the default. The guarantee rests on the gateway, not
   tmux: input from a viewer without the lock gets 403 before anything is built; the view
-  client's whole vocabulary is a closed enum (`ViewCommand`: client name, cursor info,
-  snapshot); the take-over client exists only while a viewer holds the lock and takes only
-  `Input`, whose bytes are sent as `send-keys -H` hex (key names are mapped to terminal bytes),
-  so no viewer byte can be read as a tmux command. tmux's `read-only` flag was tried and dropped:
+  client's whole vocabulary is a closed enum (`ViewCommand`: client name, list windows, cursor
+  info and snapshot of `main` or of one window id); the take-over client exists only while a
+  viewer holds the lock and takes only `Input`, whose bytes are sent as `send-keys -H` hex (key
+  names are mapped to terminal bytes), so no viewer byte can be read as a tmux command. tmux's `read-only` flag was tried and dropped:
   while such a client is attached, tmux refuses the agent's own tmux commands, even from inside
   its pane. One viewer holds the lock; a second take-over is refused unless forced; release or
   disconnect returns to view-only.
+- *Windows (2026-10-22):* `Ctrl-b` does not reach tmux from a browser (it is a browser shortcut),
+  so the page lists `main`'s windows (`list-windows`, refreshed on tmux's window notifications),
+  marking the agent's current one and `job-*` windows, and a click picks one for that viewer only
+  (`POST .../term/{viewer}/window`, body `@<n>` or `active`; `viewer:read`). The gateway never runs
+  `select-window`, which would move the agent and every viewer: it snapshots each watched window by
+  id (`display`/`capture-pane -t @<n>`), the first time by one exec for the picking viewer, and a
+  taker's input goes to that window's active pane by the pane id from the list (`send-keys -t
+  %<n>`). The only viewer text that reaches a command is a window id of exactly `@<digits>` (no
+  leading zero) that is in the latest list, parsed into a number and rendered back from it;
+  anything else is 400. A watched window that closes (a notification, or a failed capture) sends
+  its viewers back to the agent's window. Picks are capped at 4 execs at once (429 beyond).
 - *Recording:* while viewed, output chunks and take-over events go to the per-agent `ac-history`
   log (`<data>/history/<id>`, 0700, 1 MiB segments, 16 MiB kept). Keystrokes are not recorded.
   `GET .../history` returns plain text with every escape stripped.
@@ -164,7 +175,8 @@ registry outgrows RAM.
 id, live status and the result, without exec-ing into the VM. Everything inside the VM and its workspace
 is writable by the agent, so a prompt-injected agent can tamper with any file it writes there.
 **Decision:** Jobs are part of `ac-gateway` (`jobs.rs`), under `/api/v1/agents/{id}/jobs`, with the same
-token, Origin and bind rules as the rest of the API.
+Origin and bind rules as the rest of the API; since ADR-011 a caller needs a token with `jobs:read` or
+`jobs:write` for the agent, not the owner's.
 - *Routes:* `POST .../jobs` `{"prompt", "timeout_secs"?, "idempotency_key"?}` answers 202 with the job;
   `GET .../jobs` (the agent's retained jobs, newest first); `GET .../jobs/{job}[?wait=N]` (N <= 30 s:
   long-poll until the state changes; 8 waiters at most, then 429); `GET .../jobs/{job}/output` (the final
@@ -240,9 +252,74 @@ token, Origin and bind rules as the rest of the API.
 layer and the VM, egress allowlist and isolation are the boundary. A job's outcome is what the agent's
 VM reports: a compromised agent can fake its own job's exit code and result, never another agent's, and
 never the registry's state or times. Output is read through execs, so a wedged agent delays collection.
-The image's PID 1 is `sleep infinity`, which never reaps, so killed jobs leave zombies until the agent
-is paused (harmless, but an init such as `tini` would clear them).
+The image's PID 1 is `tini` (running `sleep infinity`), which reaps orphans, so a killed job leaves no
+zombies (verified 2026-10-22: none after a cancel through the API, a `pkill` of `claude` and killed
+orphans; before, with `sleep infinity` as PID 1, they stayed until the agent was paused).
 **Not now:** `rusty_agui` (AG-UI events over SSE) fits a later per-job event stream that turns the
 stream-json log into `RUN_STARTED`/`TEXT_MESSAGE_*`/`TOOL_CALL_*`/`RUN_FINISHED`; it does not fit the
 control plane (AG-UI has no queue, job id or re-attach; a run is one request). Long-polling the status
 is enough for now.
+
+## ADR-011: Scoped API tokens
+**Status:** accepted (2026-10-21).
+**Context:** One bearer token (`AC_TOKEN_FILE`) could do everything: lifecycle, jobs, viewer take-over.
+Handing a script or another agent a token to submit jobs also let it destroy agents and type into their shells.
+**Decision:** Many named tokens, each with scopes and a set of agents, checked by the gateway before any handler.
+- *File:* `/etc/agent-cloud/tokens` (`AC_TOKENS`), owned by the gateway's user (root), mode 0600, one token per
+  line: `name scopes agents sha256 [created]`; `#` comments. `scopes` is a comma list of `agents:read`,
+  `agents:write`, `jobs:read`, `jobs:write`, `viewer:read`, `viewer:control`, `admin` (implies all); `agents` is
+  `*` or a comma list of agent ids; `sha256` is the hex digest of the token; `created` is Unix seconds (a fifth,
+  optional field, added for `token list`). Only digests are stored: a token is 32 bytes from `/dev/urandom` as
+  hex, printed once by `ac-gateway token create <name> --scopes ... [--agents ...]`. `token list` shows names,
+  scopes, agents and creation times; `token revoke <name>` removes a line. The CLI edits only this file (under a
+  `flock` on its directory, then an atomic 0600 rewrite with `rusty_atomic_file`), never the registry, so it
+  works while the gateway runs.
+- *Reload:* as ac-egress's allowlist: re-read on SIGHUP (`systemctl reload ac-gateway`) and when its mtime,
+  length or inode changes (checked each second). At startup a file that is unreadable, not a regular file,
+  owned by another user, group/world accessible, over 64 KiB or malformed (unknown scope, bad agent id, bad
+  digest, duplicate name or digest) stops the gateway; so does having no token at all. A bad later version is
+  logged and the current tokens stay; a deleted file leaves only the legacy token. A revoked token's open
+  viewer streams end at their next message or keep-alive (within about 5 s).
+- *Legacy:* `AC_TOKEN_FILE` still works and is the `admin` token for every agent named `legacy` (a reserved
+  name). Deprecated: the gateway says so at startup; migrate as in install.md and drop it later.
+- *Matching:* the presented `Bearer` token is hashed with SHA-256 (`rusty_sha2`) and compared with every
+  digest using `rusty_crypto_key::constant_time_eq` (both first-party, ADR-008).
+- *Routes:* every route under `/api/` has exactly one entry in `access::ROUTES`, checked before dispatch. A path
+  with no entry is 404 for every token, so a route added to a handler without an entry is unreachable; a test
+  enumerates every path built from the table's words and checks that the handlers accept exactly the paths the
+  table lists.
+
+  | Route | Scope |
+  |---|---|
+  | `GET /api/v1/whoami` (name, scopes, agents; no secrets) | any valid token |
+  | `GET /api/v1/agents` (lists only the token's agents) | `agents:read` |
+  | `GET /api/v1/agents/{id}` | `agents:read` |
+  | `POST /api/v1/agents/{id}` (create) | `agents:write` |
+  | `POST /api/v1/agents/{id}/pause`, `.../resume` | `agents:write` |
+  | `DELETE /api/v1/agents/{id}` (destroy; `?purge=true`, `?force=true`) | `agents:write` |
+  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output` | `jobs:read` |
+  | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
+  | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
+  | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
+
+- *Agents:* a token restricted to some agents gets 404 for any other agent id, existing or not, before its scope
+  is looked at, so it cannot probe for ids. (A wrong method is still 405; that depends on the path's shape only.)
+- *Viewer ids* belong to the token that opened the stream: another token, even `admin`, gets 404 for them, so
+  input and take-overs are attributable to one token.
+- *Failures:* 401 for a missing or unknown token, logged as `auth: unknown token sha256:<first 4 bytes of its
+  digest>`, never the token or the header; 403 and 404 for a known token, logged with its name. After 20
+  failures in 60 s, further ones get 429 and are not logged until the window ends; valid tokens are never
+  refused for that. rusty_serve does not give handlers the peer address, so the count is per gateway, not per
+  source address; the limiter keys by source (bounded to 1024) and gets the address once rusty_serve passes it.
+- *Audit:* every state-changing call that passed the checks (create, pause, resume, destroy, job submit and
+  cancel, take-over, release) writes `audit token=<name> action=<action> [force=true] [purge=true] [job=<id>]
+  status=<code>` to the agent's `ac-history` log (shown by `GET .../history`) and the same line with
+  `agent=<id>` to the gateway's journal. Viewer input is not audited per call: it comes from the viewer whose
+  take-over was. No prompt, body or terminal content.
+- *Viewer page:* asks `whoami` after the token is entered, shows the token's name and scopes, and hides
+  **Take over** without `viewer:control` (the gateway refuses it anyway).
+**Consequences:** a stolen jobs token runs prompts in its agents (which is code execution as the agent user in
+those VMs) but cannot pause, destroy, watch or type into them, nor see other agents. `admin` remains as
+powerful as the old token. Tokens do not expire; revoke them. There is still no TLS of the gateway's own.
+**Not now:** expiry and per-token rate limits; per-address failure limits (needs the peer address from
+rusty_serve); scopes narrower than these seven.

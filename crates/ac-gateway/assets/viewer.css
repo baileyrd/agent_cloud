@@ -17,6 +17,7 @@ header {
 #status { flex: 1; min-width: 12em; }
 #status.control { color: var(--accent); }
 #status.other { color: var(--warn); }
+#who { color: #9aa1ad; font-size: 12px; }
 .actions { display: flex; gap: 8px; }
 button {
   font: inherit; color: var(--fg); background: #2a2f3a; border: 1px solid #3a4150;
@@ -24,6 +25,14 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button[hidden] { display: none; }
+#windows {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 16px;
+  background: var(--bar); border-bottom: 1px solid #2a2e37; font-size: 12px;
+}
+#windows:empty { display: none; }
+#windows button { padding: 2px 8px; }
+#windows button.job { color: var(--warn); }
+#windows button[aria-pressed="true"] { border-color: var(--accent); background: #24364f; }
 #term {
   flex: 1; overflow: auto; padding: 8px 16px; outline: none;
   font: 14px/var(--lh) ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace;

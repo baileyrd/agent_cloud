@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 use ac_ctr::Exec;
 use ac_domain::{AgentId, State};
 use ac_fleet::Fleet;
+use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::{Hub, Terminal, ViewClient, ViewCommand, Writer};
 use ac_gateway::web::App;
 use ac_gateway::Api;
 use ac_ports::{PortError, Runtime, SessionStore};
+use ac_viewer::windows::{Target, WindowId};
 use platform::error::{ErrorKind, OsCode, PlatformError};
 use platform::fs::File;
 use platform::process::{Child, ExitStatus, Signal};
@@ -26,10 +28,21 @@ const TOKEN: &str = "s3cret";
 
 // ---- the fake tmux ---------------------------------------------------------------------------
 
+/// A window besides the agent's own (`@0 %0`, index 0, `bash`).
+struct FakeWindow {
+    id: &'static str,
+    pane: &'static str,
+    name: &'static str,
+    screen: Vec<String>,
+}
+
 #[derive(Default)]
 struct World {
     meta: String,
     screen: Vec<String>,
+    windows: Vec<FakeWindow>,
+    /// Targets of every `Terminal::capture` exec.
+    captures: Vec<String>,
     /// (writable client, command line) for every command any client received.
     commands: Vec<(bool, String)>,
     detached: Vec<String>,
@@ -69,6 +82,13 @@ impl Fake {
             .outputs
             .retain(|tx| tx.send(line.clone()).is_ok());
     }
+    /// A tmux notification on every read-only client.
+    fn notify(&self, line: &str) {
+        let line = format!("{line}\n").into_bytes();
+        self.world()
+            .outputs
+            .retain(|tx| tx.send(line.clone()).is_ok());
+    }
     fn sent(&self, writable: bool) -> Vec<String> {
         let w = self.world();
         w.commands
@@ -103,26 +123,24 @@ impl File for FakeIn {
             w.commands.push((self.writable, cmd.to_owned()));
             w.n += 1;
             let n = w.n;
-            let reply = if cmd == "detach-client" {
+            if cmd == "detach-client" {
                 self.alive.set(false);
                 self.out = None;
                 continue;
-            } else if cmd.contains("client_name") {
-                vec!["client-7".to_owned()]
-            } else if cmd.starts_with("display") {
-                vec![w.meta.clone()]
-            } else if cmd.starts_with("capture-pane") {
-                w.screen.clone()
+            }
+            let reply = if cmd.contains("client_name") {
+                Some(vec!["client-7".to_owned()])
             } else {
-                Vec::new()
+                w.answer(cmd)
             };
             if let Some(out) = &self.out {
                 let mut text = format!("%begin 1 {n} 1\n");
-                for l in reply {
-                    text.push_str(&l);
+                for l in reply.iter().flatten() {
+                    text.push_str(l);
                     text.push('\n');
                 }
-                text.push_str(&format!("%end 1 {n} 1\n"));
+                let end = if reply.is_some() { "end" } else { "error" };
+                text.push_str(&format!("%{end} 1 {n} 1\n"));
                 let _ = out.send(text.into_bytes());
             }
         }
@@ -143,6 +161,42 @@ impl File for FakeIn {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+impl World {
+    /// tmux's reply to a view or capture command (`None`: `%error`). `display` of a missing
+    /// window prints blanks; `capture-pane` of one fails.
+    fn answer(&self, cmd: &str) -> Option<Vec<String>> {
+        if cmd.starts_with("list-windows") {
+            let mut list = vec!["@0 %0 0 1 bash".to_owned()];
+            for (i, x) in self.windows.iter().enumerate() {
+                list.push(format!("{} {} {} 0 {}", x.id, x.pane, i + 1, x.name));
+            }
+            return Some(list);
+        }
+        let target = cmd
+            .split(' ')
+            .skip_while(|a| *a != "-t")
+            .nth(1)
+            .unwrap_or("main");
+        let screen = match target {
+            "main" => Some(self.screen.clone()),
+            t => self
+                .windows
+                .iter()
+                .find(|x| x.id == t)
+                .map(|x| x.screen.clone()),
+        };
+        if cmd.starts_with("display") {
+            Some(vec![
+                screen.map_or("      ".to_owned(), |_| self.meta.clone())
+            ])
+        } else if cmd.starts_with("capture-pane") {
+            screen
+        } else {
+            Some(Vec::new())
+        }
     }
 }
 
@@ -251,6 +305,17 @@ impl Terminal for Fake {
     fn scrollback(&self, _: &AgentId) -> Result<Vec<String>, String> {
         Ok(vec!["older line".into()])
     }
+    fn capture(&self, _: &AgentId, target: Target) -> Result<Vec<String>, String> {
+        let mut w = self.world();
+        let t = target.to_string();
+        w.captures.push(t.clone());
+        let screen = w
+            .answer(&format!("capture-pane -p -e -t {t}"))
+            .ok_or("can't find window")?;
+        let mut out = vec![w.meta.clone(), format!("scrollback of {t}")];
+        out.extend(screen);
+        Ok(out)
+    }
     fn detach(&self, _: &AgentId, client: &str) -> Result<(), String> {
         let mut w = self.world();
         w.detached.push(client.to_owned());
@@ -345,11 +410,23 @@ impl Runtime for Rt {
 }
 
 fn serve(fake: &Fake, history: &std::path::Path, per_agent: usize, total: usize) -> SocketAddr {
-    let api = Api::new(Fleet::new(Rt, Store::default()), TOKEN).unwrap_or_else(|| panic!("api"));
+    let mut t = Tokens::default();
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    serve_with(fake, history, per_agent, total, Keys::new(t))
+}
+
+fn serve_with(
+    fake: &Fake,
+    history: &std::path::Path,
+    per_agent: usize,
+    total: usize,
+    keys: Keys,
+) -> SocketAddr {
+    let api = Api::new(Fleet::new(Rt, Store::default()));
     let hub = Hub::with_caps(fake.clone(), history.to_path_buf(), per_agent, total);
     let server = Server::bind_shared(
         "127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")),
-        App::new(api, hub),
+        App::new(api, hub, keys),
     )
     .unwrap_or_else(|e| panic!("bind: {e}"));
     let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
@@ -366,10 +443,21 @@ fn request(
     extra: &[&str],
     body: &str,
 ) -> (u16, String) {
+    request_as(addr, TOKEN, method, path, extra, body)
+}
+
+fn request_as(
+    addr: SocketAddr,
+    token: &str,
+    method: &str,
+    path: &str,
+    extra: &[&str],
+    body: &str,
+) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
     let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
     for h in extra {
@@ -392,16 +480,21 @@ fn request(
 struct Viewer {
     r: BufReader<TcpStream>,
     id: String,
+    token: String,
 }
 
 impl Viewer {
     fn open(addr: SocketAddr, agent: &str) -> Result<Self, u16> {
+        Self::open_as(addr, TOKEN, agent)
+    }
+
+    fn open_as(addr: SocketAddr, token: &str, agent: &str) -> Result<Self, u16> {
         let s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
         let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
         let mut w = s.try_clone().unwrap_or_else(|e| panic!("{e}"));
         let _ = write!(
             w,
-            "GET /api/v1/agents/{agent}/term HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+            "GET /api/v1/agents/{agent}/term HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n"
         );
         let mut r = BufReader::new(s);
         let mut status = String::new();
@@ -419,35 +512,41 @@ impl Viewer {
         let mut v = Self {
             r,
             id: String::new(),
+            token: token.to_owned(),
         };
         let hello = v.next().unwrap_or_default();
         v.id = hello.split('"').nth(7).unwrap_or_default().to_owned();
         Ok(v)
     }
 
-    /// The next NDJSON message (chunked framing removed); keep-alives skipped.
+    /// The next NDJSON message, keep-alives included (chunked framing removed).
+    fn next_any(&mut self) -> Option<String> {
+        let mut size = String::new();
+        self.r.read_line(&mut size).ok()?;
+        let n = usize::from_str_radix(size.trim(), 16).ok()?;
+        if n == 0 {
+            return None;
+        }
+        let mut chunk = vec![0u8; n + 2];
+        self.r.read_exact(&mut chunk).ok()?;
+        Some(String::from_utf8_lossy(&chunk[..n]).into_owned())
+    }
+
+    /// The next NDJSON message; keep-alives skipped.
     fn next(&mut self) -> Option<String> {
         loop {
-            let mut size = String::new();
-            self.r.read_line(&mut size).ok()?;
-            let n = usize::from_str_radix(size.trim(), 16).ok()?;
-            if n == 0 {
-                return None;
-            }
-            let mut chunk = vec![0u8; n + 2];
-            self.r.read_exact(&mut chunk).ok()?;
-            let msg = String::from_utf8_lossy(&chunk[..n]).into_owned();
+            let msg = self.next_any()?;
             if !msg.contains("\"t\":\"ping\"") {
                 return Some(msg);
             }
         }
     }
 
-    /// Read until a message containing `needle`.
+    /// Read until a message containing `needle`; fails after 5 s (checked at keep-alives too).
     fn until(&mut self, needle: &str) -> String {
         let end = Instant::now() + Duration::from_secs(5);
         while Instant::now() < end {
-            match self.next() {
+            match self.next_any() {
                 Some(m) if m.contains(needle) => return m,
                 Some(_) => {}
                 None => break,
@@ -457,15 +556,35 @@ impl Viewer {
     }
 
     fn post(&self, addr: SocketAddr, action: &str, body: &str) -> (u16, String) {
+        self.post_as(addr, &self.token, action, body)
+    }
+
+    fn post_as(&self, addr: SocketAddr, token: &str, action: &str, body: &str) -> (u16, String) {
         let path = format!("/api/v1/agents/a1/term/{}/{action}", self.id);
-        request(
+        request_as(
             addr,
+            token,
             "POST",
             &path,
             &[&format!("Origin: http://{addr}")],
             body,
         )
     }
+}
+
+/// Every line the shared view client may be sent, for the agent's window and `windows`.
+fn fixed_commands(windows: &[&str]) -> Vec<String> {
+    let mut targets = vec![Target::Active];
+    targets.extend(
+        windows
+            .iter()
+            .filter_map(|w| WindowId::parse(w).map(Target::Window)),
+    );
+    let mut all = vec![ViewCommand::ClientName, ViewCommand::ListWindows];
+    for t in targets {
+        all.extend([ViewCommand::CursorInfo(t), ViewCommand::Snapshot(t)]);
+    }
+    all.iter().map(|c| c.line().trim_end().to_owned()).collect()
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -624,14 +743,7 @@ fn watch_take_over_release_and_history() {
     drop(w);
     // The shared client heard nothing but the fixed view commands; the writer nothing but hex
     // keys and resizes.
-    let fixed: Vec<String> = [
-        ViewCommand::ClientName,
-        ViewCommand::CursorInfo,
-        ViewCommand::Snapshot,
-    ]
-    .iter()
-    .map(|c| c.line().trim_end().to_owned())
-    .collect();
+    let fixed = fixed_commands(&[]);
     let shared = fake.sent(false);
     assert!(shared.len() >= 5, "{shared:?}");
     assert!(
@@ -769,5 +881,195 @@ fn cross_origin_and_tokenless_requests_are_refused() {
     let (status, page) = request(addr, "GET", "/ui/a1", &[], "");
     assert_eq!(status, 200);
     assert!(page.contains("/ui/viewer.js"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn viewer_scopes_and_viewer_ids_belong_to_their_token() {
+    use std::os::unix::fs::MetadataExt;
+    let (fake, dir) = (Fake::new(), tmp("scopes"));
+    let _ = std::fs::create_dir_all(&dir);
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let file = TokenFile::new(dir.join("tokens"), me);
+    let make = |name: &str, scopes: &str| {
+        let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
+        file.create(name, scopes, Agents::All, 1)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let (watch, control) = (
+        make("watch", "viewer:read"),
+        make("ctl", "viewer:read,viewer:control"),
+    );
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let keys = Keys::new(t);
+    let addr = serve_with(&fake, &dir, 4, 16, keys.clone());
+
+    // viewer:read watches but never types or takes over.
+    let mut v = Viewer::open_as(addr, &watch, "a1").unwrap_or_else(|c| panic!("open {c}"));
+    v.until("\"t\":\"full\"");
+    for action in [
+        "takeover",
+        "takeover?force=true",
+        "release",
+        "keys",
+        "text",
+        "paste",
+        "resize?cols=80&rows=24",
+    ] {
+        assert_eq!(v.post(addr, action, "Enter").0, 403, "{action}");
+    }
+    // Another token cannot use this viewer's id, even with viewer:control (or admin).
+    assert_eq!(
+        v.post_as(addr, &control, "takeover", "").1,
+        r#"{"error":"no such viewer"}"#
+    );
+    assert_eq!(v.post_as(addr, TOKEN, "takeover", "").0, 404);
+    // Its own viewer, it can.
+    let c = Viewer::open_as(addr, &control, "a1").unwrap_or_else(|c| panic!("open {c}"));
+    assert_eq!(c.post(addr, "takeover", "").0, 200);
+    assert_eq!(c.post(addr, "text", "ls\n").0, 200);
+    assert_eq!(c.post(addr, "release", "").0, 200);
+    assert!(fake
+        .sent(true)
+        .iter()
+        .all(|l| l != "send-keys -t main -H 45 6e 74 65 72"));
+    let (_, history) = request(addr, "GET", "/api/v1/agents/a1/history", &[], "");
+    for line in [
+        "audit token=ctl action=takeover status=200",
+        "audit token=ctl action=release status=200",
+    ] {
+        assert!(history.contains(line), "{line} missing from {history}");
+    }
+    assert!(
+        !history.contains("action=text"),
+        "input is not audited per call"
+    );
+
+    // Revoking a token ends its open streams too (at the next message or keep-alive).
+    assert!(file.revoke("watch").is_ok());
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    keys.set(t);
+    let end = Instant::now() + Duration::from_secs(15);
+    while v.next().is_some() {
+        assert!(Instant::now() < end, "revoked token's stream still open");
+    }
+    assert_eq!(
+        c.post(addr, "takeover", "").0,
+        200,
+        "other tokens unaffected"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_viewer_picks_a_window_without_moving_the_agent_and_falls_back_when_it_closes() {
+    let (fake, dir) = (Fake::new(), tmp("windows"));
+    fake.world().windows.push(FakeWindow {
+        id: "@3",
+        pane: "%5",
+        name: "job-6b941feec45a4c25",
+        screen: vec!["job says hi".into(), String::new(), String::new()],
+    });
+    let addr = serve(&fake, &dir, 4, 16);
+    let mut a = Viewer::open(addr, "a1").unwrap_or_else(|c| panic!("open {c}"));
+    let list = a.until("\"t\":\"windows\"");
+    assert_eq!(
+        list,
+        "{\"t\":\"windows\",\"list\":[{\"id\":\"@0\",\"index\":0,\"name\":\"bash\",\"active\":true,\"job\":false},\
+         {\"id\":\"@3\",\"index\":1,\"name\":\"job-6b941feec45a4c25\",\"active\":false,\"job\":true}]}\n"
+    );
+    a.until("\"t\":\"full\"");
+    let mut b = Viewer::open(addr, "a1").unwrap_or_else(|c| panic!("open {c}"));
+    assert!(
+        b.until("\"t\":\"windows\"").contains("@3"),
+        "late viewers get the list"
+    );
+    b.until("\"t\":\"full\"");
+
+    // Hostile or unknown ids are refused before anything is built; nothing reaches tmux.
+    let huge = format!("@{}", "9".repeat(100_000));
+    for body in [
+        "@1;kill-server",
+        "@3;kill-server",
+        "@3 ",
+        "%5",
+        "%1",
+        "",
+        "@7",
+        "@03",
+        huge.as_str(),
+        "@\u{0663}",
+        "\u{ff20}3",
+        "Active",
+    ] {
+        assert_eq!(a.post(addr, "window", body).0, 400, "{body:?}");
+    }
+    assert!(fake.world().captures.is_empty());
+
+    // a watches the job's window; b still watches the agent's.
+    assert_eq!(
+        a.post(addr, "window", "@3"),
+        (200, r#"{"window":"@3"}"#.into())
+    );
+    assert!(a.until("\"t\":\"target\"").contains("\"@3\""));
+    let full = a.until("\"t\":\"full\"");
+    assert!(
+        full.contains("job says hi") && full.contains("scrollback of @3"),
+        "{full}"
+    );
+    fake.world().windows[0].screen[1] = "job line 2".into();
+    fake.world().screen[1] = "agent line 2".into();
+    fake.output(r"x");
+    assert!(a.until("\"t\":\"delta\"").contains("job line 2"));
+    assert!(b.until("\"t\":\"delta\"").contains("agent line 2"));
+
+    // A taker types into the active pane of the window it watches, by the pane id from the list.
+    assert_eq!(a.post(addr, "takeover", "").0, 200);
+    assert_eq!(a.post(addr, "text", "q").0, 200);
+    wait_for("typed into the job's pane", || !fake.sent(true).is_empty());
+    assert_eq!(fake.sent(true), ["send-keys -t %5 -H 71"]);
+
+    // The window closes: the new list, then a falls back to the agent's window, and so does its
+    // input.
+    fake.world().windows.clear();
+    fake.notify("%window-close @3");
+    assert_eq!(a.until("\"t\":\"windows\"").matches("\"id\"").count(), 1);
+    assert!(a.until("\"t\":\"target\"").contains("null"));
+    assert!(a.until("\"t\":\"full\"").contains("agent line 2"));
+    assert_eq!(a.post(addr, "text", "r").0, 200);
+    wait_for("typed into main", || fake.sent(true).len() >= 2);
+    assert_eq!(fake.sent(true)[1], "send-keys -t main -H 72");
+    assert_eq!(a.post(addr, "window", "@3").0, 400, "no longer listed");
+    assert_eq!(a.post(addr, "window", "active").0, 200);
+
+    // Closed between the list and the pick: the capture fails, the viewer stays put.
+    fake.world().windows.push(FakeWindow {
+        id: "@4",
+        pane: "%6",
+        name: "w",
+        screen: vec![String::new(); 3],
+    });
+    fake.notify("%window-add @4");
+    a.until("\"id\":\"@4\"");
+    fake.world().windows.clear();
+    assert_eq!(a.post(addr, "window", "@4").0, 409);
+
+    // Nobody ran select-window; the shared client heard only the fixed set; picks captured only
+    // `main` and listed ids.
+    let fixed = fixed_commands(&["@3", "@4"]);
+    for line in fake.sent(false) {
+        assert!(
+            fixed.contains(&line) || line == "detach-client",
+            "shared client got {line:?}"
+        );
+    }
+    assert!(fake
+        .sent(true)
+        .iter()
+        .all(|l| l.starts_with("send-keys -t ") && !l.contains("select")));
+    assert_eq!(fake.world().captures, ["@3", "main", "@4"]);
+    drop((a, b));
     let _ = std::fs::remove_dir_all(dir);
 }

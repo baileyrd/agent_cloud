@@ -11,6 +11,8 @@ After=containerd.service ac-agentfw.service network-online.target
 EnvironmentFile=/etc/agent-cloud/gateway.env
 UnsetEnvironment=AC_ALLOW_PUBLIC_BIND
 ExecStart=/usr/local/bin/ac-gateway
+# Re-read /etc/agent-cloud/tokens now (it is also re-read within a second of any change).
+ExecReload=/usr/bin/kill -HUP $MAINPID
 Restart=on-failure
 UMask=0077
 NoNewPrivileges=yes

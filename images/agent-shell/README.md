@@ -1,7 +1,8 @@
 # agent-shell image
 
 Fedora 44 with Node, git, ripgrep, tmux, vim and Claude Code, running as `agent` (uid 1000, no sudo). The
-container sleeps; you attach to it, or watch it in a browser: the gateway's terminal viewer creates and shows
+container sleeps under `tini`, its PID 1, which reaps orphaned processes (a killed job's, for example), so they
+never pile up as zombies. You attach to it, or watch it in a browser: the gateway's terminal viewer creates and shows
 the tmux session `main` ([docs/install.md, Terminal viewer](../../docs/install.md#host-services)). Desktop,
 browser and the agent API come later.
 
@@ -56,8 +57,8 @@ Agents reach the internet only through the egress proxy `ac-egress` on the bridg
 hosts on its allowlist (ADR-007). The image sets `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (and their lowercase
 forms, since curl reads only a lowercase `http_proxy`). These are a convenience: the host firewall drops every
 direct connection, so a program that ignores them fails instead of bypassing the proxy. The image also sets
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `ENABLE_CLAUDEAI_MCP_SERVERS=false`, so Claude Code contacts
-only its API. Without them it also tried telemetry and the owner's claude.ai connectors (Gmail, Drive and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `ENABLE_CLAUDEAI_MCP_SERVERS=false` and `DISABLE_AUTOUPDATER=1`
+(no self-update from downloads.claude.ai; rebuild the image to upgrade), so Claude Code contacts only its API. Without them it also tried telemetry and the owner's claude.ai connectors (Gmail, Drive and
 others, through the agent's login). Agents pick up the image's variables only when their VM starts: after
 rebuilding, `pause` then `resume` each agent (or create it again).
 

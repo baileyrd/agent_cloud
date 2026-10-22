@@ -249,12 +249,48 @@ public bind is refused, and `IPAddressDeny`/`IPAddressAllow` drop traffic to or 
 cargo build --release -p ac-gateway
 sudo install -m 0755 target/release/ac-gateway /usr/local/bin/
 sudo install -m 0600 deploy/gateway.env /etc/agent-cloud/gateway.env      # edit AC_BIND / AC_IMAGE
-sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /etc/agent-cloud/gateway.token'
+# The owner's admin token. It is printed once and only its digest is stored; keep it in a root-only
+# file for the host scripts (post-reboot-check.sh and ac-job.sh read it from there).
+sudo sh -c 'umask 077; ac-gateway token create owner --scopes admin > /etc/agent-cloud/owner.token'
 sudo install -m 0644 deploy/ac-gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ac-gateway
-TOKEN=$(sudo cat /etc/agent-cloud/gateway.token)
+TOKEN=$(sudo cat /etc/agent-cloud/owner.token)
 curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1
 ```
+
+**API tokens** (ADR-011): every caller gets its own token, with scopes and agents. Scopes: `agents:read`
+(status, list), `agents:write` (create, pause, resume, destroy, purge), `jobs:read`, `jobs:write` (submit,
+cancel), `viewer:read` (watch, history), `viewer:control` (take over, type), `admin` (everything). The route
+table is in [ADR-011](decisions.md#adr-011-scoped-api-tokens). Tokens live in `/etc/agent-cloud/tokens` (root,
+0600) as digests; the commands below edit only that file, so they work while the gateway runs, which picks
+the change up within a second (or at once with `sudo systemctl reload ac-gateway`).
+
+```bash
+sudo ac-gateway token create ci-a1 --scopes jobs:read,jobs:write --agents a1   # prints the token once
+sudo ac-gateway token create watcher --scopes viewer:read                       # every agent (--agents '*')
+sudo ac-gateway token list          # NAME SCOPES AGENTS CREATED; never digests or tokens
+sudo ac-gateway token revoke ci-a1
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/whoami
+# {"name":"owner","scopes":["admin"],"agents":"*"}
+```
+
+A token gets 403 for a route outside its scopes and 404 for an agent outside its list (so it cannot tell which
+agents exist); `GET /api/v1/agents` lists only its agents. Failures are logged with the token's name, or for an
+unknown token the first 8 hex digits of its SHA-256, never the token (`journalctl -u ac-gateway | grep auth:`).
+Every state-changing call is logged as `audit token=<name> action=<...> status=<code>` there and in the agent's
+history. A tokens file that is unreadable, not 0600, not root's or malformed stops the gateway at startup (and
+is ignored, with a log line, if it turns up later); fix it and start again.
+
+*Migrating from `AC_TOKEN_FILE`* (hosts set up before ADR-011). Nothing breaks on upgrade: the old token keeps
+working as an `admin` token for every agent named `legacy`, and the gateway logs that it is deprecated. To move
+off it:
+1. `sudo sh -c 'umask 077; ac-gateway token create owner --scopes admin > /etc/agent-cloud/owner.token'`, and a
+   scoped token for each other caller (a script that only runs jobs gets `jobs:read,jobs:write` for its agents).
+2. Point clients at their token: the viewer page asks for it; `scripts/ac-job.sh` takes `AC_TOKEN` or reads
+   `owner.token`; `scripts/post-reboot-check.sh` reads `owner.token` once `AC_TOKEN_FILE` is gone.
+3. Remove `AC_TOKEN_FILE` from `/etc/agent-cloud/gateway.env`, `sudo systemctl restart ac-gateway`, then
+   `sudo shred -u /etc/agent-cloud/gateway.token`.
+`AC_TOKEN_FILE` will be removed in a later release.
 
 **Terminal viewer** (ADR-006): served by the gateway, nothing else to install. Agents need an image with tmux
 (`images/agent-shell` has it since 2026-10-20); a paused agent picks up a re-imported image when it is resumed.
@@ -264,20 +300,29 @@ How to use it:
    `ssh -N -L 8780:127.0.0.1:8780 -p 30556 baileyrd@192.168.50.196` (in general:
    `ssh -N -L 8780:127.0.0.1:8780 [-p <ssh-port>] <user>@<host>`). With `AC_BIND` on a tailnet address,
    skip the tunnel and use that address instead of `localhost`.
-2. Open `http://localhost:8780/ui/<agent-id>` (for example `http://localhost:8780/ui/a1`). The page asks for the
-   gateway token (`sudo cat /etc/agent-cloud/gateway.token`) and keeps it in memory only: reloading asks again.
+2. Open `http://localhost:8780/ui/<agent-id>` (for example `http://localhost:8780/ui/a1`). The page asks for a
+   token with `viewer:read` for that agent (or the owner's, `sudo cat /etc/agent-cloud/owner.token`), shows its
+   name and scopes, and keeps it in memory only: reloading asks again. Without `viewer:control` there is no
+   **Take over** button (and the gateway refuses take-over and input anyway).
 3. You watch the agent's tmux session `main`, view-only. **Take over** gives you the keyboard (paste works;
    the window follows your browser's size); **Release** hands it back. If another viewer has control you get
    **Force take over**. Closing the tab leaves the session running; the next viewer sees its scrollback.
-4. What was shown while someone watched, with take-over events: `GET /api/v1/agents/<id>/history?limit=N`
+   The bar under the header lists the session's windows (`*` marks the agent's current one; `job-*` windows
+   from the task API are highlighted). Click one to watch it, and while you have control your keys go to it;
+   **Follow agent** goes back to whichever window the agent has current. This is per page: the agent and other
+   viewers stay where they are (no `select-window`). If the window closes the page falls back to the agent's.
+4. What was shown while someone watched, with take-over and audit events: `GET /api/v1/agents/<id>/history?limit=N`
    (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
 
 The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off);
 a wedged one is logged (`journalctl -u ac-gateway | grep watchdog`) and freed by killing `ctr` clients, or
 reported as `"health":"unhealthy"` if that fails. Recordings live under `/var/lib/agent-cloud/history/` (0700).
 
-The gateway locks the data directory (`/var/lib/agent-cloud`), so stop it (`sudo systemctl stop ac-gateway`)
-before running `ac-ctl` against the same directory. Stopping the gateway leaves its agents running.
+The gateway locks the data directory (`/var/lib/agent-cloud`) while it runs. `ac-ctl` against the same directory
+then exits with code 3 and says so (`/var/lib/agent-cloud is in use by another process, normally ac-gateway ...:
+use the gateway API at http://<AC_BIND> with a token ..., or stop ac-gateway`); it never goes through the API on
+its own. Use the API with a token that has `agents:read`/`agents:write`, or stop the gateway
+(`sudo systemctl stop ac-gateway`) first. Stopping the gateway leaves its agents running.
 
 **After a host reboot** the registry still records agents as running, but containerd has no task for them.
 The gateway reconciles once at startup and logs each agent it changes
@@ -292,7 +337,7 @@ reboot, the gateway logged `reconcile: a1 had no VM; marked paused` and `scripts
 
 **Task API** (ADR-010): run a prompt in an agent as a job, with an id, live status and the result. Nothing to
 install; the gateway serves it. Jobs run `claude -p` in the agent's tmux session `main`, in a window named
-`job-<id>`, so you can watch one in the viewer (select the window with `Ctrl-b <n>` after **Take over**). Settings
+`job-<id>`, so you can watch one in the viewer (click it in the window list; `job-*` windows are highlighted). Settings
 in `gateway.env` (restart the gateway after a change):
 
 - `AC_JOB_PERMISSION_MODE`: `acceptEdits` (default), `auto`, `dontAsk`, `manual` or `plan`;
@@ -300,11 +345,12 @@ in `gateway.env` (restart the gateway after a change):
   `git` without push, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`);
 - `AC_JOB_UNSAFE=1`: `--dangerously-skip-permissions` instead. Read [security.md](security.md#task-api) first.
 
-With curl (the token goes to curl on stdin, not on its command line):
+With curl (the token goes to curl on stdin, not on its command line; it needs `jobs:read` and `jobs:write` for
+the agent):
 
 ```bash
-. <(sudo grep -E '^AC_(BIND|TOKEN_FILE)=' /etc/agent-cloud/gateway.env)
-H() { printf 'Authorization: Bearer %s\n' "$(sudo cat "$AC_TOKEN_FILE")"; }
+. <(sudo grep -E '^AC_BIND=' /etc/agent-cloud/gateway.env)
+H() { printf 'Authorization: Bearer %s\n' "$(sudo cat /etc/agent-cloud/owner.token)"; }
 J=http://$AC_BIND/api/v1/agents/a1/jobs
 H | curl -sS -H @- -d '{"prompt":"reply with exactly the word pong","timeout_secs":300}' $J
 # {"job_id":"6b941feec45a4c25","agent":"a1","state":"queued",...}         202
@@ -329,7 +375,10 @@ every agent the gateway lists (`GET /api/v1/agents`) is paused or destroyed and 
 containerd task or CNI lease left. Then it resumes `a1` through the gateway and, inside it, checks
 `claude auth status`, `claude -p`, the API through the proxy, a denied host (example.com) and an unreachable
 LAN address (192.168.50.1), and runs a job through the task API ("reply with exactly the word pong", expecting
-`succeeded`). It pauses `a1` again afterwards (`KEEP_A1=1` leaves it running). It takes about 30 s.
+`succeeded`). It submits that job with a throwaway token (`post-reboot-check-<pid>`, `jobs:read,jobs:write` for
+`a1`): 202 for the job, 403 for pause and take-over, 404 for `a2`, then 401 once it is revoked (it is revoked on
+every way out). It checks that `a1`'s PID 1 is `tini` and no zombie is left under it. It pauses `a1` again
+afterwards (`KEEP_A1=1` leaves it running). It takes about 30 s.
 
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).

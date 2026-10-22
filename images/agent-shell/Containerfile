@@ -1,5 +1,5 @@
 # Shell-only agent image: Fedora + Claude Code, runs as an unprivileged user.
-# The container stays up (sleep) and you attach with `ctr task exec`; see README.md.
+# The container stays up (sleep under tini) and you attach with `ctr task exec`; see README.md.
 FROM registry.fedoraproject.org/fedora:44
 
 # Pin for reproducible images: podman build --build-arg CLAUDE_CODE_VERSION=<x.y.z> ...
@@ -7,7 +7,7 @@ ARG CLAUDE_CODE_VERSION=latest
 
 RUN dnf install -y --setopt=install_weak_deps=False \
         nodejs npm git openssh-clients ripgrep jq procps-ng findutils which less tmux vim-minimal \
-        gcc gcc-c++ make python3 \
+        gcc gcc-c++ make python3 tini \
     && dnf clean all
 
 # Installed globally by root: the agent user cannot modify or self-update it.
@@ -19,6 +19,7 @@ RUN useradd --uid 1000 --user-group --create-home --home-dir /home/agent --shell
 
 # Claude Code keeps .claude.json, its login and sessions in CLAUDE_CONFIG_DIR. On the persistent
 # workspace they survive pause/resume and destroy; the image layer under $HOME does not.
+# DISABLE_AUTOUPDATER: never try to self-update from downloads.claude.ai (not allowlisted anyway).
 ENV HOME=/home/agent \
     CLAUDE_CONFIG_DIR=/workspace/.claude \
     DISABLE_AUTOUPDATER=1
@@ -35,4 +36,8 @@ ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 USER agent
 WORKDIR /workspace
 
+# tini is PID 1: it reaps orphans (a killed job's processes, a dead exec's children), which
+# `sleep infinity` as PID 1 never did, so they stayed zombies until the VM stopped. `ctr run` passes
+# no command, so containerd runs ENTRYPOINT + CMD.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sleep", "infinity"]

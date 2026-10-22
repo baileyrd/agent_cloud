@@ -15,7 +15,7 @@ use std::path::Path;
 
 use ac_domain::{AgentId, State};
 use ac_ports::{PortError, SessionStore};
-use rusty_multimodal_db_engine::dir_lock::DirLock;
+use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 use rusty_multimodal_db_engine::generic::mmap_store::GenericMmapStore;
 use rusty_multimodal_db_engine::generic::production::GenericProductionStore;
 use rusty_multimodal_db_engine::generic::traits::{
@@ -96,6 +96,10 @@ fn uuid_of(id: &AgentId) -> Uuid {
     Uuid::new_v5(&NAMESPACE, id.as_str().as_bytes())
 }
 
+/// [`PortError::op`] of [`EngineStore::open`] when another process (normally `ac-gateway`) holds
+/// the data directory.
+pub const IN_USE: &str = "data dir in use";
+
 /// Engine-backed registry of agents and their lifecycle state, and of jobs.
 pub struct EngineStore {
     store: GenericProductionStore<GenericMmapStore<AgentRecord, BySlug, ByState>>,
@@ -107,7 +111,10 @@ pub struct EngineStore {
 impl EngineStore {
     /// Open (or create) the registry in `dir`. Fails if another process holds it.
     pub fn open(dir: &Path) -> Result<Self, PortError> {
-        let lock = DirLock::acquire(dir, "agents.lock").map_err(|e| err("lock data dir", e))?;
+        let lock = DirLock::acquire(dir, "agents.lock").map_err(|e| match e {
+            DirLockError::Held(_) => err(IN_USE, e),
+            e => err("lock data dir", e),
+        })?;
         let path = dir.join(STORE_FILE);
         let core = if path.exists() {
             GenericMmapStore::open_portable(&path)
@@ -245,7 +252,7 @@ pub(crate) mod tests {
     fn second_open_of_same_dir_is_refused() {
         let dir = tmp();
         let _first = EngineStore::open(&dir).unwrap_or_else(|e| panic!("{e}"));
-        assert!(EngineStore::open(&dir).is_err());
+        assert_eq!(EngineStore::open(&dir).err().map(|e| e.op), Some(IN_USE));
         let _ = std::fs::remove_dir_all(dir);
     }
 

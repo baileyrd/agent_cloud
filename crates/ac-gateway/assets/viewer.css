@@ -17,6 +17,7 @@ header {
 #status { flex: 1; min-width: 12em; }
 #status.control { color: var(--accent); }
 #status.other { color: var(--warn); }
+#who { color: #9aa1ad; font-size: 12px; }
 .actions { display: flex; gap: 8px; }
 button {
   font: inherit; color: var(--fg); background: #2a2f3a; border: 1px solid #3a4150;

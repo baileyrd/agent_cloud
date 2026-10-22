@@ -13,7 +13,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 | Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
 | Agent attacks the viewer's browser | Only sanitised text and SGR colours reach the page; strict CSP; see [Viewer](#viewer) |
-| Network attacker reaches the API | Gateway on tailnet only, bearer token, TLS; no public port |
+| Network attacker reaches the API | Gateway on a private bind only (loopback, RFC 1918, tailnet), scoped bearer tokens ([API tokens](#api-tokens)); no public port |
+| A caller's token is stolen | Each caller has its own token, limited to scopes and agents, revocable alone; see [API tokens](#api-tokens) |
 | Runaway agent starves the host | Per-agent CPU/memory caps, disk quotas, concurrent-build limit |
 | Destructive commands | Command guard in the shell container (a backstop, not a boundary) |
 
@@ -49,6 +50,9 @@ may execute untrusted code or be steered by prompt injection from web content.
   where killing `ctr` clients frees it
 - [x] Task API: job state in the host registry, agent output served as inert text, prompts never in an
   argv, permission mode and tool list set by the operator (verified 2026-10-21, see [Task API](#task-api))
+- [x] One token per caller with the least scopes and agents it needs; tokens stored only as SHA-256 digests in
+  a root-only 0600 file; every route mapped to a scope by a table a test checks (ADR-011, see
+  [API tokens](#api-tokens))
 
 ## Credentials for model access
 
@@ -61,6 +65,26 @@ uid, so on a shared host rebuild the image with an otherwise unused uid and set 
 environment files. A request flow that asks the owner for a secret through a form, not
 chat, is worth building (Cloudroom's `cloud-secrets` skill is a reference).
 
+## API tokens
+
+Every call under `/api/` needs a bearer token from `/etc/agent-cloud/tokens` (ADR-011). Each token has a name,
+scopes and agents; the gateway stores only its SHA-256 digest, compares in constant time, and refuses to start
+with a tokens file that is unreadable, group/world accessible, not owned by root or malformed (no fallback to
+open). Logs carry the token's name, or for an unknown token the first 4 bytes of its digest; never the token
+or the `Authorization` header.
+
+What a stolen token gives its holder (on the private bind, until revoked):
+
+| Token | Can | Cannot |
+|---|---|---|
+| `jobs:read,jobs:write` for `a1` | Run prompts in a1, which with the default tool list means running code as a1's agent user inside a1's VM (see [Task API](#task-api)); read a1's job output; cancel a1's jobs | Pause, resume, destroy or purge any agent; watch or type into any terminal; read terminal history; see that other agents exist (404 for every other id, the list shows only a1) |
+| `viewer:read` | Watch the listed agents' terminals live and read their history, which shows whatever the agents printed, secrets included | Type, take over, run jobs or change any agent's state |
+| `viewer:control` (with `viewer:read`) | Take over the listed agents' shells: everything their agent users can do, including their logins | Change agent state or run jobs through the API (its shell access makes this moot inside those agents) |
+| `admin` (or the legacy `AC_TOKEN_FILE` token) | Everything on every agent: create, destroy and purge workspaces, run jobs, take over shells | Reach the host beyond what the agents' VMs and the egress allowlist allow |
+
+Revoke with `sudo ac-gateway token revoke <name>`; the gateway stops honouring it within a second. Audit lines
+(`audit token=<name> action=...`) in the journal and in each agent's history show what a token did.
+
 ## Viewer
 
 The terminal viewer (ADR-006) shows an agent's tmux session `main` and lets one viewer take over
@@ -68,7 +92,8 @@ its input.
 
 What it protects:
 - **The token** travels only in the `Authorization` header. The page asks for it and keeps it in
-  memory: never in the URL, a cookie or browser storage. There are no cookies, so a cross-site
+  memory: never in the URL, a cookie or browser storage. Watching needs `viewer:read`, taking over and
+  typing `viewer:control` (ADR-011); a viewer id works only with the token that opened it. There are no cookies, so a cross-site
   page cannot ride a session; Origin (and `Sec-Fetch-Site`) are checked on every request anyway.
   The page itself carries no data and is served without the token, since a browser cannot send a
   header when it navigates.
@@ -97,7 +122,7 @@ What it protects:
 What it does not protect:
 - **A take-over holder has full control of the agent's shell**, and so of everything the agent
   user can reach: its workspace, its Claude Code login (`/workspace/.claude`), its Git credentials.
-  Treat the token, and a take-over, as equivalent to agent access.
+  Treat a `viewer:control` token, and a take-over, as equivalent to agent access.
 - Anything the agent prints is shown and recorded, secrets included.
 - The gateway listens on loopback here; reach it through an SSH tunnel (encrypted) or a tailnet
   address. There is no TLS of its own.
@@ -108,9 +133,9 @@ What it does not protect:
 
 Jobs (ADR-010) run a prompt in an agent with `claude -p`.
 
-**Who can call it:** whoever holds the gateway token, on the private bind, as for the rest of the API. If
-you give the token to another agent so it can submit jobs, it can also pause, destroy and take over every
-agent: there is one token. A per-caller, per-agent token is future work.
+**Who can call it:** a token with `jobs:write` (submit, cancel) or `jobs:read` (status, output) for the agent,
+on the private bind (ADR-011). Give a script or another agent a token with just those scopes and just its
+agents: it cannot pause, destroy, watch or take over anything, nor learn which other agents exist.
 
 **What a job can do:** it runs as the agent user in that agent's VM, with its login, its workspace and its
 egress allowlist. A headless `claude` cannot ask for approval, so the gateway passes the operator's choice:
@@ -145,7 +170,10 @@ the agent user, by capped execs. Prompts are never in an argv; history records o
 - A container-in-VM boundary is only as strong as the hypervisor and guest kernel config.
   Keep Kata and the host kernel patched.
 - The command guard only blocks known-bad patterns.
-- One bearer token for everything: a caller of the task API can also run the lifecycle API and the viewer.
+- Tokens do not expire; revoke them. `admin` (and the deprecated legacy token) can do everything.
+- Failed authentications are limited per gateway (20 a minute are logged, then 429), not per source address:
+  rusty_serve does not tell handlers the peer's address. Tokens are 256-bit, so this bounds log volume rather
+  than guessing.
 - Egress control limits destinations, not content: an agent can still send data to an allowed
   host (a GitHub gist, a model API request). TLS is not inspected, so domain fronting on shared
   CDN addresses is possible. See ADR-007.

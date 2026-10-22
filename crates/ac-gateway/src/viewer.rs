@@ -7,7 +7,8 @@
 //! vocabulary is the closed [`ViewCommand`] enum, and the writer takes only [`Input`], whose
 //! bytes are sent as hex. (tmux's own `read-only` flag is not used: while such a client is
 //! attached, tmux refuses the agent's own tmux commands too.) Both wrap an [`Exec`], so their
-//! stdin never reaches EOF while they run. Routes (bearer token required):
+//! stdin never reaches EOF while they run. A viewer id works only with the token that opened it.
+//! Routes (scopes in [`crate::access`]):
 //! - `GET /api/v1/agents/{id}/term`: NDJSON stream ([`ac_viewer::screen`] messages);
 //! - `POST /api/v1/agents/{id}/term/{viewer}/{keys|text|paste|resize|takeover|release}`;
 //! - `GET /api/v1/agents/{id}/history?limit=N`: recorded output as plain text.
@@ -216,20 +217,46 @@ pub enum Answer {
 
 /// A viewer route.
 #[derive(Debug, PartialEq, Eq)]
-enum Route<'a> {
+pub(crate) enum Route<'a> {
     Stream(AgentId),
-    Action(AgentId, &'a str, &'a str),
+    Action(AgentId, &'a str, Action),
     History(AgentId),
 }
 
+/// What a viewer asks for under `term/{viewer}/`: a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    Takeover,
+    Release,
+    Keys,
+    Text,
+    Paste,
+    Resize,
+}
+
+impl Action {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "takeover" => Self::Takeover,
+            "release" => Self::Release,
+            "keys" => Self::Keys,
+            "text" => Self::Text,
+            "paste" => Self::Paste,
+            "resize" => Self::Resize,
+            _ => return None,
+        })
+    }
+}
+
 /// Parse a viewer route: `None` if `path` is not one (the lifecycle API handles it).
-fn route<'a>(method: &str, path: &'a str) -> Option<Result<Route<'a>, Reply>> {
+pub(crate) fn route<'a>(method: &str, path: &'a str) -> Option<Result<Route<'a>, Reply>> {
     let rest = path.strip_prefix("/api/v1/agents/")?;
     let parts: Vec<&str> = rest.split('/').collect();
     let (id, tail) = parts.split_first()?;
     let want = match tail {
         ["term"] | ["history"] => "GET",
-        ["term", _, _] => "POST",
+        ["term", v, a] if !v.is_empty() && Action::parse(a).is_some() => "POST",
+        ["term", _, _] => return Some(Err(error(404, "not found"))),
         _ => return None,
     };
     let id = match AgentId::parse(id) {
@@ -242,7 +269,7 @@ fn route<'a>(method: &str, path: &'a str) -> Option<Result<Route<'a>, Reply>> {
     Some(Ok(match tail {
         ["term"] => Route::Stream(id),
         ["history"] => Route::History(id),
-        [_, viewer, action] => Route::Action(id, viewer, action),
+        [_, viewer, action] => Route::Action(id, viewer, Action::parse(action)?),
         _ => return None,
     }))
 }
@@ -262,6 +289,8 @@ struct Inner {
 struct State {
     registry: Registry,
     views: HashMap<String, View>,
+    /// The token (name) each viewer id belongs to.
+    tokens: HashMap<String, String>,
     next_gen: u64,
 }
 
@@ -293,6 +322,7 @@ impl Hub {
                 state: Mutex::new(State {
                     registry: Registry::new(per_agent, total),
                     views: HashMap::new(),
+                    tokens: HashMap::new(),
                     next_gen: 0,
                 }),
                 recorder: Recorder {
@@ -313,23 +343,24 @@ impl Hub {
         self.inner.recorder.event(id, text);
     }
 
-    /// Answer a viewer route (`None`: not one). The caller has checked the token and Origin.
-    pub fn handle(&self, method: &str, target: &str, body: &[u8]) -> Option<Answer> {
+    /// Answer a viewer route (`None`: not one) for the token named `who`. The caller has checked
+    /// the token, its scope and Origin.
+    pub fn handle(&self, method: &str, target: &str, body: &[u8], who: &str) -> Option<Answer> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let route = match route(method, path)? {
             Ok(r) => r,
             Err(reply) => return Some(Answer::Json(reply)),
         };
         Some(match route {
-            Route::Stream(id) => self.open(&id),
+            Route::Stream(id) => self.open(&id, who),
             Route::History(id) => self.history(&id, query),
             Route::Action(id, viewer, action) => {
-                Answer::Json(self.action(&id, viewer, action, query, body))
+                Answer::Json(self.action(&id, viewer, action, query, body, who))
             }
         })
     }
 
-    fn open(&self, id: &AgentId) -> Answer {
+    fn open(&self, id: &AgentId, who: &str) -> Answer {
         let viewer = new_viewer_id();
         // Fetched before taking the lock: it is an exec. Fails harmlessly before the session exists.
         let scroll = self
@@ -365,7 +396,9 @@ impl Hub {
                 let _ = tx.try_send(screen::full(s, &scroll).into_bytes());
             }
             view.viewers.insert(viewer.clone(), tx);
-            (view.gen == gen).then_some(gen)
+            let start = (view.gen == gen).then_some(gen);
+            st.tokens.insert(viewer.clone(), who.to_owned());
+            start
         };
         if let Some(gen) = start {
             let inner = Arc::clone(&self.inner);
@@ -383,6 +416,7 @@ impl Hub {
     fn leave(&self, id: &AgentId, viewer: &str) {
         let detach = {
             let mut st = self.inner.lock();
+            st.tokens.remove(viewer);
             let event = st.registry.leave(id.as_str(), viewer);
             if let Some(e) = &event {
                 self.inner.recorder.event(id, &e.to_string());
@@ -406,13 +440,23 @@ impl Hub {
         }
     }
 
-    fn action(&self, id: &AgentId, viewer: &str, action: &str, query: &str, body: &[u8]) -> Reply {
+    fn action(
+        &self,
+        id: &AgentId,
+        viewer: &str,
+        action: Action,
+        query: &str,
+        body: &[u8],
+        who: &str,
+    ) -> Reply {
         let mut st = self.inner.lock();
-        if !st.registry.is_viewer(id.as_str(), viewer) {
+        if !st.registry.is_viewer(id.as_str(), viewer)
+            || st.tokens.get(viewer).map(String::as_str) != Some(who)
+        {
             return error(404, "no such viewer");
         }
         match action {
-            "takeover" => {
+            Action::Takeover => {
                 let force = query.split('&').any(|p| p == "force=true");
                 match st.registry.take_over(id.as_str(), viewer, force) {
                     Err(Held(o)) => {
@@ -436,7 +480,7 @@ impl Hub {
                     }
                 }
             }
-            "release" => match st.registry.release(id.as_str(), viewer) {
+            Action::Release => match st.registry.release(id.as_str(), viewer) {
                 None => error(409, "you do not have control"),
                 Some(e) => {
                     self.inner.recorder.event(id, &e.to_string());
@@ -447,7 +491,7 @@ impl Hub {
                     ok(r#"{"owner":null}"#)
                 }
             },
-            "keys" | "text" | "paste" | "resize" => {
+            Action::Keys | Action::Text | Action::Paste | Action::Resize => {
                 // View-only input is discarded here, before any command is built.
                 if !st.registry.may_write(id.as_str(), viewer) {
                     return error(403, "view-only: input discarded");
@@ -457,12 +501,12 @@ impl Hub {
                 };
                 let meta = view.screen.as_ref().map(|s| s.meta);
                 let input = match action {
-                    "keys" => input::keys(
+                    Action::Keys => input::keys(
                         &String::from_utf8_lossy(body),
                         meta.is_some_and(|m| m.app_cursor),
                     ),
-                    "text" => input::text(body),
-                    "paste" => input::paste(body, meta.is_some_and(|m| m.bracketed_paste)),
+                    Action::Text => input::text(body),
+                    Action::Paste => input::paste(body, meta.is_some_and(|m| m.bracketed_paste)),
                     _ => size(query).and_then(|(c, r)| input::resize(c, r)),
                 };
                 let input = match input {
@@ -476,7 +520,6 @@ impl Hub {
                     _ => error(503, "take-over client is gone"),
                 }
             }
-            _ => error(404, "not found"),
         }
     }
 
@@ -846,7 +889,11 @@ mod tests {
         );
         assert_eq!(
             route("POST", "/api/v1/agents/a1/term/v1/keys").map(Result::ok),
-            Some(Some(Route::Action(id(), "v1", "keys")))
+            Some(Some(Route::Action(id(), "v1", Action::Keys)))
+        );
+        assert_eq!(
+            route("POST", "/api/v1/agents/a1/term/v1/explode").map(|r| r.err().map(|e| e.status)),
+            Some(Some(404))
         );
         assert_eq!(
             route("POST", "/api/v1/agents/a1/term").map(|r| r.err().map(|e| e.status)),

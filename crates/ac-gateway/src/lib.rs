@@ -1,14 +1,17 @@
-//! Sans-IO gateway logic: auth, routing and error mapping over a [`Fleet`].
-//! The HTTP transport lives in `main.rs`, so every route is testable here.
+//! Sans-IO gateway logic: routing and error mapping over a [`Fleet`]. Tokens and scopes are
+//! checked before a request gets here ([`access`], [`tokens`]); the HTTP transport lives in
+//! `main.rs`, so every route is testable here.
 //!
-//! Routes (bearer token required): `GET /api/v1/agents` lists every agent and its state. Under
+//! Routes: `GET /api/v1/agents` lists the agents the token is for, and their state. Under
 //! `/api/v1/agents/{id}`: `GET` status, `POST` create, `POST .../pause`, `POST .../resume`, `DELETE` destroy (keeps the
 //! workspace; `DELETE ...?purge=true` removes it, also for an agent already destroyed). Pause and destroy of
 //! an agent with a queued or running job are refused (409) unless `?force=true`, which interrupts the job
 //! first (ADR-010).
 
+pub mod access;
 pub mod bind;
 pub mod jobs;
+pub mod tokens;
 pub mod viewer;
 pub mod web;
 
@@ -18,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use ac_domain::{AgentId, State};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::{Runtime, SessionStore};
+use tokens::Agents;
 
 const PREFIX: &str = "/api/v1/agents/";
 
@@ -28,26 +32,6 @@ pub struct Reply {
     pub status: u16,
     /// JSON document.
     pub body: String,
-}
-
-/// The owner's bearer token. Checked without any other lock, so viewer requests never wait on
-/// a slow lifecycle call.
-#[derive(Clone)]
-pub struct Auth(Arc<[u8]>);
-
-impl Auth {
-    /// `None` for an empty token.
-    pub fn new(token: &str) -> Option<Self> {
-        (!token.is_empty()).then(|| Self(token.as_bytes().into()))
-    }
-
-    /// Whether an `Authorization` header carries the token (`Bearer <token>`, exactly).
-    pub fn check(&self, authorization: Option<&str>) -> bool {
-        let presented = authorization
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .unwrap_or("");
-        constant_time_eq(presented.as_bytes(), &self.0)
-    }
 }
 
 /// Agents the watchdog found wedged (by id). Shared with [`Api`], which reports them.
@@ -75,23 +59,21 @@ impl Busy for NoJobs {
     fn forget(&self, _: &AgentId) {}
 }
 
-/// The authenticated lifecycle API.
+/// The lifecycle API.
 pub struct Api<R, S> {
     fleet: Fleet<R, S>,
-    auth: Auth,
     unhealthy: Unhealthy,
     jobs: Arc<dyn Busy>,
 }
 
 impl<R: Runtime, S: SessionStore> Api<R, S> {
-    /// Build from a fleet and the owner's bearer token (must be non-empty).
-    pub fn new(fleet: Fleet<R, S>, token: &str) -> Option<Self> {
-        Some(Self {
+    /// Serve `fleet`.
+    pub fn new(fleet: Fleet<R, S>) -> Self {
+        Self {
             fleet,
-            auth: Auth::new(token)?,
             unhealthy: Unhealthy::default(),
             jobs: Arc::new(NoJobs),
-        })
+        }
     }
 
     /// Ask `jobs` before pausing or destroying an agent.
@@ -111,11 +93,6 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         self
     }
 
-    /// The token checker, for routes outside this API.
-    pub fn auth(&self) -> Auth {
-        self.auth.clone()
-    }
-
     /// Agents recorded running, for the watchdog.
     pub fn running(&self) -> Vec<AgentId> {
         self.fleet
@@ -129,16 +106,14 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             .unwrap_or_default()
     }
 
-    /// Handle one request. Of the query string, only `purge` on `DELETE` and `force` on pause and
+    /// Handle one request from a token for `agents` (the list shows only those; the caller has
+    /// checked the rest). Of the query string, only `purge` on `DELETE` and `force` on pause and
     /// `DELETE` are read.
-    pub fn handle(&self, method: &str, target: &str, authorization: Option<&str>) -> Reply {
-        if !self.auth.check(authorization) {
-            return error(401, "unauthorized");
-        }
+    pub fn handle(&self, method: &str, target: &str, agents: &Agents) -> Reply {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         if path == PREFIX.trim_end_matches('/') {
             return match method {
-                "GET" => self.list(),
+                "GET" => self.list(agents),
                 _ => error(405, "method not allowed"),
             };
         }
@@ -185,10 +160,14 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         }
     }
 
-    fn list(&self) -> Reply {
+    fn list(&self, agents: &Agents) -> Reply {
         match self.fleet.list() {
             Ok(all) => {
-                let items: Vec<String> = all.iter().map(|(id, s)| self.record(id, *s)).collect();
+                let items: Vec<String> = all
+                    .iter()
+                    .filter(|(id, _)| agents.contains(id.as_str()))
+                    .map(|(id, s)| self.record(id, *s))
+                    .collect();
                 Reply {
                     status: 200,
                     body: format!(r#"{{"agents":[{}]}}"#, items.join(",")),
@@ -285,12 +264,6 @@ pub(crate) fn escape(s: &str) -> String {
         .collect()
 }
 
-/// Compare without early exit on the first differing byte.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
-    a.len() == b.len() && diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -351,15 +324,12 @@ mod tests {
         }
     }
 
-    const AUTH: Option<&str> = Some("Bearer s3cret");
-
     fn api(fail: bool) -> Api<Rt, Store> {
-        Api::new(Fleet::new(Rt { fail }, Store::default()), "s3cret")
-            .unwrap_or_else(|| panic!("token"))
+        Api::new(Fleet::new(Rt { fail }, Store::default()))
     }
 
     fn call(api: &Api<Rt, Store>, m: &str, t: &str) -> (u16, String) {
-        let r = api.handle(m, t, AUTH);
+        let r = api.handle(m, t, &Agents::All);
         (r.status, r.body)
     }
 
@@ -397,7 +367,11 @@ mod tests {
             r#"{"agents":[{"id":"a1","state":"paused"},{"id":"b2","state":"running"}]}"#
         );
         assert_eq!(call(&a, "POST", "/api/v1/agents").0, 405);
-        assert_eq!(a.handle("GET", "/api/v1/agents", None).status, 401);
+        let only_b2 = Agents::parse("b2,zz").unwrap_or(Agents::All);
+        assert_eq!(
+            a.handle("GET", "/api/v1/agents", &only_b2).body,
+            r#"{"agents":[{"id":"b2","state":"running"}]}"#
+        );
     }
 
     #[test]
@@ -418,20 +392,65 @@ mod tests {
         assert_eq!(call(&a, "DELETE", "/api/v1/agents/zz?purge=true").0, 404);
     }
 
+    /// Every route a handler accepts has an entry in the scope table, and every entry is a route
+    /// some handler accepts, over every path built from the table's words, a few ids and
+    /// strangers. (Accepted: answered with anything but "not found" or 405; 400 for a bad id
+    /// counts, since the shape is a route, unless the bad id is an empty segment, which no
+    /// placeholder matches.) A route added without an entry is unreachable anyway: the table is
+    /// checked first.
     #[test]
-    fn auth_is_required_and_exact() {
+    fn every_route_has_exactly_one_scope_entry() {
         let a = api(false);
-        for h in [
-            None,
-            Some("s3cret"),
-            Some("Bearer wrong"),
-            Some("Bearer s3cre"),
-            Some("bearer s3cret"),
-            Some("Bearer "),
-        ] {
-            assert_eq!(a.handle("GET", "/api/v1/agents/a1", h).status, 401, "{h:?}");
+        let mut words: Vec<&str> = access::ROUTES
+            .iter()
+            .flat_map(|r| r.path.split('/'))
+            .filter(|w| !w.is_empty() && !w.starts_with('{') && *w != "api" && *w != "v1")
+            .collect();
+        words.extend(["a1", "0123456789abcdef", "explode", ""]);
+        words.sort_unstable();
+        words.dedup();
+        let mut paths = vec!["/api/v1/agents".to_owned()];
+        for w in &words {
+            paths.push(format!("/api/v1/{w}"));
         }
-        assert!(Api::new(Fleet::new(Rt { fail: false }, Store::default()), "").is_none());
+        // Every tail of up to 3 words (the deepest routes), and each 3-word tail plus one more.
+        let mut tails = vec![String::new()];
+        for _ in 0..3 {
+            let longer: Vec<String> = tails
+                .iter()
+                .flat_map(|t| words.iter().map(move |w| format!("{t}/{w}")))
+                .collect();
+            for t in &longer {
+                paths.push(format!("/api/v1/agents/a1{t}"));
+            }
+            tails = longer;
+        }
+        for t in &tails {
+            paths.push(format!("/api/v1/agents/a1{t}/cancel"));
+        }
+        let handled = |m: &str, p: &str| -> bool {
+            let empty = p.split('/').skip(1).any(str::is_empty);
+            let ours = |r: Option<Result<(), Reply>>| match r {
+                Some(Ok(())) => true,
+                Some(Err(e)) => e.status == 400 && !empty,
+                None => false,
+            };
+            let viewer = ours(viewer::route(m, p).map(|r| r.map(drop)));
+            let job = ours(jobs::route(m, p).map(|r| r.map(drop)));
+            let life = a.handle(m, p, &Agents::All);
+            let life = life.status != 405
+                && life.body != error(404, "not found").body
+                && !(life.status == 400 && empty);
+            viewer || job || life || (m == "GET" && p == web::WHOAMI)
+        };
+        let mut checked = 0;
+        for m in ["GET", "POST", "DELETE", "PUT"] {
+            for p in &paths {
+                assert_eq!(handled(m, p), access::find(m, p).is_ok(), "{m} {p}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 50_000, "{checked}");
     }
 
     #[test]

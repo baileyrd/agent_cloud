@@ -14,6 +14,7 @@ use ac_ctr::{CtrConfig, CtrRuntime};
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Answer, JobRunner, Jobs, Part, Probe, Route};
+use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::web::App;
 use ac_gateway::{Api, Busy};
@@ -627,13 +628,21 @@ impl ac_gateway::viewer::Terminal for NoTerm {
     }
 }
 
+fn legacy() -> Keys {
+    let mut t = Tokens::default();
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    Keys::new(t)
+}
+
 fn serve(r: &Rig) -> SocketAddr {
+    serve_with(r, legacy())
+}
+
+fn serve_with(r: &Rig, keys: Keys) -> SocketAddr {
     let fleet = Fleet::new(Rt, Arc::clone(&r.store));
-    let api = Api::new(fleet, TOKEN)
-        .unwrap_or_else(|| panic!("api"))
-        .with_jobs(r.jobs.clone());
+    let api = Api::new(fleet).with_jobs(r.jobs.clone());
     let hub = Hub::new(NoTerm, r.root.join("history"));
-    let app = App::new(api, hub).with_jobs(Arc::clone(&r.jobs));
+    let app = App::new(api, hub, keys).with_jobs(Arc::clone(&r.jobs));
     let server = Server::bind_shared("127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")), app)
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
@@ -643,11 +652,21 @@ fn serve(r: &Rig) -> SocketAddr {
 
 /// (status, headers, body).
 fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String, String) {
+    request_as(addr, TOKEN, method, path, body)
+}
+
+fn request_as(
+    addr: SocketAddr,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (u16, String, String) {
     let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
     let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = write!(
         s,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\
          Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -727,6 +746,205 @@ fn routes_over_http() {
         "cache-control: no-store",
     ] {
         assert!(head.contains(h), "{h} missing: {head}");
+    }
+}
+
+/// Tokens made as `ac-gateway token create` makes them, plus the legacy one.
+struct Scoped {
+    file: TokenFile,
+    keys: Keys,
+    jobs_a1: String,
+    viewer: String,
+    read_a1: String,
+}
+
+fn scoped(root: &Path) -> Scoped {
+    use std::os::unix::fs::MetadataExt;
+    let _ = std::fs::create_dir_all(root);
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let file = TokenFile::new(root.join("tokens"), me);
+    let make = |name: &str, scopes: &str, agents: &str| {
+        let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
+        let agents = Agents::parse(agents).unwrap_or_else(|e| panic!("{e}"));
+        file.create(name, scopes, agents, 1)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let jobs_a1 = make("jobs-a1", "jobs:read,jobs:write", "a1");
+    let viewer = make("watch", "viewer:read", "*");
+    let read_a1 = make("read-a1", "agents:read", "a1");
+    let keys = Keys::new(Tokens::default());
+    reload(&file, &keys);
+    Scoped {
+        file,
+        keys,
+        jobs_a1,
+        viewer,
+        read_a1,
+    }
+}
+
+/// What the gateway's watcher does when the file changes.
+fn reload(file: &TokenFile, keys: &Keys) {
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    keys.set(t);
+}
+
+#[test]
+fn scoped_tokens_over_http() {
+    let r = rig();
+    let t = scoped(&r.root);
+    let addr = serve_with(&r, t.keys.clone());
+    let status =
+        |token: &str, method: &str, path: &str| request_as(addr, token, method, path, "").0;
+    let base = "/api/v1/agents/a1";
+    let term = format!("{base}/term/0011223344556677");
+
+    // A jobs token for a1: its jobs, nothing else.
+    let (code, _, body) = request_as(
+        addr,
+        &t.jobs_a1,
+        "POST",
+        &format!("{base}/jobs"),
+        r#"{"prompt":"hi"}"#,
+    );
+    assert_eq!(code, 202, "{body}");
+    let job = field(&body, "job_id");
+    assert_eq!(
+        status(&t.jobs_a1, "GET", &format!("{base}/jobs/{job}")),
+        200
+    );
+    assert_eq!(status(&t.jobs_a1, "GET", &format!("{base}/jobs")), 200);
+    for (method, path) in [
+        ("POST", format!("{base}/pause")),
+        ("POST", format!("{base}/pause?force=true")),
+        ("POST", format!("{base}/resume")),
+        ("POST", base.to_owned()),
+        ("DELETE", base.to_owned()),
+        ("DELETE", format!("{base}?purge=true&force=true")),
+        ("GET", base.to_owned()),
+        ("GET", "/api/v1/agents".to_owned()),
+        ("GET", format!("{base}/term")),
+        ("GET", format!("{base}/history")),
+        ("POST", format!("{term}/takeover")),
+        ("POST", format!("{term}/takeover?force=true")),
+        ("POST", format!("{term}/keys")),
+    ] {
+        assert_eq!(
+            status(&t.jobs_a1, method, &path),
+            403,
+            "jobs token: {method} {path}"
+        );
+    }
+    // Other agents do not exist for it, whether they exist or not. (A wrong method is still 405:
+    // that depends on the path's shape alone.)
+    for (method, path) in [
+        ("GET", "/api/v1/agents/a2/jobs"),
+        ("POST", "/api/v1/agents/a2/jobs"),
+        ("POST", "/api/v1/agents/a2/pause"),
+        ("GET", "/api/v1/agents/a2"),
+        ("DELETE", "/api/v1/agents/a2"),
+        ("GET", "/api/v1/agents/zz/jobs"),
+        ("GET", "/api/v1/agents/..%2Fa1/jobs"),
+        ("GET", "/api/v1/agents/a2/term"),
+    ] {
+        assert_eq!(status(&t.jobs_a1, method, path), 404, "{method} {path}");
+    }
+    let (code, _, body) = request_as(addr, &t.jobs_a1, "GET", "/api/v1/whoami", "");
+    assert_eq!(
+        (code, body.as_str()),
+        (
+            200,
+            r#"{"name":"jobs-a1","scopes":["jobs:read","jobs:write"],"agents":["a1"]}"#
+        )
+    );
+    assert!(!body.contains(&t.jobs_a1));
+
+    // A viewer:read token watches and reads history, never types or takes over.
+    assert_eq!(status(&t.viewer, "GET", &format!("{base}/history")), 200);
+    for action in [
+        "takeover",
+        "takeover?force=true",
+        "release",
+        "keys",
+        "text",
+        "paste",
+        "resize?cols=80&rows=24",
+    ] {
+        assert_eq!(
+            status(&t.viewer, "POST", &format!("{term}/{action}")),
+            403,
+            "{action}"
+        );
+    }
+    assert_eq!(status(&t.viewer, "POST", &format!("{base}/jobs")), 403);
+    let (_, _, body) = request_as(addr, &t.viewer, "GET", "/api/v1/whoami", "");
+    assert_eq!(
+        body,
+        r#"{"name":"watch","scopes":["viewer:read"],"agents":"*"}"#
+    );
+
+    // The list shows a restricted token only its agents.
+    let (code, _, body) = request_as(addr, &t.read_a1, "GET", "/api/v1/agents", "");
+    assert_eq!(
+        (code, body.as_str()),
+        (200, r#"{"agents":[{"id":"a1","state":"running"}]}"#)
+    );
+    assert_eq!(status(&t.read_a1, "GET", "/api/v1/agents/a2"), 404);
+
+    // The legacy token still does everything; audit lines name the token, never the secret.
+    assert_eq!(status(TOKEN, "POST", "/api/v1/agents/a2/pause"), 200);
+    let (_, _, history) = request(addr, "GET", &format!("{base}/history"), "");
+    assert!(
+        history.contains(&format!(
+            "audit token=jobs-a1 action=job-submit job={job} status=202"
+        )),
+        "{history}"
+    );
+    let (_, _, history) = request(addr, "GET", "/api/v1/agents/a2/history", "");
+    assert!(
+        history.contains("audit token=legacy action=pause status=200"),
+        "{history}"
+    );
+    assert!(!history.contains(TOKEN) && !history.contains(&t.jobs_a1));
+    let refused = request_as(addr, &t.jobs_a1, "GET", &format!("{base}/history"), "");
+    assert_eq!(
+        refused.0, 403,
+        "denied calls are not audited in the agent's history"
+    );
+
+    // Revoked and reloaded: the token stops working; the others do not.
+    assert!(t.file.revoke("jobs-a1").is_ok());
+    reload(&t.file, &t.keys);
+    assert_eq!(status(&t.jobs_a1, "GET", &format!("{base}/jobs")), 401);
+    assert_eq!(status(&t.viewer, "GET", &format!("{base}/history")), 200);
+}
+
+#[test]
+fn failed_auth_is_limited_without_locking_out_valid_tokens() {
+    let r = rig();
+    let addr = serve(&r);
+    let codes: Vec<u16> = (0..25)
+        .map(|i| request_as(addr, &format!("guess{i}"), "GET", "/api/v1/agents", "").0)
+        .collect();
+    assert_eq!(codes[..19], [401; 19]);
+    assert!(codes[19..].iter().all(|c| *c == 429), "{codes:?}");
+    assert_eq!(request(addr, "GET", "/api/v1/agents", "").0, 200);
+    for hostile in [
+        "Bearer",
+        "Basic czNjcmV0",
+        "Bearer s3cret\u{0}",
+        "Bearer s3cret s3cret",
+    ] {
+        let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
+        let _ = write!(
+            s,
+            "GET /api/v1/agents HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {hostile}\r\nConnection: close\r\n\r\n"
+        );
+        let mut raw = String::new();
+        let _ = s.read_to_string(&mut raw);
+        let code: u16 = raw.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+        assert!(code == 429 || code == 400, "{hostile:?}: {raw}");
     }
 }
 

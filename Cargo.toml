@@ -23,5 +23,10 @@ platform-mock = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eee
 rusty_multimodal_db_engine = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
 rusty_serve = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
 rusty_http = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+# API tokens (ADR-011): SHA-256 digests, constant-time comparison, atomic 0600 rewrites. No deps
+# outside rusty_mill.
+rusty_sha2 = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+rusty_crypto_key = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+rusty_atomic_file = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
 # JSON request bodies (job API). No serde: its own Value and parser.
 rusty_json = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555", default-features = false, features = ["std"] }

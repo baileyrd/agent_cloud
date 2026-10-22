@@ -1,17 +1,33 @@
 //! The whole HTTP surface, in order: the Origin check (every request), the viewer page and its
 //! script and style (no data in them, so no token: a browser cannot send a header when it
-//! navigates), the viewer routes, the job routes, then the lifecycle API. Everything under `/api`
-//! needs the token.
+//! navigates), then under `/api/`: the token, the route's scope and agents ([`access`]), and the
+//! viewer, job or lifecycle handler. State-changing calls are audited: one line in the gateway's
+//! log and one event in the agent's history, with the token's name, never the token.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use ac_domain::AgentId;
 use ac_ports::{Runtime, SessionStore};
 use rusty_http::{HeaderMap, Method, StatusCode};
 use rusty_serve::{Request, Response, SharedHandler};
 
+use crate::access::{self, Failures, Rule, Verdict};
 use crate::jobs::{self, Jobs, Route};
+use crate::tokens::{Keys, Presented, Token};
 use crate::viewer::{Answer, Hub};
-use crate::{error, Api, Auth, Reply};
+use crate::{error, escape, Api, Reply};
+
+/// Who the caller is: name, scopes and agents, no secrets.
+pub const WHOAMI: &str = "/api/v1/whoami";
+/// Failed authentications logged per source per window; past it they get 429, unlogged.
+const FAIL_LIMIT: u32 = 20;
+const FAIL_WINDOW: Duration = Duration::from_secs(60);
+/// Sources tracked at once.
+const FAIL_SOURCES: usize = 1024;
+/// rusty_serve does not tell a handler the peer's address, so every failure counts against one
+/// source: the limit bounds log volume and does not single out an address (ADR-011).
+const SOURCE: &str = "any";
 
 const PAGE: &str = include_str!("../assets/viewer.html");
 const SCRIPT: &str = include_str!("../assets/viewer.js");
@@ -30,20 +46,23 @@ pub const CSP: &str =
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
     img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-/// The gateway's handler. Lifecycle calls take the API's lock; viewer calls never do.
+/// The gateway's handler. Lifecycle calls take the API's lock; token checks and viewer calls
+/// never do.
 pub struct App<R, S> {
     api: Mutex<Api<R, S>>,
-    auth: Auth,
+    keys: Keys,
+    failures: Failures,
     hub: Hub,
     jobs: Option<Arc<Jobs>>,
 }
 
 impl<R: Runtime, S: SessionStore> App<R, S> {
-    /// Serve `api` and `hub`.
-    pub fn new(api: Api<R, S>, hub: Hub) -> Self {
+    /// Serve `api` and `hub` to holders of `keys`.
+    pub fn new(api: Api<R, S>, hub: Hub, keys: Keys) -> Self {
         Self {
-            auth: api.auth(),
             api: Mutex::new(api),
+            keys,
+            failures: Failures::new(FAIL_WINDOW, FAIL_LIMIT, FAIL_SOURCES),
             hub,
             jobs: None,
         }
@@ -76,25 +95,118 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
         if let Some(asset) = asset(method, path) {
             return asset;
         }
-        if path.starts_with("/api/") && !self.auth.check(r.authorization) {
-            return json(error(401, "unauthorized"));
+        if !path.starts_with("/api/") {
+            return json(error(404, "not found"));
         }
-        match self.hub.handle(method, r.target, r.body) {
+        let keys = self.keys.get();
+        let token = match keys.find(r.authorization) {
+            Presented::Known(t) => t,
+            Presented::Missing => return self.refuse(method, path, "no bearer token"),
+            Presented::Unknown(prefix) => {
+                return self.refuse(method, path, &format!("unknown token sha256:{prefix}"))
+            }
+        };
+        let (rule, agent) = match access::find(method, path) {
+            Ok(found) => found,
+            Err(reply) => return json(reply),
+        };
+        if let Err(reply) = access::check(token, rule, agent) {
+            eprintln!(
+                "ac-gateway: auth: token {} refused ({}) for {method} {}",
+                token.name,
+                reply.status,
+                shown(path)
+            );
+            return json(reply);
+        }
+        let response = self.dispatch(method, path, r, token);
+        if let (Some(action), Some(agent)) = (rule.audit, agent) {
+            self.audit(token, rule, action, agent, r.target, &response);
+        }
+        response
+    }
+}
+
+impl<R: Runtime, S: SessionStore> App<R, S> {
+    /// 401, or 429 once a source has failed too often; logged with the token's digest prefix,
+    /// never the token or the header.
+    fn refuse(&self, method: &str, path: &str, why: &str) -> Response {
+        let path = shown(path);
+        match self.failures.fail(SOURCE, Instant::now()) {
+            Verdict::Log => {
+                eprintln!("ac-gateway: auth: {why} for {method} {path}");
+                json(error(401, "unauthorized"))
+            }
+            Verdict::Limit => {
+                eprintln!(
+                    "ac-gateway: auth: {why} for {method} {path}; {FAIL_LIMIT} failures in \
+                     {}s, further ones answered 429 and not logged",
+                    FAIL_WINDOW.as_secs()
+                );
+                json(error(429, "too many failed attempts"))
+            }
+            Verdict::Quiet => json(error(429, "too many failed attempts")),
+        }
+    }
+
+    fn dispatch(&self, method: &str, path: &str, r: &Request<'_>, token: &Token) -> Response {
+        if path == WHOAMI {
+            return json(whoami(token));
+        }
+        match self.hub.handle(method, r.target, r.body, &token.name) {
             Some(Answer::Json(reply)) => json(reply),
-            Some(Answer::Stream(stream)) => Response::stream("application/x-ndjson", stream),
+            Some(Answer::Stream(stream)) => Response::stream(
+                "application/x-ndjson",
+                Revocable {
+                    stream,
+                    keys: self.keys.clone(),
+                    token: token.clone(),
+                },
+            ),
             Some(Answer::Text(text)) => untrusted(text.into_bytes()),
             None => match jobs::route(method, path) {
                 Some(route) => self.job(route, r),
                 None => {
                     let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
-                    json(api.handle(method, r.target, r.authorization))
+                    json(api.handle(method, r.target, &token.agents))
                 }
             },
         }
     }
-}
 
-impl<R: Runtime, S: SessionStore> App<R, S> {
+    /// One line in the gateway log and an event in the agent's history: token name, action, its
+    /// flags, the job a submit created, the status. No prompt, body or terminal content.
+    fn audit(
+        &self,
+        token: &Token,
+        rule: &Rule,
+        action: &str,
+        agent: &str,
+        target: &str,
+        response: &Response,
+    ) {
+        let mut line = format!("audit token={} action={action}", token.name);
+        let query = target.split_once('?').map_or("", |(_, q)| q);
+        for flag in ["force=true", "purge=true"] {
+            if query.split('&').any(|p| p == flag) {
+                line.push_str(&format!(" {flag}"));
+            }
+        }
+        if rule.path.contains("{job}") {
+            let job = target.split('/').nth(6).unwrap_or_default();
+            line.push_str(&format!(" job={}", shown(job)));
+        } else if let Some(job) = created_job(response) {
+            line.push_str(&format!(" job={job}"));
+        }
+        let status = response.status.as_u16();
+        line.push_str(&format!(" status={status}"));
+        eprintln!("ac-gateway: {line} agent={}", shown(agent));
+        let known = !matches!(status, 400 | 404);
+        if let (true, Ok(id)) = (known, AgentId::parse(agent)) {
+            self.hub.note(&id, &line);
+        }
+    }
+
     /// A job route. A submit takes the lifecycle lock around the agent's state check and the
     /// queueing, so a pause cannot slip between them; the others never take it.
     fn job(&self, route: Result<Route, Reply>, r: &Request<'_>) -> Response {
@@ -118,6 +230,72 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             jobs::Answer::Output(bytes) => untrusted(bytes),
         }
     }
+}
+
+/// A viewer stream that ends once its token is revoked or changed (checked at every message and
+/// keep-alive, so within a few seconds of the reload). Ending it gives up the viewer's seat.
+struct Revocable {
+    stream: crate::viewer::Stream,
+    keys: Keys,
+    token: Token,
+}
+
+impl Iterator for Revocable {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        let msg = self.stream.next()?;
+        self.keys.get().holds(&self.token).then_some(msg)
+    }
+}
+
+/// `{"name","scopes","agents"}` of the caller's token.
+fn whoami(token: &Token) -> Reply {
+    let quoted = |v: Vec<String>| {
+        v.iter()
+            .map(|s| format!(r#""{}""#, escape(s)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let scopes = quoted(
+        token
+            .scopes
+            .names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    );
+    let agents = match &token.agents {
+        crate::tokens::Agents::All => r#""*""#.to_owned(),
+        crate::tokens::Agents::Only(ids) => {
+            format!(
+                "[{}]",
+                quoted(ids.iter().map(ToString::to_string).collect())
+            )
+        }
+    };
+    Reply {
+        status: 200,
+        body: format!(
+            r#"{{"name":"{}","scopes":[{scopes}],"agents":{agents}}}"#,
+            escape(&token.name)
+        ),
+    }
+}
+
+/// The job id in a submit's reply, if it is one.
+fn created_job(response: &Response) -> Option<String> {
+    let rusty_serve::Body::Json(body) = &response.body else {
+        return None;
+    };
+    let text = std::str::from_utf8(body).ok()?;
+    let id = text.split_once(r#""job_id":""#)?.1.split('"').next()?;
+    ac_domain::JobId::parse(id).ok().map(|j| j.to_string())
+}
+
+/// A request path for the log: control characters out, at most 200 characters.
+fn shown(path: &str) -> String {
+    escape(&path.chars().take(200).collect::<String>())
 }
 
 /// Agent-written bytes as plain text (see [`UNTRUSTED`]).

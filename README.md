@@ -57,7 +57,8 @@ Details: [docs/architecture.md](docs/architecture.md).
    kernel-differs isolation test (runbook Phases 0-3).
 6. Gateway: `ac-gateway` serves `GET /api/v1/agents` (every agent and its state),
    `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
-   with a bearer token. `DELETE` keeps the workspace; `DELETE ...?purge=true` removes it. Env: `AC_TOKEN_FILE` (mode 0600), `AC_IMAGE`, `AC_BIND` (private addresses
+   with a scoped bearer token (`ac-gateway token create|list|revoke`, ADR-011). `DELETE` keeps the workspace;
+   `DELETE ...?purge=true` removes it. Env: `AC_TOKENS` (default `/etc/agent-cloud/tokens`, 0600), `AC_IMAGE`, `AC_BIND` (private addresses
    only; default `127.0.0.1:8780`), `AC_DATA`. The terminal viewer is at `/ui/<agent-id>` (ADR-006; how to open it:
    [docs/install.md, Terminal viewer](docs/install.md#host-services)). Not yet: the agent API (AG-UI) and desktop viewer.
    systemd units for the gateway, the agent firewall and the egress proxy (`ac-egress`, ADR-007): [docs/install.md, Host services](docs/install.md#host-services).

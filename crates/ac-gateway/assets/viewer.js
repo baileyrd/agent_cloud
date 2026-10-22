@@ -13,6 +13,7 @@
   const statusEl = $('status');
 
   let token = null;
+  let who = null;
   let viewer = null;
   let owner = null;
   let rows = [];
@@ -37,6 +38,8 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const controlling = () => viewer !== null && owner === viewer;
+  // The server refuses take-over and input without viewer:control; this only hides the buttons.
+  const mayControl = () => who !== null && (who.scopes.includes('viewer:control') || who.scopes.includes('admin'));
 
   function renderLine(div, runs) {
     div.replaceChildren(...runs.map(([text, fg, bg, attrs]) => {
@@ -98,9 +101,10 @@
     if (note && viewer !== null) text += ` ${note}`;
     statusEl.textContent = text;
     statusEl.className = cls;
-    $('take').hidden = viewer === null || controlling() || owner !== null;
-    $('force').hidden = viewer === null || controlling() || owner === null;
+    $('take').hidden = !mayControl() || viewer === null || controlling() || owner !== null;
+    $('force').hidden = !mayControl() || viewer === null || controlling() || owner === null;
     $('release').hidden = !controlling();
+    $('who').textContent = who ? `Token ${who.name}: ${who.scopes.join(', ')}` : '';
   }
 
   function handle(m) {
@@ -223,12 +227,30 @@
         }
       }
       try {
-        const r = await fetch(base, { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+        const auth = { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' };
+        if (!who) {
+          const w = await fetch('/api/v1/whoami', auth);
+          if (w.status === 401) {
+            token = null;
+            note = 'Wrong token.';
+            show();
+            continue;
+          }
+          if (!w.ok) throw new Error(`HTTP ${w.status}`);
+          who = await w.json();
+        }
+        const r = await fetch(base, auth);
         if (r.status === 401) {
           token = null;
+          who = null;
           note = 'Wrong token.';
           show();
           continue;
+        }
+        if (r.status === 403 || r.status === 404) {
+          note = r.status === 403 ? 'This token may not view this agent (needs viewer:read).' : 'No such agent for this token.';
+          show();
+          return;
         }
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.json()).error}`);
         const reader = r.body.getReader();

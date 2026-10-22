@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use ac_ctr::Exec;
 use ac_domain::{AgentId, State};
 use ac_fleet::Fleet;
+use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::{Hub, Terminal, ViewClient, ViewCommand, Writer};
 use ac_gateway::web::App;
 use ac_gateway::Api;
@@ -345,11 +346,23 @@ impl Runtime for Rt {
 }
 
 fn serve(fake: &Fake, history: &std::path::Path, per_agent: usize, total: usize) -> SocketAddr {
-    let api = Api::new(Fleet::new(Rt, Store::default()), TOKEN).unwrap_or_else(|| panic!("api"));
+    let mut t = Tokens::default();
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    serve_with(fake, history, per_agent, total, Keys::new(t))
+}
+
+fn serve_with(
+    fake: &Fake,
+    history: &std::path::Path,
+    per_agent: usize,
+    total: usize,
+    keys: Keys,
+) -> SocketAddr {
+    let api = Api::new(Fleet::new(Rt, Store::default()));
     let hub = Hub::with_caps(fake.clone(), history.to_path_buf(), per_agent, total);
     let server = Server::bind_shared(
         "127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")),
-        App::new(api, hub),
+        App::new(api, hub, keys),
     )
     .unwrap_or_else(|e| panic!("bind: {e}"));
     let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
@@ -366,10 +379,21 @@ fn request(
     extra: &[&str],
     body: &str,
 ) -> (u16, String) {
+    request_as(addr, TOKEN, method, path, extra, body)
+}
+
+fn request_as(
+    addr: SocketAddr,
+    token: &str,
+    method: &str,
+    path: &str,
+    extra: &[&str],
+    body: &str,
+) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
     let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
     for h in extra {
@@ -392,16 +416,21 @@ fn request(
 struct Viewer {
     r: BufReader<TcpStream>,
     id: String,
+    token: String,
 }
 
 impl Viewer {
     fn open(addr: SocketAddr, agent: &str) -> Result<Self, u16> {
+        Self::open_as(addr, TOKEN, agent)
+    }
+
+    fn open_as(addr: SocketAddr, token: &str, agent: &str) -> Result<Self, u16> {
         let s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
         let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
         let mut w = s.try_clone().unwrap_or_else(|e| panic!("{e}"));
         let _ = write!(
             w,
-            "GET /api/v1/agents/{agent}/term HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+            "GET /api/v1/agents/{agent}/term HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n"
         );
         let mut r = BufReader::new(s);
         let mut status = String::new();
@@ -419,6 +448,7 @@ impl Viewer {
         let mut v = Self {
             r,
             id: String::new(),
+            token: token.to_owned(),
         };
         let hello = v.next().unwrap_or_default();
         v.id = hello.split('"').nth(7).unwrap_or_default().to_owned();
@@ -457,9 +487,14 @@ impl Viewer {
     }
 
     fn post(&self, addr: SocketAddr, action: &str, body: &str) -> (u16, String) {
+        self.post_as(addr, &self.token, action, body)
+    }
+
+    fn post_as(&self, addr: SocketAddr, token: &str, action: &str, body: &str) -> (u16, String) {
         let path = format!("/api/v1/agents/a1/term/{}/{action}", self.id);
-        request(
+        request_as(
             addr,
+            token,
             "POST",
             &path,
             &[&format!("Origin: http://{addr}")],
@@ -769,5 +804,84 @@ fn cross_origin_and_tokenless_requests_are_refused() {
     let (status, page) = request(addr, "GET", "/ui/a1", &[], "");
     assert_eq!(status, 200);
     assert!(page.contains("/ui/viewer.js"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn viewer_scopes_and_viewer_ids_belong_to_their_token() {
+    use std::os::unix::fs::MetadataExt;
+    let (fake, dir) = (Fake::new(), tmp("scopes"));
+    let _ = std::fs::create_dir_all(&dir);
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let file = TokenFile::new(dir.join("tokens"), me);
+    let make = |name: &str, scopes: &str| {
+        let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
+        file.create(name, scopes, Agents::All, 1)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let (watch, control) = (
+        make("watch", "viewer:read"),
+        make("ctl", "viewer:read,viewer:control"),
+    );
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let keys = Keys::new(t);
+    let addr = serve_with(&fake, &dir, 4, 16, keys.clone());
+
+    // viewer:read watches but never types or takes over.
+    let mut v = Viewer::open_as(addr, &watch, "a1").unwrap_or_else(|c| panic!("open {c}"));
+    v.until("\"t\":\"full\"");
+    for action in [
+        "takeover",
+        "takeover?force=true",
+        "release",
+        "keys",
+        "text",
+        "paste",
+        "resize?cols=80&rows=24",
+    ] {
+        assert_eq!(v.post(addr, action, "Enter").0, 403, "{action}");
+    }
+    // Another token cannot use this viewer's id, even with viewer:control (or admin).
+    assert_eq!(
+        v.post_as(addr, &control, "takeover", "").1,
+        r#"{"error":"no such viewer"}"#
+    );
+    assert_eq!(v.post_as(addr, TOKEN, "takeover", "").0, 404);
+    // Its own viewer, it can.
+    let c = Viewer::open_as(addr, &control, "a1").unwrap_or_else(|c| panic!("open {c}"));
+    assert_eq!(c.post(addr, "takeover", "").0, 200);
+    assert_eq!(c.post(addr, "text", "ls\n").0, 200);
+    assert_eq!(c.post(addr, "release", "").0, 200);
+    assert!(fake
+        .sent(true)
+        .iter()
+        .all(|l| l != "send-keys -t main -H 45 6e 74 65 72"));
+    let (_, history) = request(addr, "GET", "/api/v1/agents/a1/history", &[], "");
+    for line in [
+        "audit token=ctl action=takeover status=200",
+        "audit token=ctl action=release status=200",
+    ] {
+        assert!(history.contains(line), "{line} missing from {history}");
+    }
+    assert!(
+        !history.contains("action=text"),
+        "input is not audited per call"
+    );
+
+    // Revoking a token ends its open streams too (at the next message or keep-alive).
+    assert!(file.revoke("watch").is_ok());
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    keys.set(t);
+    let end = Instant::now() + Duration::from_secs(15);
+    while v.next().is_some() {
+        assert!(Instant::now() < end, "revoked token's stream still open");
+    }
+    assert_eq!(
+        c.post(addr, "takeover", "").0,
+        200,
+        "other tokens unaffected"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

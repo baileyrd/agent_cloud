@@ -1,5 +1,5 @@
 #!/bin/sh
-# Collect host specs and estimate how many agents fit, using docs/sizing.md numbers.
+# Collect host specs and estimate how many agents fit, using the measured model in docs/sizing.md.
 # Read-only. Usage: scripts/capacity.sh [workspace-dir]   (default /var/lib/agent-cloud)
 set -u
 WS=${1:-/var/lib/agent-cloud}
@@ -24,18 +24,22 @@ printf 'kernel %s | virt: %s | selinux: %s | /dev/kvm: %s\n' "$(uname -r)" "$(sy
     "$(getenforce 2>/dev/null || echo n/a)" "$([ -c /dev/kvm ] && echo yes || echo NO)"
 . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"
 
-echo "== Capacity estimate (sizing.md: idle 2.2 GiB/0.2 core, active 5 GiB/1.5 core, disk 15 GB; host reserve 3 GiB + 1 core)"
+# Measured per-agent model (docs/sizing.md, 2026-10-22): a running agent ends up holding its guest's
+# default_memory + 0.15 GiB (guests never return memory), all of it in /dev/shm; ~0.05 core idle, one
+# core per vCPU when busy. Host reserve 4 GiB and 1 core.
+kata=/etc/kata-containers/configuration.toml
+vm_mib=$(sed -n 's/^default_memory = \([0-9]*\)$/\1/p' "$kata" 2>/dev/null | head -n 1)
+vcpus=$(sed -n 's/^default_vcpus = \([0-9]*\)$/\1/p' "$kata" 2>/dev/null | head -n 1)
+echo "== Capacity estimate (sizing.md model; default_memory ${vm_mib:-2048} MiB, default_vcpus ${vcpus:-1})"
 mem_gib=$(awk '/MemTotal/ {printf "%.1f", $2/1048576}' /proc/meminfo)
+shm_gib=$(df -k --output=size /dev/shm | tail -1 | awk '{printf "%.1f", $1/1048576}')
 cores=$(nproc)
-free_gb=$(df -BG --output=avail "$WS" | tail -1 | tr -dc '0-9')
-awk -v m="$mem_gib" -v c="$cores" -v d="$free_gb" 'BEGIN {
-    usable = m - 3; if (usable < 0) usable = 0
-    cpu = c - 1;    if (cpu < 0) cpu = 0
-    act_ram = int(usable / 5);   act_cpu = int(cpu * 3 / 1.5)   # 3x CPU overcommit
-    idle_ram = int(usable / 2.2); idle_cpu = int(cpu * 3 / 0.2)
-    disk = int((d - 20) / 15); if (disk < 0) disk = 0
-    printf "RAM %.1f GiB, %d cores, %d GB free for workspaces\n", m, c, d
-    printf "active at once : %d  (RAM %d, CPU %d, disk %d)\n", min3(act_ram, act_cpu, disk), act_ram, act_cpu, disk
-    printf "provisioned    : %d  (RAM %d, CPU %d, disk %d)\n", min3(idle_ram, idle_cpu, disk), idle_ram, idle_cpu, disk
-}
-function min3(a, b, c,   lo) { lo = a; if (b < lo) lo = b; if (c < lo) lo = c; return lo }'
+awk -v m="$mem_gib" -v shm="$shm_gib" -v c="$cores" -v vm="${vm_mib:-2048}" -v v="${vcpus:-1}" 'BEGIN {
+    per = vm / 1024 + 0.15
+    ram = int((m - 4) / per); if (ram < 0) ram = 0
+    sh = int(shm / (vm / 1024))
+    busy = int((c - 1) / v); if (busy < 0) busy = 0
+    printf "RAM %.1f GiB, /dev/shm %.1f GiB, %d cores\n", m, shm, c
+    printf "running agents : %d  (RAM %d, /dev/shm %d; idle CPU is not the limit)\n", (ram < sh ? ram : sh), ram, sh
+    printf "CPU-busy at once: %d  (rotational disk: 2, see sizing.md)\n", busy
+}'

@@ -315,6 +315,8 @@ vm_sample() {
     for a in "${AGENTS[@]}"; do p[$a]=$(vm_pids "$a" | tr '\n' ' '); t0[$a]=$(ticks ${p[$a]}); done
     nap "$2"
     for a in "${AGENTS[@]}"; do
+        # A VM whose processes went away (it died) is recorded as dead, not as a figure.
+        [ "$(vm_pids "$a" | tr '\n' ' ')" = "${p[$a]}" ] || { echo "$(date +%s),$1,${#AGENTS[@]},$a,dead,dead,dead" >> "$OUT/vm.csv"; continue; }
         set -- "$1" "$2" $(mem ${p[$a]})
         echo "$(date +%s),$1,${#AGENTS[@]},$a,$3,$4,$(awk -v d=$(( $(ticks ${p[$a]}) - t0[$a] )) -v s="$2" -v c="$CLK" 'BEGIN { printf "%.1f", 100 * d / c / s }')" >> "$OUT/vm.csv"
     done
@@ -381,7 +383,8 @@ cleanup() {
     nap 3
     state > "$OUT/state.after"
     left=$( { ctr -n "$NS" containers ls -q; ctr -n "$NS" tasks ls -q; ip netns; ls "$DATA/workspaces"
-              ps -eo args; } 2>&1 | grep -E 'bench-[0-9]{1,3}([^0-9-]|$)' )
+              ps -C qemu-system-x86_64,virtiofsd,containerd-shim-kata-v2,ctr -o args=; } 2>&1 |
+              grep -E 'bench-[0-9]{1,3}([^0-9-]|$)' )
     if [ -n "$left" ]; then echo "LEFT BEHIND:"; echo "$left"; fail=1
     else echo "no bench-* container, task, netns, workspace or process left"; fi
     if diff "$OUT/state.before" "$OUT/state.after" > "$OUT/state.diff"; then
@@ -414,10 +417,12 @@ summary() {
         END { for (k in c) printf "%-10s mem %6d swap %4d psi %5.1f/%5.1f %5.1f/%5.1f %5.1f load %5.2f busy %3.0f%% egress %d shm %d\n",
             k, ma[k], sw[k], ms[k], mf[k], is[k], if_[k], cs[k], l[k], b[k] / c[k], er[k], sh[k] }' \
         "$OUT/host.csv" | sort -k1,1 -k2,2n
-    echo "-- per VM per phase and N: mean RSS / PSS MiB, mean CPU % of one core, sum CPU %"
-    awk -F, 'NR > 1 { k = $2 " " $3; c[k]++; r[k] += $5; p[k] += $6; u[k] += $7 }
-        END { for (k in c) printf "%-10s rss %5.0f pss %5.0f cpu %5.1f%% sum %5.1f%%\n",
-            k, r[k] / c[k] / 1024, p[k] / c[k] / 1024, u[k] / c[k], u[k] }' "$OUT/vm.csv" | sort -k1,1 -k2,2n
+    echo "-- per VM per phase and N: mean RSS / PSS MiB, mean CPU % of one core, sum CPU %, VMs that died"
+    awk -F, 'NR > 1 { k = $2 " " $3; if ($5 == "dead") { d[k]++; c[k] += 0; next }
+            c[k]++; r[k] += $5; p[k] += $6; u[k] += $7 }
+        END { for (k in c) printf "%-10s rss %5.0f pss %5.0f cpu %5.1f%% sum %5.1f%% dead %d\n",
+            k, c[k] ? r[k] / c[k] / 1024 : 0, c[k] ? p[k] / c[k] / 1024 : 0, c[k] ? u[k] / c[k] : 0, u[k], d[k] }' \
+        "$OUT/vm.csv" | sort -k1,1 -k2,2n
 }
 
 # --- run ------------------------------------------------------------------------------------------
@@ -430,7 +435,7 @@ LAST=${STEPS[-1]}
 for n in "${STEPS[@]}"; do
     echo "== N=$n $(date +%T)"
     # Stop adding when the next agents would not fit: worst load-phase RSS seen so far per VM.
-    peak=$(awk -F, 'NR > 1 && $2 == "load" { if ($5 > m) m = $5 } END { print m + 0 }' "$OUT/vm.csv")
+    peak=$(awk -F, 'NR > 1 && $2 == "load" && $5 != "dead" { if ($5 > m) m = $5 } END { print m + 0 }' "$OUT/vm.csv")
     need=$(( (n - ${#AGENTS[@]}) * peak ))
     if [ $(( $(kib MemAvailable) - need )) -lt $((MEM_FLOOR_KIB + 1048576)) ]; then
         STOP="headroom: N=$n needs ~$((need / 1024)) MiB more, $(( $(kib MemAvailable) / 1024 )) MiB available"

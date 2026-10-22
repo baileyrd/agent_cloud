@@ -193,6 +193,25 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    exec runs). The gateway's `exec_once` holds a pipe open the same way, and `scripts/post-reboot-check.sh` uses
    the FIFO. To run a script, copy it into the workspace and run it there. (Measured 2026-10-20: `printf x |
    ctr task exec ... cat` wedged; this caused an earlier a1 freeze the same day.)
+9. **Size `/dev/shm` for the guests.** Kata keeps each guest's RAM in a file under `/dev/shm`
+   (`memory-backend-file,mem-path=/dev/shm`). The default size is half of RAM; when it fills, guests die with
+   `kvm run failed Bad address` while RAM is still free (measured, [sizing.md](sizing.md)). Make it MemTotal
+   minus an 8 GiB host reserve, in [`deploy/dev-shm.fstab`](../deploy/dev-shm.fstab). Recompute `size=` for
+   another host with `awk '/MemTotal/ {printf "%dM\n", $2/1024 - 8192}' /proc/meminfo`, then:
+   ```
+   findmnt /dev/shm                                         # note its options; keep them in the line
+   findmnt --verify --tab-file deploy/dev-shm.fstab         # the line parses
+   sudo cp -a /etc/fstab /etc/fstab.ac-bak
+   grep -v '^#' deploy/dev-shm.fstab | sudo tee -a /etc/fstab >/dev/null
+   sudo findmnt --verify                                    # the whole fstab still parses
+   sudo mount -o remount,size=15717M /dev/shm               # live; at boot systemd-remount-fs applies fstab
+   findmnt /dev/shm; df -h /dev/shm
+   ```
+   Running guests are unaffected by a remount that grows it. The gateway's admission control (ADR-012) reads the
+   new size at once. To undo: `sudo cp -a /etc/fstab.ac-bak /etc/fstab` (or delete the `/dev/shm` line) and
+   `sudo mount -o remount,size=50% /dev/shm`. `systemd-fstab-generator` makes no unit for `/dev/shm` (it leaves
+   kernel API filesystems to `systemd-remount-fs.service`), so there is no `dev-shm.mount` to check; only a
+   reboot exercises the boot path.
 
 ## Host services
 

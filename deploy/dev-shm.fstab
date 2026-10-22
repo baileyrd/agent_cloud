@@ -1,0 +1,8 @@
+# /dev/shm sized for agent guests (ADR-012), appended to /etc/fstab. Kata keeps every guest's RAM
+# in /dev/shm, whose default size is half of RAM; this makes it MemTotal minus an 8 GiB host
+# reserve. Compute the figure for a host with:
+#   awk '/MemTotal/ {printf "%dM\n", $2/1024 - 8192}' /proc/meminfo
+# (BaileyServ: 23909 MiB - 8192 = 15717M). At boot, systemd-remount-fs.service applies fstab's
+# options to the /dev/shm that PID 1 mounted; on a running host, remount it (docs/install.md).
+# Keep the options /dev/shm already has (findmnt /dev/shm) and change only size=.
+tmpfs  /dev/shm  tmpfs  nosuid,nodev,inode64,usrquota,size=15717M  0  0

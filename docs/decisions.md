@@ -519,6 +519,18 @@ How it works:
 `gateway.cpu_psi_max = 20` is marked measured because it rests on measured PSI (two 2-vCPU builds peaked at
 23.7); the gate set to 20 has not yet been exercised by a burst of real builds (roadmap).
 
+*Live (2026-10-23, BaileyServ, gateway running).* `sudo ac-ctl doctor --profile build`: 17 ok, 1 info (disk
+class), every finding measured, exit 0 (as a user: gateway.env and the firewall skipped, still exit 0). `tune`
+showed no changes. `--json` parsed with `python3 -m json.tool`. On copies of the live files with
+`default_memory = 4096`, `default_vcpus = 1`, `default_maxmemory` commented out, no PSI line and no fstab line
+(`--root`): doctor exit 2 (2 errors, 3 warnings); `tune --apply` wrote exactly those five edits, three backups
+equal to the copies, gateway.env still 0600, the rest of each file byte-identical; a second run changed nothing.
+With a1 running, `--apply` was refused naming a1 and wrote nothing. The gateway started on the untuned copy
+logged `settings differ ... default_maxmemory unset (0: all host RAM) -> 8192, default_vcpus 1 -> 2,
+default_memory 4096 -> 2048, AC_JOB_CPU_PSI_MAX unset (40) -> 20; run ac-ctl doctor`, and nothing on the live
+settings. `post-reboot-check.sh` passed with its new line. The facts file of the hypothetical 32 GiB / 8 core /
+NVMe host forecasts 11 agents at 2048 MiB and 4 builds at once (extrapolated).
+
 **Consequences:**
 - A new host gets its numbers, with their provenance, before anything is installed: `doctor --facts-file`.
 - On another shape most figures are `extrapolated`, and the doctor says so; the PSI limit stays at the default

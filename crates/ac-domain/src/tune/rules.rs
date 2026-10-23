@@ -100,14 +100,19 @@ pub enum Confidence {
     Measured,
     /// Derived from a rule; not measured on this shape of hardware.
     Extrapolated,
+    /// The figure it rests on was measured on this shape, but the setting's own effect was not:
+    /// `AC_JOB_CPU_PSI_MAX = 20` comes from the measured PSI of 2 builds (23.7), and the gate at
+    /// 20 has never run against a burst of real builds.
+    MeasuredInput,
 }
 
 impl Confidence {
-    /// `measured` or `extrapolated`.
+    /// `measured`, `extrapolated` or `measured input, gate unvalidated`.
     pub fn name(self) -> &'static str {
         match self {
             Self::Measured => "measured",
             Self::Extrapolated => "extrapolated",
+            Self::MeasuredInput => "measured input, gate unvalidated",
         }
     }
 }
@@ -327,10 +332,10 @@ pub fn vcpus_target(cores: u32) -> u64 {
     }
 }
 
-/// The job gate's CPU PSI limit for this shape, and whether it was measured.
+/// The job gate's CPU PSI limit for this shape, and how far it was measured.
 pub fn psi_target(cores: u32) -> (f64, Confidence) {
     if cores == MEASURED_CORES && vcpus_target(cores) == 2 {
-        (MEASURED_CPU_PSI_MAX, Confidence::Measured)
+        (MEASURED_CPU_PSI_MAX, Confidence::MeasuredInput)
     } else {
         (DEFAULT_CPU_PSI_MAX, Confidence::Extrapolated)
     }
@@ -682,12 +687,12 @@ fn cpu_psi(f: &HostFacts, env: &Env) -> Finding {
     let set = env.get("AC_JOB_CPU_PSI_MAX");
     let current = set.map_or_else(|| format!("unset ({DEFAULT_CPU_PSI_MAX})"), String::clone);
     let reason = match confidence {
-        Confidence::Measured => {
-            "4 cores, 2-vCPU guests: 2 builds peaked at CPU PSI 23.7, so 20 holds a burst at 2 \
-             (sizing.md, Jobs at once)"
-        }
         Confidence::Extrapolated => {
             "uncalibrated: run scripts/real-build-bench.sh to calibrate (only 4 cores were measured)"
+        }
+        _ => {
+            "4 cores, 2-vCPU guests: 2 builds peaked at CPU PSI 23.7 (measured), so 20 should hold \
+             a burst at 2; the gate at 20 has not run against real builds (sizing.md, Builds at once)"
         }
     };
     let base = finding(
@@ -712,12 +717,12 @@ fn cpu_psi(f: &HostFacts, env: &Env) -> Finding {
         return base;
     }
     match confidence {
-        Confidence::Measured => base
-            .status(Status::Warn)
-            .change(Change::Env("AC_JOB_CPU_PSI_MAX", target.to_string())),
         Confidence::Extrapolated => base.status(Status::Info).reason(
             "set by hand on an uncalibrated shape: keep it if scripts/real-build-bench.sh calibrated it",
         ),
+        _ => base
+            .status(Status::Warn)
+            .change(Change::Env("AC_JOB_CPU_PSI_MAX", target.to_string())),
     }
 }
 

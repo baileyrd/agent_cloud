@@ -473,8 +473,9 @@ would be on other hardware, or said which figures were measured and which were c
 - *Workload settings come from a profile backed by measurements.* `idle`, `build` (the default) or `heavy` sets
   `default_memory`; `AC_PROFILE` in `gateway.env` records the host's profile.
 - *Every recommendation is labelled.* It has a stable rule id, a one-line reason citing sizing.md or install.md,
-  and a confidence: `measured` (reproduces what sizing.md measured on the i5-3550, on a host of that shape) or
-  `extrapolated` (derived from a rule; not measured on this shape of hardware).
+  and a confidence: `measured` (reproduces what sizing.md measured on the i5-3550, on a host of that shape),
+  `extrapolated` (derived from a rule; not measured on this shape of hardware), or `measured input, gate
+  unvalidated` (the figure it rests on was measured on this shape, the setting's own effect was not).
 - *Nothing is applied silently.* `ac-ctl doctor` only reads. `ac-ctl tune` prints diffs; only `--apply` (root)
   writes, and the gateway only logs one line at startup when its settings differ.
 - *Neither takes the registry lock.* Both read files and `/proc`, so they work while `ac-gateway` runs.
@@ -512,18 +513,19 @@ How it works:
 | `kata.default_vcpus` | 2 at ≥ 4 cores, else 1; never above 2 | 4 cores |
 | `kata.default_memory` | idle 2048, build 2048, heavy 4096 | idle and build (any host); heavy never |
 | `gateway.max_running_jobs` | the core count (the default) | 4 cores |
-| `gateway.cpu_psi_max` | 20 on 4 cores with 2-vCPU guests, else the default 40, "uncalibrated" | 4 cores (see below) |
+| `gateway.cpu_psi_max` | 20 on 4 cores with 2-vCPU guests, else the default 40, "uncalibrated" | never: on 4 cores with 2 vCPUs it is `measured input, gate unvalidated` (see below) |
 | `disk.class` | information: the measured cold-start cost of a rotational disk | rotational |
 | `prereq.*` | `/dev/kvm`, vmx/svm, Kata config, initrd drop-in, fstab line = running mount, firewall, modes | (checks) |
 
-`gateway.cpu_psi_max = 20` is marked measured because it rests on measured PSI (two 2-vCPU builds peaked at
-23.7); the gate set to 20 has not yet been exercised by a burst of real builds (roadmap).
+`gateway.cpu_psi_max = 20` is `measured input, gate unvalidated`: the PSI it rests on was measured (two 2-vCPU
+builds peaked at 23.7), but the gate set to 20 has never run against a burst of real builds (roadmap). It
+becomes `measured` once that run shows it holds builds at 2.
 
 *Live (2026-10-23, BaileyServ, gateway running).* `sudo ac-ctl doctor --profile build`: 17 ok, 1 info (disk
-class), every finding measured, exit 0 (as a user: gateway.env and the firewall skipped, still exit 0). `tune`
+class), every finding measured, exit 0 (since relabelled: the PSI limit is `measured input, gate unvalidated`; as a user: gateway.env and the firewall skipped, still exit 0). `tune`
 showed no changes. `--json` parsed with `python3 -m json.tool`. On copies of the live files with
 `default_memory = 4096`, `default_vcpus = 1`, `default_maxmemory` commented out, no PSI line and no fstab line
-(`--root`): doctor exit 2 (2 errors, 3 warnings); `tune --apply` wrote exactly those five edits, three backups
+(`--root`): doctor exit 2 (2 errors, 3 warnings; errors exit 4 since); `tune --apply` wrote exactly those five edits, three backups
 equal to the copies, gateway.env still 0600, the rest of each file byte-identical; a second run changed nothing.
 With a1 running, `--apply` was refused naming a1 and wrote nothing. The gateway started on the untuned copy
 logged `settings differ ... default_maxmemory unset (0: all host RAM) -> 8192, default_vcpus 1 -> 2,

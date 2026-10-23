@@ -290,6 +290,15 @@ mod tests {
             v.pointer("/forecast/max_agents").and_then(Value::as_u64),
             Some(7)
         );
+        let psi = v.get("findings").and_then(Value::as_array).and_then(|fs| {
+            fs.iter()
+                .find(|f| f.get("rule").and_then(Value::as_str) == Some("gateway.cpu_psi_max"))
+        });
+        assert_eq!(
+            psi.and_then(|f| f.get("confidence"))
+                .and_then(Value::as_str),
+            Some("measured input, gate unvalidated")
+        );
         // The JSON reads back as the same facts.
         assert_eq!(factsjson::from_json(&j), Ok(r.facts.clone()));
         // A skipped fact shows as "skipped", its cause in WHY.

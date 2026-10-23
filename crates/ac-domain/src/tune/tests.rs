@@ -89,7 +89,7 @@ fn verdict(fs: &[Finding], rule: &str) -> (Status, String, Confidence) {
     (f.status, f.recommended.clone(), f.confidence)
 }
 
-use Confidence::{Extrapolated as X, Measured as M};
+use Confidence::{Extrapolated as X, Measured as M, MeasuredInput as MI};
 use Status::{Error as E, Info as I, Ok as K, Warn as W};
 
 #[test]
@@ -99,7 +99,13 @@ fn this_host_is_as_recommended_and_measured() {
         for f in &fs {
             let want = if f.rule == "disk.class" { I } else { K };
             assert_eq!(f.status, want, "{p:?} {f:?}");
-            assert_eq!(f.confidence, M, "{p:?} {f:?}");
+            // The PSI limit's input was measured; the gate at that limit was not.
+            let conf = if f.rule == "gateway.cpu_psi_max" {
+                MI
+            } else {
+                M
+            };
+            assert_eq!(f.confidence, conf, "{p:?} {f:?}");
             assert_eq!(f.change, None, "{p:?} {f:?}");
         }
         assert_eq!(worst(&fs), I);
@@ -152,7 +158,7 @@ fn shapes() {
             vec![
                 ("shm.size", K, "7850 MiB", X),
                 ("kata.default_vcpus", W, "2", M),
-                ("gateway.cpu_psi_max", W, "20", M),
+                ("gateway.cpu_psi_max", W, "20", MI),
             ],
             (3, 2),
         ),
@@ -391,7 +397,8 @@ fn vcpus_and_psi_boundaries() {
         ),
         (1, 1, 2, 2)
     );
-    assert_eq!(psi_target(4), (20.0, M));
+    assert_eq!(psi_target(4), (20.0, MI));
+    assert_eq!(MI.name(), "measured input, gate unvalidated");
     assert_eq!(psi_target(3), (40.0, X));
     assert_eq!(psi_target(5), (40.0, X));
     // A Kata config above 2 vCPUs: warned down to 2.

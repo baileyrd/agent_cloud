@@ -326,7 +326,8 @@ the next one starts. The two layers relate to the build measurements above like 
 
 `ac-ctl doctor` turns the figures above into rules over a host's facts; `ac-ctl tune` applies them
 ([install.md](install.md#host-settings-ac-ctl-doctor-and-ac-ctl-tune-adr-014)). A recommendation is `measured` only
-where it reproduces a measurement on this shape of host; elsewhere it is `extrapolated`.
+where it reproduces a measurement on this shape of host; elsewhere it is `extrapolated`. The PSI limit is a third
+case, `measured input, gate unvalidated`: its input was measured here, its effect as a gate was not.
 
 | Rule | From | Measured | Carried over |
 |---|---|---|---|
@@ -335,7 +336,7 @@ where it reproduces a measurement on this shape of host; elsewhere it is `extrap
 | `default_vcpus` = 2 at ≥ 4 cores, else 1, never above 2 | Builds at once: 2 vCPUs ~40% faster, 3 builds at 2 vCPUs 7% slower | 4 cores | any other core count; more than 2 vCPUs per guest was never run |
 | `default_memory` idle 2048, build 2048, heavy 4096 | Claude Code ~475 MiB used; this repo's builds 468 MiB used, ≥ 65% free | idle, build | heavy: bigger builds were not measured |
 | `AC_MAX_RUNNING_JOBS` = cores | ADR-013, Jobs at once | 4 cores | other core counts |
-| `AC_JOB_CPU_PSI_MAX` = 20 on 4 cores with 2-vCPU guests, else 40 | Builds at once: 2 builds peaked at CPU PSI 23.7, 3 at 59.9 | 4 cores, 2 vCPUs (the PSI; the gate at 20 is not yet exercised) | every other shape: the default 40, "uncalibrated" |
+| `AC_JOB_CPU_PSI_MAX` = 20 on 4 cores with 2-vCPU guests, else 40 | Builds at once: 2 builds peaked at CPU PSI 23.7, 3 at 59.9 | the input only: on 4 cores, 2 vCPUs it is `measured input, gate unvalidated` (the gate at 20 never ran against real builds) | every other shape: the default 40, "uncalibrated" |
 | Forecast: agents = floor((`/dev/shm` − 512) / guest), builds = floor(cores / vCPUs) | Admission capacity; Builds at once | 7 agents and 2 builds here | the builds figure on other core counts |
 | Boot class | Real builds: cold boot 18–19 s against 3.5 s warm | rotational | SSD and NVMe: no SSD was measured |
 

@@ -7,6 +7,7 @@ pub mod id;
 pub mod job;
 pub mod lifecycle;
 pub mod schedule;
+pub mod tune;
 
 pub use allowlist::{Allowlist, AllowlistError};
 pub use capacity::{GuestMemory, Shortfall};

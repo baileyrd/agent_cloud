@@ -220,22 +220,27 @@ pub fn major_minor(dev: u64) -> (u64, u64) {
     (major, minor)
 }
 
-/// The mount source of the filesystem whose device is `major:minor`, from `/proc/self/mountinfo`
-/// (`36 1 0:36 /root / rw shared:1 - btrfs /dev/sda3 rw`). Btrfs and overlayfs report an
-/// anonymous device (major 0) in `st_dev`; their source names the block device.
-pub fn mount_source<'a>(mountinfo: &'a str, dev: &str) -> Option<&'a str> {
-    mountinfo.lines().find_map(|l| {
-        let mut fields = l.split_whitespace();
-        if fields.nth(2) != Some(dev) {
-            return None;
-        }
-        let (_, after) = l.split_once(" - ")?;
-        after.split_whitespace().nth(1)
-    })
+/// The mount source of the filesystem that holds `path`, from `/proc/self/mountinfo`
+/// (`42 1 0:34 /root / rw shared:1 - btrfs /dev/sda3 rw`): the mount with the longest mount
+/// point containing `path`. Btrfs and overlayfs report an anonymous device (major 0) in `st_dev`,
+/// and a btrfs subvolume's is not even the one mountinfo lists; the mount's source names the
+/// block device.
+pub fn mount_source<'a>(mountinfo: &'a str, path: &Path) -> Option<&'a str> {
+    mountinfo
+        .lines()
+        .filter_map(|l| {
+            let point = l.split_whitespace().nth(4)?;
+            let (_, after) = l.split_once(" - ")?;
+            let point = Path::new(point);
+            path.starts_with(point)
+                .then(|| Some((point.components().count(), after.split_whitespace().nth(1)?)))?
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, source)| source)
 }
 
 /// Rotational or not, for the disk under the data directory: its `st_dev`, or for btrfs and the
-/// like the device its mount names; then `queue/rotational` of that device or, for a partition,
+/// like the device its mount names (the data directory's path as given: no symlinks resolved); then `queue/rotational` of that device or, for a partition,
 /// of its disk.
 fn disk(h: &dyn HostRead, p: &Paths) -> Fact<Disk> {
     let Ok(st) = h.stat(&p.data) else {
@@ -244,8 +249,8 @@ fn disk(h: &dyn HostRead, p: &Paths) -> Fact<Disk> {
     let (mut major, mut minor) = major_minor(st.dev);
     if major == 0 {
         let mountinfo = h.read(&p.proc.join("self/mountinfo")).unwrap_or_default();
-        let Some(source) = mount_source(&mountinfo, &format!("0:{minor}")) else {
-            return Fact::Skipped(format!("no mount for device 0:{minor}"));
+        let Some(source) = mount_source(&mountinfo, &p.data) else {
+            return Fact::Skipped(format!("no mount holds {}", p.data.display()));
         };
         match h.stat(Path::new(source)) {
             Ok(dev) if dev.rdev != 0 => (major, minor) = major_minor(dev.rdev),
@@ -640,7 +645,8 @@ mod tests {
         )
         .file(
             "/proc/self/mountinfo",
-            "36 1 0:36 /root / rw,relatime shared:1 - btrfs /dev/sda3 rw,seclabel,compress=zstd:1\n",
+            "42 1 0:34 /root / rw,relatime shared:1 - btrfs /dev/sda3 rw,seclabel,compress=zstd:1\n\
+             41 39 0:26 / /dev/shm rw,nosuid,nodev shared:3 - tmpfs tmpfs rw,size=16094208k\n",
         )
         .file("/sys/dev/block/8:3/../queue/rotational", "1\n")
         .file(
@@ -801,13 +807,9 @@ mod tests {
             collected(&h, Scope::Settings).disk,
             Fact::Known(Disk::Solid)
         );
-        let h = baileyserv().stat(
-            "/var/lib/agent-cloud",
-            Stat {
-                dev: 99,
-                ..file_stat(0, 0o755)
-            },
-        );
+        // An anonymous device with no mount to name its disk: unknown, not guessed.
+        let mut h = baileyserv();
+        h.files.remove(Path::new("/proc/self/mountinfo"));
         assert!(matches!(
             collected(&h, Scope::Settings).disk,
             Fact::Skipped(_)
@@ -837,9 +839,15 @@ mod tests {
         assert_eq!(major_minor(36), (0, 36));
         assert_eq!(major_minor((8 << 8) | 3), (8, 3));
         assert_eq!(major_minor((259 << 8) | (1 << 20) | 5), (259, (1 << 8) | 5));
-        let mi = "22 1 8:1 / /boot rw - ext4 /dev/sda1 rw\n36 1 0:36 /root / rw shared:1 - btrfs /dev/sda3 rw\n";
-        assert_eq!(mount_source(mi, "0:36"), Some("/dev/sda3"));
-        assert_eq!(mount_source(mi, "0:37"), None);
+        let mi = "22 42 8:1 / /boot rw - ext4 /dev/sda1 rw\n42 1 0:34 /root / rw shared:1 - btrfs \
+                  /dev/sda3 rw\n50 42 0:40 / /var/lib/x rw - tmpfs tmpfs rw\n";
+        let at = |p: &str| mount_source(mi, Path::new(p));
+        assert_eq!(at("/var/lib/agent-cloud"), Some("/dev/sda3"));
+        assert_eq!(at("/boot/efi"), Some("/dev/sda1"));
+        assert_eq!(at("/var/lib/x/y"), Some("tmpfs"));
+        // Component-wise: /var/lib/xy is not under /var/lib/x.
+        assert_eq!(at("/var/lib/xy"), Some("/dev/sda3"));
+        assert_eq!(mount_source("", Path::new("/")), None);
     }
 
     #[test]

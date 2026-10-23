@@ -14,7 +14,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   rust:
@@ -30,16 +29,11 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
       - run: rustup component add clippy rustfmt
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --locked
-      - run: cargo test --workspace --locked
+      - run: ./scripts/ci-local.sh rust
 
   scripts:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Syntax-check shell scripts
-        run: |
-          for f in scripts/*.sh; do
-            head -1 "$f" | grep -q bash && bash -n "$f" || sh -n "$f"
-          done
+        run: ./scripts/ci-local.sh scripts

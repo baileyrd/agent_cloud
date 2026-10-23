@@ -23,7 +23,8 @@ guest memory, and with more than one at once CPU, not the disk, is the limit ([R
   a1, which already has a login (see [Claude Code](#claude-code-measured-on-a1)).
 - **Watchdog.** A 2 s watchdog stopped the run on the first threshold crossed: MemAvailable < 1.5 GiB, swap
   traffic, memory PSI, host OOM, ac-gateway or ac-egress not answering, or load > 8 for 60 s. The io PSI
-  `full` limit was 80 during load phases and 40 elsewhere.
+  `full` limit was 80 during load phases and 40 elsewhere. (Since 2026-10-23 the settle right after a
+  workspace purge also has 80: a purge's own disk I/O tripped 40.10 > 40 in a `--max-n 2` run.)
 - **Runs.** There were four runs. A run is labelled by the time it started, which is also its directory name.
 
   | Run | Scope | How it ended |

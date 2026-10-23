@@ -2,7 +2,8 @@
 # Sourced by capacity-bench.sh and real-build-bench.sh, never run: host readers, the gateway API with a
 # scoped throwaway token, the watchdog (trip() names the threshold), held-stdin execs and the per-VM
 # figures. The caller sets OUT and MAIN (its $$) and traps USR1 to its cleanup; EXEC_TAG prefixes exec
-# ids; LOUD_PHASES lists the phases whose io PSI full limit is 80 instead of 40.
+# ids; LOUD_PHASES lists the phases whose io PSI full limit is 80 instead of 40 (phase "purged", the
+# settle after a workspace purge, always is).
 NS=agents
 DATA=/var/lib/agent-cloud
 KATA=/etc/kata-containers/configuration.toml
@@ -99,7 +100,9 @@ sampler() {
         awk -v v="$mf" 'BEGIN { exit !(v > 10) }' && trip "memory PSI full avg10 $mf > 10"
         awk -v v="$ms" 'BEGIN { exit !(v > 40) }' && trip "memory PSI some avg10 $ms > 40"
         # io pressure only slows the host: 80 while the disk-heavy phases run, 40 otherwise.
-        lim=40; case " ${LOUD_PHASES:-load} " in *" ${ph%% *} "*) lim=80 ;; esac
+        # "purged": a settle right after a purge, whose disk I/O is the bench's own and bounded (it once
+        # tripped 40.10 > 40). Idle phases keep 40.
+        lim=40; case " ${LOUD_PHASES:-load} purged " in *" ${ph%% *} "*) lim=80 ;; esac
         awk -v v="$iof" -v m=$lim 'BEGIN { exit !(v > m) }' && trip "io PSI full avg10 $iof > $lim"
         [ "$(vmstat oom_kill)" = "$oom0" ] || trip "host OOM kill ($(dmesg | grep -iE 'killed process|out of memory' | tail -n 1))"
         if awk -v v="$l" -v c="$CORES" 'BEGIN { exit !(v > 2 * c) }'; then

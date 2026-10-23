@@ -376,12 +376,14 @@ sampler &
 bundle || { STOP="source bundle failed"; exit 2; }
 use_image || { STOP="drop-in failed"; exit 2; }
 
+# The settle after a purge is phase "purged" (io PSI full limit 80, bench-guard.sh); the first is idle.
+SETTLE=settle
 if [ "$STAGE" = matrix ]; then
     for mem in $SIZES; do
         echo "== $mem MiB, $VCPUS vCPU $(date +%T)"
         kata_set "$mem" "$VCPUS" || { STOP="kata_set $mem"; exit 2; }
         [ "$(gw_image)" = "$IMAGE" ] || { STOP="ac-gateway did not take AC_IMAGE=$IMAGE"; exit 2; }
-        echo "settle 0" > "$OUT/phase"; settle
+        echo "$SETTLE 0" > "$OUT/phase"; settle
         drop_caches
         echo "create 1" > "$OUT/phase"
         create rb-1 || { STOP="create rb-1 failed"; exit 2; }
@@ -390,7 +392,7 @@ if [ "$STAGE" = matrix ]; then
             for ((rep = 1; rep <= REPS; rep++)); do run_builds matrix "$mem" "$kind" "$rep" rb-1; done
         done
         destroy rb-1 || { STOP="destroy rb-1 failed"; exit 2; }
-        AGENTS=()
+        AGENTS=() SETTLE=purged
     done
 else
     mem=$SIZES
@@ -408,14 +410,14 @@ else
             fi
         fi
         echo "== N=$n at $mem MiB, $VCPUS vCPU $(date +%T)"
-        echo "settle 0" > "$OUT/phase"; settle
+        echo "$SETTLE 0" > "$OUT/phase"; settle
         drop_caches
         echo "create $n" > "$OUT/phase"
         for ((k = 1; k <= n; k++)); do create "rb-$k" || { STOP="create rb-$k failed"; exit 2; }; done
         drop_caches
         for ((rep = 1; rep <= REPS; rep++)); do run_builds concurrent "$mem" release "$rep" "${AGENTS[@]}"; done
         for a in "${AGENTS[@]}"; do destroy "$a" || { STOP="destroy $a failed"; exit 2; }; done
-        AGENTS=()
+        AGENTS=() SETTLE=purged
     done
 fi
 exit 0

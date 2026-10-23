@@ -366,7 +366,7 @@ done
 echo "== storm $(date +%T)"
 for a in "${AGENTS[@]}"; do destroy "$a"; done
 AGENTS=()
-echo "settle 0" > "$OUT/phase"
+echo "purged 0" > "$OUT/phase"  # the purges' disk I/O: io PSI full limit 80 (bench-guard.sh)
 settle
 echo "storm 4" > "$OUT/phase"
 pids=()

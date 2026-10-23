@@ -301,8 +301,8 @@ holds, and keep the running count at the figures above.
   and refuses (507) a create or resume unless the total plus the new guest plus 512 MiB fits `/dev/shm`. The new
   guest plus 512 MiB must also fit what is free. Admission counts the configured size, not what a guest uses,
   because touched pages never come back.
-- *Running agents now.* At `default_memory = 4096`, 3 agents run (3 × 4096 + 512 = 12800 ≤ 15717) and a fourth
-  is refused instead of crashing a VM. At 2048 it would be 7.
+- *Running agents now.* At `default_memory = 2048`, the setting now, 7 agents run (7 × 2048 + 512 = 14848 ≤
+  15717) and an eighth is refused instead of crashing a VM. At 4096 it was 3.
 - *Checking.* `GET /api/v1/capacity` and `scripts/capacity.sh` show the figures.
 
 Still open: a way for guests to return memory, such as free page reporting or virtio-mem.

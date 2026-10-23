@@ -54,8 +54,8 @@
   peak at 314 MiB used at 1 vCPU (468 MiB at 2), with ≥ 65% of a 2048 MiB guest free, so per-agent memory
   classes are not needed for builds of this size. With 2 or 3 builds at once, CPU is the limit
   ([sizing.md](sizing.md#real-builds)).
-- [ ] Decide `default_memory` and `default_vcpus` (4096 and 1 today). Proposal from the measurements: 2048
-  (admits 7 agents here instead of 3) and 2 vCPUs (builds 40% faster; 7% slower at 3 builds at once).
+- [x] `default_memory` and `default_vcpus` set to 2048 and 2, as the measurements proposed (admits 7 agents
+  here instead of 3; builds 40% faster; 7% slower at 3 builds at once).
 - [ ] Measure a bigger build (a larger Rust workspace, C++ or npm) before trusting 2048 for every build
 - [ ] Measure on an SSD (every figure in sizing.md is from one rotational disk)
 - [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s)

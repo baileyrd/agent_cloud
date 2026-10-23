@@ -410,3 +410,21 @@ afterwards (`KEEP_A1=1` leaves it running). It takes about 30 s.
 
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).
+
+## Operations: commands not to run
+
+- **No prune against the agent image store without listing first.** `ctr content prune`, `ctr images prune`,
+  `podman system prune` and `podman image prune` delete whatever they consider unreferenced, and that has
+  included images in use: one run deleted the layers of `localhost/agent-shell:dev` and `nginx:alpine`, and both
+  had to be re-imported at their original digests. Before any of them, list what is there and what it would
+  delete (`sudo ctr -n agents images ls`, `sudo ctr -n agents content ls`, `podman images -a`) and compare
+  digests afterwards. To restore an image from podman: `podman save localhost/agent-shell:dev | sudo ctr -n
+  agents images import -`, then check the digest in `sudo ctr -n agents images ls` against the one noted before.
+- **Never give a live `ctr task exec` EOF on stdin**: no pipe, no file, not `< /dev/null`. It wedges the Kata
+  shim for that agent ([Fedora note 8](#fedora-44-notes-verified-on-baileyserv-i5-3550-2026-10-18), ADR-006,
+  ADR-010); hold stdin open from a FIFO instead. The watchdog recovers a wedge in about 2 minutes (ADR-012), but
+  do not cause one.
+- **No `dnf install` after the proxy `ENV` lines in `images/agent-shell/Containerfile`.** From that point every
+  build step goes through `HTTPS_PROXY=http://10.89.0.1:3128`, which allows only the model API, so the mirrors
+  are refused and the step fails. Put packages in the `dnf install` above the `ENV` lines, or, for a step that
+  must come later, pass the proxy settings as build-time `--build-arg` values instead.

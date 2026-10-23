@@ -7,6 +7,7 @@
 
 pub mod capacity;
 pub mod exec;
+pub mod facts;
 pub mod host;
 
 use std::collections::BTreeMap;
@@ -598,7 +599,7 @@ fn is_already_gone(cause: &str) -> bool {
     cause.contains("not found")
 }
 
-fn read_all(file: &mut dyn platform::fs::File) -> platform::error::Result<Vec<u8>> {
+pub(crate) fn read_all(file: &mut dyn platform::fs::File) -> platform::error::Result<Vec<u8>> {
     let (mut out, mut buf) = (Vec::new(), [0u8; 4096]);
     loop {
         let n = file.read(&mut buf)?;

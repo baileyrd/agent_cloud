@@ -30,5 +30,7 @@ rusty_crypto_key = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84
 rusty_atomic_file = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
 # statfs(2) of /dev/shm for admission (ADR-012): safe wrappers over raw syscalls, no dependencies.
 rusty_libc = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
+# Dates for logs, history and backup names: civil dates from Unix seconds. No dependencies.
+rusty_time = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
 # JSON request bodies (job API). No serde: its own Value and parser.
 rusty_json = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555", default-features = false, features = ["std"] }

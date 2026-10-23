@@ -130,23 +130,24 @@ pub fn fstab_shm(text: &str, size_mib: u64, options: &[String]) -> String {
     join(&lines, true)
 }
 
-/// Unix seconds as `YYYYMMDDTHHMMSSZ`, for backup names.
+/// Unix seconds as `YYYYMMDDTHHMMSSZ`, for backup names (`rusty_time`); past its range (a year
+/// beyond `i32`), the raw seconds.
 pub fn stamp(secs: u64) -> String {
-    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
-    // Days to civil date (H. Hinnant), as ac-gateway's and ac-viewer's `utc`.
-    let z = days + 719_468;
-    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    let Some(t) = i64::try_from(secs)
+        .ok()
+        .and_then(|s| rusty_time::DateTime::from_unix_secs(s).ok())
+    else {
+        return secs.to_string();
+    };
+    let (d, h) = (t.date(), t.time());
     format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        d.year(),
+        d.month(),
+        d.day(),
+        h.hour(),
+        h.minute(),
+        h.second()
     )
 }
 

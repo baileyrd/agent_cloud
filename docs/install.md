@@ -144,6 +144,8 @@ user, backups.
 3. Confirm a second agent cannot see the first one's files.
 4. Measure capacity: `sudo scripts/capacity-bench.sh --estimate`, then without `--estimate` (about 25 min,
    guarded by abort thresholds; it creates and purges `bench-*` agents only). Results: [sizing.md](sizing.md).
+   For real builds: `sudo scripts/real-build-bench.sh matrix`, then `concurrent --sizes <MiB>` (about 45 and
+   15 min; `rb-*` agents only, from a measurement-only image with a toolchain, see the script's header).
 
 ## Rough effort
 
@@ -168,7 +170,7 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    sudo mkdir -p /etc/kata-containers
    sudo cp /usr/share/kata-containers/defaults/configuration.toml /etc/kata-containers/configuration.toml
    sudo sed -i 's/^#\?default_maxmemory *=.*/default_maxmemory = 8192/' /etc/kata-containers/configuration.toml
-   sudo sed -i 's/^#\?default_memory *=.*/default_memory = 4096/' /etc/kata-containers/configuration.toml   # Claude Code needs >= 4 GB
+   sudo sed -i 's/^#\?default_memory *=.*/default_memory = 4096/' /etc/kata-containers/configuration.toml   # see sizing.md: 2048 measured enough
    ```
 4. **Repair the guest initrd.** Symptom: `timed out connecting to vsock`; booting the initrd by hand shows
    `kata-agent: error while loading shared libraries: libseccomp.so.2`. Run `sudo scripts/fix-kata-initrd.sh`

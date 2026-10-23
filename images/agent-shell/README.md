@@ -16,8 +16,10 @@ sudo ctr -n agents images ls            # note the name, expected localhost/agen
 
 ## Give each VM enough memory
 
-Claude Code needs at least 4 GB of RAM ([setup docs](https://code.claude.com/docs/en/troubleshoot-install));
-Kata's default VM is 2 GB. In `/etc/kata-containers/configuration.toml` set:
+Claude Code's [setup docs](https://code.claude.com/docs/en/troubleshoot-install) ask for 4 GB of RAM;
+Kata's default VM is 2 GB. Measured here, 2048 MiB is enough for Claude Code (peak ~190 MiB) and for a
+release build of this repo (guest used ≤ 468 MiB); see [docs/sizing.md](../../docs/sizing.md#real-builds).
+The current setting, in `/etc/kata-containers/configuration.toml` (not yet changed, see the roadmap):
 
 ```
 default_memory = 4096

@@ -53,9 +53,11 @@ Details: [docs/architecture.md](docs/architecture.md).
    agents whose VM vanished, for example after a reboot, as paused; the gateway runs it at startup.
    Defaults: data in `/var/lib/agent-cloud`, containerd namespace `agents`. Verified on one host (Fedora 44, i5-3550):
    create, pause, resume, destroy all worked. A fresh Fedora host needs the fixes in [docs/install.md](docs/install.md#fedora-44-notes-verified-on-baileyserv-i5-3550-2026-10-18).
-5. Run `sudo scripts/m0-smoke.sh` first on a new host: it checks KVM, containerd, Kata and the
+5. Check the host's settings against its facts: `sudo ac-ctl doctor`, and `sudo ac-ctl tune` for the diffs it
+   would apply (ADR-014; [install.md](docs/install.md#host-settings-ac-ctl-doctor-and-ac-ctl-tune-adr-014)).
+6. Run `sudo scripts/m0-smoke.sh` first on a new host: it checks KVM, containerd, Kata and the
    kernel-differs isolation test (runbook Phases 0-3).
-6. Gateway: `ac-gateway` serves `GET /api/v1/agents` (every agent and its state),
+7. Gateway: `ac-gateway` serves `GET /api/v1/agents` (every agent and its state),
    `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
    with a scoped bearer token (`ac-gateway token create|list|revoke`, ADR-011). `DELETE` keeps the workspace;
    `DELETE ...?purge=true` removes it. Env: `AC_TOKENS` (default `/etc/agent-cloud/tokens`, 0600), `AC_IMAGE`, `AC_BIND` (private addresses

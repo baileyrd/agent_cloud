@@ -63,6 +63,11 @@
   `queued_reason` and job counts in `GET /api/v1/capacity` (ADR-013)
 - [ ] Measure the gate with real builds submitted together; whether `AC_JOB_CPU_PSI_MAX=20` or a 60 s spacing
   keeps a burst at 2 builds
+- [x] Settings from host facts: `ac-ctl doctor` (read-only; each figure `measured` or `extrapolated`, with its
+  source) and `ac-ctl tune` (diffs; `--apply` with backups); `--facts-file` plans other hardware; the gateway
+  logs one line when its settings differ (ADR-014)
+- [ ] Calibrate `default_vcpus`, builds at once and `AC_JOB_CPU_PSI_MAX` on another core count with
+  `scripts/real-build-bench.sh`, so doctor can mark them measured there
 
 ## Later
 - Local model option for an offline posture

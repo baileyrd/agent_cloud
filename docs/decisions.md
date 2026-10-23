@@ -458,3 +458,75 @@ How it works:
 
 **Not now:** priorities or per-agent fairness beyond FIFO; limiting the CPU of a running job; io pressure in
 the gate.
+
+## ADR-014: Settings from host facts: `ac-ctl doctor` and `ac-ctl tune`
+**Status:** accepted (2026-10-23).
+**Context:** BaileyServ's settings were tuned by hand, each from a measurement or a failure: `/dev/shm` =
+MemTotal − 8 GiB (ADR-012), Kata `default_memory = 2048` and `default_vcpus = 2` (real builds),
+`default_maxmemory = 8192` (QEMU's "phys-bits too low (36)"), `AC_JOB_CPU_PSI_MAX` (ADR-013). The reasons live in
+[sizing.md](sizing.md) and [install.md](install.md), but nothing checked a host against them, said what they
+would be on other hardware, or said which figures were measured and which were carried over.
+
+**Decision.**
+- *Host settings come from host facts.* `/dev/shm`, `default_maxmemory`, `default_vcpus`, `AC_MAX_RUNNING_JOBS`
+  and `AC_JOB_CPU_PSI_MAX` follow from MemTotal, cores, physical address bits and the measured shape.
+- *Workload settings come from a profile backed by measurements.* `idle`, `build` (the default) or `heavy` sets
+  `default_memory`; `AC_PROFILE` in `gateway.env` records the host's profile.
+- *Every recommendation is labelled.* It has a stable rule id, a one-line reason citing sizing.md or install.md,
+  and a confidence: `measured` (reproduces what sizing.md measured on the i5-3550, on a host of that shape) or
+  `extrapolated` (derived from a rule; not measured on this shape of hardware).
+- *Nothing is applied silently.* `ac-ctl doctor` only reads. `ac-ctl tune` prints diffs; only `--apply` (root)
+  writes, and the gateway only logs one line at startup when its settings differ.
+- *Neither takes the registry lock.* Both read files and `/proc`, so they work while `ac-gateway` runs.
+
+How it works:
+- *Code.* `ac_domain::tune` is pure: `facts` (`HostFacts` and the parsers for meminfo, cpuinfo, CPU lists, mount
+  tables, `EnvironmentFile`s and Kata's hypervisor table), `rules` (`recommend(&HostFacts, Profile)` →
+  `Vec<Finding>`, `forecast`, the rule list `--explain` prints) and `edit` (line edits and `-U0` diffs). The
+  collector, `ac_ctr::facts::collect`, reads through the `HostRead` trait, which tests fake.
+- *Facts.* MemTotal, online CPUs, physical address bits and the vmx/svm flag; the disk class of the data
+  directory (for btrfs, by the mount that holds it: a subvolume's `st_dev` names no block device); `/dev/shm` as
+  mounted, as used and in fstab; Kata's `default_memory`, `default_vcpus`, `default_maxmemory`, `default_maxvcpus`
+  and initrd; `gateway.env`; `/dev/kvm` opened read-write; whether the initrd has `fix-kata-initrd.sh`'s NIC
+  drop-in (the initrd is streamed through `gzip -dc` into a cpio reader, nothing is unpacked); the nft rule
+  counts and firewalld zone that `post-reboot-check.sh` checks (a test keeps the two lists equal); the modes of
+  `tokens` and `egress-allow.txt`. What only root may read is skipped and says so.
+- *Facts files.* `doctor --json` includes the facts; `--facts-file` reads them back, or a hand-written subset,
+  to plan a host that is not this one (`deploy/hosts/`). A fact left out is skipped; the recommendations that
+  need only size and cores still show.
+- *Tune.* It edits only the keys it owns: Kata's `default_memory`, `default_vcpus` and `default_maxmemory` in the
+  first `[hypervisor.*]` table (a line edit that keeps comments, layout and other keys; a missing key goes after
+  its commented template), the `gateway.env` keys of the rules and `AC_PROFILE`, and `size=` of the `/dev/shm`
+  fstab line (added in the style of `deploy/dev-shm.fstab` if missing). Each changed file is copied to
+  `<file>.ac-tune-<UTC stamp>` first and replaced atomically with its mode and owner kept. A second run changes
+  nothing. It refuses while any Kata VM runs (unless `--force`; it names those that need a pause and resume)
+  and refuses a `/dev/shm` smaller than what is in use. It never reboots, remounts (it prints the remount),
+  rebuilds the initrd or touches the firewall or units: those are printed as manual steps with the command
+  from install.md. `--restart-gateway` restarts the gateway and waits for its port, since it reports active
+  before it listens. `--root DIR` edits copies under DIR, to try it without touching the host.
+
+| Rule | Recommendation | Measured when |
+|---|---|---|
+| `shm.size` | MemTotal − 8 GiB (MemTotal ≥ 16 GiB), else MemTotal/2; error below 8 GiB | MemTotal within 2 GiB of the measured 23909 MiB |
+| `kata.default_maxmemory` | 8192 at ≤ 36 physical address bits, else Kata's default | 36 bits |
+| `kata.default_vcpus` | 2 at ≥ 4 cores, else 1; never above 2 | 4 cores |
+| `kata.default_memory` | idle 2048, build 2048, heavy 4096 | idle and build (any host); heavy never |
+| `gateway.max_running_jobs` | the core count (the default) | 4 cores |
+| `gateway.cpu_psi_max` | 20 on 4 cores with 2-vCPU guests, else the default 40, "uncalibrated" | 4 cores (see below) |
+| `disk.class` | information: the measured cold-start cost of a rotational disk | rotational |
+| `prereq.*` | `/dev/kvm`, vmx/svm, Kata config, initrd drop-in, fstab line = running mount, firewall, modes | (checks) |
+
+`gateway.cpu_psi_max = 20` is marked measured because it rests on measured PSI (two 2-vCPU builds peaked at
+23.7); the gate set to 20 has not yet been exercised by a burst of real builds (roadmap).
+
+**Consequences:**
+- A new host gets its numbers, with their provenance, before anything is installed: `doctor --facts-file`.
+- On another shape most figures are `extrapolated`, and the doctor says so; the PSI limit stays at the default
+  until `scripts/real-build-bench.sh` calibrates it there.
+- A setting a person chose deliberately below the recommendation (fewer job slots, a calibrated PSI limit on
+  other hardware) is `info`, not a warning, and tune leaves it.
+- Exit codes: doctor 0 ok, 1 warnings, 2 errors; `post-reboot-check.sh` FAILs on errors only.
+- MemTotal moves by a few MiB across kernels, so `/dev/shm` within 1% of the target is ok.
+
+**Not now:** calibrating the PSI limit automatically; editing the initrd, firewall or units; per-agent memory
+classes; telling nested virtualization from bare metal.

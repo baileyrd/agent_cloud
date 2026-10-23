@@ -3,7 +3,9 @@
 //! measured on a host of this shape (`measured`) or carried over by a rule (`extrapolated`).
 //! Pure: [`HostFacts`] in, [`Finding`]s out.
 
-use super::facts::{Disk, Env, Fact, HostFacts, Kvm, Mode, Shm, Virt, AGENTS_ZONE, NFT_CHAINS};
+use super::facts::{
+    Disk, Env, Fact, HostFacts, Kata, Kvm, Mode, Shm, Virt, AGENTS_ZONE, NFT_CHAINS,
+};
 
 /// The measured host (BaileyServ, i5-3550): every figure in docs/sizing.md comes from it.
 pub const MEASURED_CORES: u32 = 4;
@@ -401,6 +403,17 @@ pub fn recommend(f: &HostFacts, p: Profile) -> Vec<Finding> {
     out
 }
 
+/// The settings (not prerequisites) at warn or error, as `setting current -> recommended`
+/// joined by `, `; `None` when every setting is as recommended. For the gateway's startup log.
+pub fn drift(findings: &[Finding]) -> Option<String> {
+    let differ: Vec<String> = findings
+        .iter()
+        .filter(|f| f.is_setting() && f.status >= Status::Warn)
+        .map(|f| format!("{} {} -> {}", f.setting, f.current, f.recommended))
+        .collect();
+    (!differ.is_empty()).then(|| differ.join(", "))
+}
+
 /// The worst status among `findings` (`Ok` for none).
 pub fn worst(findings: &[Finding]) -> Status {
     findings
@@ -455,28 +468,32 @@ fn kata_current(value: Option<u64>, default: &str) -> String {
     value.map_or_else(|| format!("unset ({default})"), |v| v.to_string())
 }
 
+/// Findings judged on a fact that is not known: the recommendation stands, the current value
+/// shows why it is unknown, and nothing is changed or warned about.
+fn unjudged(findings: Vec<Finding>, why: &str) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .map(|f| Finding {
+            current: why.to_owned(),
+            status: Status::Info,
+            change: None,
+            ..f
+        })
+        .collect()
+}
+
 fn kata_settings(f: &HostFacts, p: Profile) -> Vec<Finding> {
-    let kata = match &f.kata {
-        Fact::Known(k) => k,
-        other => {
-            let why = format!("{}; see prereq.kata_config", unknown(other));
-            let skip = |rule, setting| {
-                finding(rule, setting, why.clone(), "-".into())
-                    .status(Status::Info)
-                    .reason("Kata's configuration could not be read")
-            };
-            return vec![
-                skip("kata.default_maxmemory", "default_maxmemory"),
-                skip("kata.default_vcpus", "default_vcpus"),
-                skip("kata.default_memory", "default_memory"),
-            ];
-        }
-    };
-    vec![
+    let none = Kata::default();
+    let kata = f.kata.known().unwrap_or(&none);
+    let out = vec![
         maxmemory(f, kata.default_maxmemory),
         vcpus(f, kata.default_vcpus),
         memory(p, kata.default_memory),
-    ]
+    ];
+    match &f.kata {
+        Fact::Known(_) => out,
+        other => unjudged(out, &unknown(other)),
+    }
 }
 
 fn maxmemory(f: &HostFacts, value: Option<u64>) -> Finding {
@@ -490,6 +507,7 @@ fn maxmemory(f: &HostFacts, value: Option<u64>) -> Finding {
             "-".into(),
         )
         .status(Status::Info)
+        .confidence(Confidence::Extrapolated)
         .reason(format!("physical address bits {}", unknown(&f.phys_bits)));
     };
     if bits > SHORT_PHYS_BITS {
@@ -594,26 +612,16 @@ fn memory(p: Profile, value: Option<u64>) -> Finding {
 }
 
 fn gateway_settings(f: &HostFacts, p: Profile) -> Vec<Finding> {
-    let env = match &f.gateway {
-        Fact::Known(env) => env,
-        other => {
-            let why = unknown(other);
-            let skip = |rule, setting: &str| {
-                finding(rule, setting, why.clone(), "-".into())
-                    .status(Status::Info)
-                    .reason("the gateway's settings could not be read")
-            };
-            return vec![
-                skip("gateway.max_running_jobs", "AC_MAX_RUNNING_JOBS"),
-                skip("gateway.cpu_psi_max", "AC_JOB_CPU_PSI_MAX"),
-            ];
-        }
-    };
+    let none = Env::new();
+    let env = f.gateway.known().unwrap_or(&none);
     let mut out = Vec::new();
     out.extend(vm_memory(f, p, env));
     out.push(max_running(f, env));
     out.push(cpu_psi(f, env));
-    out
+    match &f.gateway {
+        Fact::Known(_) => out,
+        other => unjudged(out, &unknown(other)),
+    }
 }
 
 fn vm_memory(f: &HostFacts, p: Profile, env: &Env) -> Option<Finding> {

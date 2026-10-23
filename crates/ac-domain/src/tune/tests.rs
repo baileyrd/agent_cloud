@@ -1,6 +1,6 @@
 //! The rules over the host shapes ADR-014 names, and the edits on fixture files.
 
-use super::edit::{diff, env_set, fstab_shm, hunks, kata_set};
+use super::edit::{diff, env_set, fstab_shm, hunks, kata_set, stamp};
 use super::facts::*;
 use super::rules::*;
 
@@ -508,7 +508,13 @@ fn hypothetical_host_with_only_size() {
     let f = HostFacts::bare(31998, 8, "not in the facts file");
     let fs = recommend(&f, Profile::Build);
     assert_eq!(worst(&fs), I, "{fs:#?}");
-    assert_eq!(get(&fs, "shm.size").recommended, "23806 MiB");
+    // Every setting still has its recommendation, for planning.
+    let rec = |rule| verdict(&fs, rule);
+    assert_eq!(rec("shm.size"), (I, "23806 MiB".into(), X));
+    assert_eq!(rec("kata.default_vcpus"), (I, "2".into(), X));
+    assert_eq!(rec("kata.default_memory"), (I, "2048".into(), M));
+    assert_eq!(rec("gateway.cpu_psi_max"), (I, "40".into(), X));
+    assert_eq!(rec("gateway.max_running_jobs"), (I, "8".into(), X));
     assert_eq!(forecast(&f, Profile::Build, 512).max_agents, 11);
 }
 
@@ -665,4 +671,31 @@ fn diffs() {
     let two = hunks("1\n2\n3\n4\n5\n", "1\nx\n3\n4\ny\n");
     assert_eq!(two.len(), 2);
     assert_eq!((two[1].old, two[1].new), ((5, 1), (5, 1)));
+}
+
+#[test]
+fn stamps() {
+    assert_eq!(stamp(0), "19700101T000000Z");
+    assert_eq!(stamp(1_761_221_715), "20251023T121515Z");
+    assert_eq!(stamp(951_782_400), "20000229T000000Z");
+}
+
+#[test]
+fn drift_names_only_settings_that_differ() {
+    assert_eq!(drift(&recommend(&this_host(), Profile::Build)), None);
+    let f = HostFacts {
+        kvm: Fact::Absent,
+        gateway: Fact::Known(Env::new()),
+        kata: Fact::Known(Kata {
+            default_memory: Some(4096),
+            ..Kata::default()
+        }),
+        ..this_host()
+    };
+    let line = drift(&recommend(&f, Profile::Build)).unwrap_or_default();
+    assert_eq!(
+        line,
+        "default_maxmemory unset (0: all host RAM) -> 8192, default_vcpus unset (Kata's default 1) -> 2, \
+         default_memory 4096 -> 2048, AC_JOB_CPU_PSI_MAX unset (40) -> 20"
+    );
 }

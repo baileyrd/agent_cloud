@@ -7,10 +7,18 @@
   "cores": 4,
   "disk": "rotational",
   "firewall": {
-    "skipped": "nft and firewall-cmd need root: run with sudo"
+    "chains": {
+      "bridge agentfw forward": 1,
+      "inet agentfw forward": 3,
+      "inet agentfw input": 3
+    },
+    "zone": "acbr0|3128/tcp|"
   },
   "gateway": {
-    "skipped": "/etc/agent-cloud/gateway.env is root-only: run with sudo"
+    "AC_BIND": "127.0.0.1:8780",
+    "AC_IMAGE": "localhost/agent-shell:dev",
+    "AC_JOB_CPU_PSI_MAX": "20",
+    "AC_NETWORK": "1"
   },
   "initrd_net": true,
   "kata": {

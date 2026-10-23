@@ -400,7 +400,8 @@ lives in `/var/lib/agent-cloud/jobs.mmap`; prompts and collected output in `/var
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the
 allowlist's owner and mode, and that the gateway and proxy listen only on private addresses. It checks that
 every agent the gateway lists (`GET /api/v1/agents`) is paused or destroyed and has no netns, Kata processes,
-containerd task or CNI lease left. Then it resumes `a1` through the gateway and, inside it, checks
+containerd task or CNI lease left (destroyed agents share one PASS line; a FAIL names the agent and what is left).
+Then it resumes `a1` through the gateway and, inside it, checks
 `claude auth status`, `claude -p`, the API through the proxy, a denied host (example.com) and an unreachable
 LAN address (192.168.50.1), and runs a job through the task API ("reply with exactly the word pong", expecting
 `succeeded`). It submits that job with a throwaway token (`post-reboot-check-<pid>`, `jobs:read,jobs:write` for

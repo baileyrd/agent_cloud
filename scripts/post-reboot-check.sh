@@ -100,10 +100,16 @@ leftovers() {
     l=$(leases_of "$id"); [ -n "$l" ] && left="$left lease:$l"
     echo "$left"
 }
+# Destroyed agents are checked one by one but reported on one line; a FAIL names the agent.
+dead=0 dead_clean=0
 while read -r id state; do
     [ -n "$id" ] || continue
     case $state in
-        paused|destroyed) pass "$id is $state" ;;
+        destroyed)
+            dead=$((dead + 1)) left=$(leftovers "$id")
+            if [ -z "$left" ]; then dead_clean=$((dead_clean + 1)); else bad "$id (destroyed) leftovers:$left"; fi
+            continue ;;
+        paused) pass "$id is paused" ;;
         *) bad "$id is $state, want paused" ;;
     esac
     [ "$state" = running ] && continue
@@ -112,6 +118,8 @@ while read -r id state; do
 done <<EOF
 $agents
 EOF
+[ "$dead_clean" -eq "$dead" ] && n=$dead || n="$dead_clean of $dead"
+[ "$dead_clean" -eq 0 ] || pass "$n destroyed agent(s): no netns, Kata processes, task or lease"
 was=$(echo "$agents" | awk -v id="$AGENT" '$1 == id { print $2 }')
 
 # --- resume a1 and test it from inside ------------------------------------------------------

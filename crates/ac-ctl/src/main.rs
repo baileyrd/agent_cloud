@@ -1,22 +1,34 @@
-//! `ac-ctl`: drive the agent fleet from the shell.
+//! `ac-ctl`: drive the agent fleet from the shell, and check (`doctor`) or set (`tune`) the
+//! host's settings from its facts (ADR-014). `doctor` and `tune` never open the registry.
 //!
 //! Exit codes: 0 ok, 1 operation failed (or `status` of an unknown agent), 2 bad usage, 3 the
 //! data directory is in use by another process (normally `ac-gateway`, which holds it while it
 //! runs): use the gateway's API instead, or stop it. `reconcile` prints one `<id> paused` line
 //! per agent it changed. `create` and `resume` are refused when the guest would not fit `/dev/shm`
 //! (ADR-012; the gateway's `AC_SHM_MARGIN_MIB`, `AC_VM_MEMORY_MIB`, `AC_KATA_CONFIG` and
-//! `AC_SHM_LIMIT_MIB` apply here too).
+//! `AC_SHM_LIMIT_MIB` apply here too). `doctor`: 0 all ok, 1 warnings, 4 errors found (2: bad
+//! usage, or it could not run). `tune`: 0 shown or applied, 1 refused or failed.
 
 mod args;
+mod doctor;
+mod factsjson;
+mod tune;
 
+use std::io;
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ac_ctr::capacity::{CapacityConfig, HostCapacity};
+use ac_ctr::facts::{collect, kata_sandboxes, HostRead, LinuxHost, Paths, Scope};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
+use ac_domain::tune::edit::stamp;
+use ac_domain::tune::{recommend, HostFacts};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::PortError;
 use ac_store::EngineStore;
-use args::{Action, Cli, Job, USAGE};
+use args::{Action, Cli, Command, Doctor, Job, Tune, USAGE};
 use platform_linux::LinuxSpawner;
 
 /// Exit code when another process holds the data directory.
@@ -100,12 +112,199 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("{id} {state:?}").to_lowercase())
 }
 
+/// Kata's configuration: `AC_KATA_CONFIG`, else the installed one.
+fn kata_config() -> PathBuf {
+    std::env::var("AC_KATA_CONFIG")
+        .unwrap_or_else(|_| "/etc/kata-containers/configuration.toml".to_owned())
+        .into()
+}
+
+fn paths(root: Option<&Path>) -> Paths {
+    let p = Paths::system(kata_config());
+    match root {
+        Some(r) => p.rooted(r),
+        None => p,
+    }
+}
+
+/// The facts, from a facts file or this host, and where they came from.
+fn host_facts(
+    facts_file: Option<&Path>,
+    root: Option<&Path>,
+    scope: Scope,
+) -> Result<(HostFacts, String), String> {
+    if let Some(file) = facts_file {
+        let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let facts = factsjson::from_json(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+        return Ok((facts, format!("facts file {}", file.display())));
+    }
+    let facts = collect(&LinuxHost::new(LinuxSpawner), &paths(root), scope)?;
+    let source = match root {
+        Some(r) => format!("this host, configuration under {}", r.display()),
+        None => "this host".to_owned(),
+    };
+    Ok((facts, source))
+}
+
+fn run_doctor(d: &Doctor) -> Result<u8, String> {
+    if d.explain {
+        print!("{}", doctor::explain());
+        return Ok(0);
+    }
+    let (facts, source) = host_facts(d.facts_file.as_deref(), d.root.as_deref(), Scope::Full)?;
+    let report = doctor::report(facts, d.profile, &source)?;
+    if d.json {
+        println!("{}", doctor::json(&report));
+    } else {
+        print!("{}", doctor::table(&report));
+    }
+    Ok(doctor::exit_code(&report.findings))
+}
+
+/// A file tune may edit, or why it cannot be read.
+fn text_of(path: &Path) -> (PathBuf, Result<String, String>) {
+    let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        io::ErrorKind::PermissionDenied => "root-only: run with sudo".to_owned(),
+        _ => e.to_string(),
+    });
+    (path.to_owned(), text)
+}
+
+/// Wait up to `limit` for something to listen on `bind`: the gateway reports active before it
+/// listens.
+fn wait_for_port(bind: &str, limit: Duration) -> Result<Duration, String> {
+    let addr: SocketAddr = bind.parse().map_err(|e| format!("AC_BIND={bind}: {e}"))?;
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
+            return Ok(start.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!(
+        "nothing listens on {bind} after {}s",
+        limit.as_secs()
+    ))
+}
+
+fn run_tune(t: &Tune) -> Result<u8, String> {
+    let host = LinuxHost::new(LinuxSpawner);
+    let (facts, source) = host_facts(t.facts_file.as_deref(), t.root.as_deref(), Scope::Settings)?;
+    let configured = doctor::profile(None, &facts)?;
+    let profile = t.profile.unwrap_or(configured);
+    let p = paths(t.root.as_deref());
+    let texts = if t.facts_file.is_some() {
+        let none = |path: &Path| {
+            (
+                path.to_owned(),
+                Err("facts file: no file to edit".to_owned()),
+            )
+        };
+        tune::Texts {
+            kata: none(&p.kata),
+            env: none(&p.gateway_env),
+            fstab: none(&p.fstab),
+        }
+    } else {
+        tune::Texts {
+            kata: text_of(&p.kata),
+            env: text_of(&p.gateway_env),
+            fstab: text_of(&p.fstab),
+        }
+    };
+    let options = facts
+        .shm
+        .known()
+        .map(|s| s.options.clone())
+        .unwrap_or_default();
+    let findings = recommend(&facts, profile);
+    let plan = tune::plan(
+        &findings,
+        t.profile.map(|p| (p, configured)),
+        &texts,
+        &options,
+    );
+    println!("ac-ctl tune: profile {}, {source}", profile.name());
+    print!("{}", tune::render(&plan));
+    if t.facts_file.is_none() {
+        for (path, text) in [&texts.kata, &texts.env, &texts.fstab] {
+            if let Err(why) = text {
+                println!("not checked: {}: {why}", path.display());
+            }
+        }
+    }
+    if !t.apply {
+        if !plan.edits.is_empty() {
+            println!("dry run: nothing written (--apply makes these edits)");
+        }
+        return Ok(0);
+    }
+    if plan.edits.is_empty() {
+        return Ok(0);
+    }
+    if host.euid() != 0 && t.root.is_none() {
+        return Err("--apply needs root (sudo), or --root DIR to edit copies".into());
+    }
+    let running = kata_sandboxes(&host.cmdlines());
+    let used = facts.shm_used_mib.known().copied();
+    if let Some(why) = tune::refusal(&plan, &running, t.force, used) {
+        return Err(format!("refused: {why}"));
+    }
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for backup in tune::apply(&plan, &stamp(secs))? {
+        println!("backup: {}", backup.display());
+    }
+    for line in tune::afterwards(&plan, &running, t.restart_gateway) {
+        println!("{line}");
+    }
+    if t.restart_gateway {
+        host.run(&["systemctl", "restart", "ac-gateway"])
+            .map_err(|e| format!("systemctl restart ac-gateway: {e}"))?;
+        let bind = gateway_bind(None, std::fs::read_to_string(&p.gateway_env).ok());
+        let took = wait_for_port(&bind, Duration::from_secs(60))?;
+        println!(
+            "gateway: restarted; listening on {bind} after {:.1}s",
+            took.as_secs_f64()
+        );
+    }
+    println!("\nafter applying:");
+    let (facts, source) = host_facts(None, t.root.as_deref(), Scope::Full)?;
+    print!(
+        "{}",
+        doctor::table(&doctor::report(facts, Some(profile), &source)?)
+    );
+    Ok(0)
+}
+
 fn main() -> ExitCode {
-    let cli = match args::parse(std::env::args().skip(1)) {
-        Ok(cli) => cli,
+    let command = match args::parse(std::env::args().skip(1)) {
+        Ok(command) => command,
         Err(e) => {
             eprintln!("ac-ctl: {e}\n{USAGE}");
             return ExitCode::from(2);
+        }
+    };
+    let cli = match command {
+        Command::Fleet(cli) => cli,
+        Command::Doctor(d) => {
+            return run_doctor(&d).map_or_else(
+                |e| {
+                    eprintln!("ac-ctl doctor: {e}");
+                    ExitCode::from(2)
+                },
+                ExitCode::from,
+            );
+        }
+        Command::Tune(t) => {
+            return run_tune(&t).map_or_else(
+                |e| {
+                    eprintln!("ac-ctl tune: {e}");
+                    ExitCode::FAILURE
+                },
+                ExitCode::from,
+            );
         }
     };
     match run(&cli) {

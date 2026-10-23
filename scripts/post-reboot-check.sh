@@ -2,7 +2,8 @@
 # After a host reboot: the units, firewall and agents came back as expected, and agent a1
 # resumes through the gateway with a working login and egress (ADR-007), runs a job through the
 # task API (ADR-010) with a throwaway jobs-only token that cannot pause it (ADR-011), and leaves
-# no zombies (tini is PID 1); committed guest memory fits /dev/shm (ADR-012). Run as root:
+# no zombies (tini is PID 1); committed guest memory fits /dev/shm (ADR-012); `ac-ctl doctor`
+# finds no errors in the host's settings (ADR-014). Run as root:
 #   sudo scripts/post-reboot-check.sh
 # Leaves the system as found: if it resumed a1, it pauses it again (KEEP_A1=1 leaves it running);
 # the throwaway token is revoked on every way out.
@@ -54,6 +55,16 @@ binds() {
     if out=$(private_binds "$1"); then pass "$1 bound only to private addresses: $out"; else bad "$1 binds: $out"; fi
 }
 binds ac-gateway
+
+# Settings against the host's facts (ADR-014): an error FAILs (naming its rules); warnings PASS, counted.
+doc=$(ac-ctl doctor --json 2>&1)
+top() { printf '%s\n' "$doc" | sed -n "s/^  \"$1\": \"\{0,1\}\([a-z0-9]*\)\"\{0,1\},\{0,1\}\$/\1/p"; }
+errs=$(top errors) warns=$(top warnings)
+case $errs in
+    0) pass "ac-ctl doctor: 0 errors, $warns warning(s), profile $(top profile)" ;;
+    [1-9]*) bad "ac-ctl doctor: $errs error(s): $(printf '%s\n' "$doc" | awk -F'"' '/^      "rule":/ { r = $4 } /^      "status": "error"/ { printf "%s ", r }')" ;;
+    *) bad "ac-ctl doctor --json: $(printf '%s' "$doc" | head -c 200)" ;;
+esac
 
 # --- agents ---------------------------------------------------------------------------------
 val() { sed -n "s/^$1=//p" "$ENV" | tail -n 1; }

@@ -173,6 +173,7 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    sudo sed -i 's/^#\?default_memory *=.*/default_memory = 2048/' /etc/kata-containers/configuration.toml   # measured enough, sizing.md
    sudo sed -i 's/^#\?default_vcpus *=.*/default_vcpus = 2/' /etc/kata-containers/configuration.toml
    ```
+   `sudo ac-ctl tune --apply` makes these three edits from the host's facts ([below](#host-settings-ac-ctl-doctor-and-ac-ctl-tune-adr-014)).
 4. **Repair the guest initrd.** Symptom: `timed out connecting to vsock`; booting the initrd by hand shows
    `kata-agent: error while loading shared libraries: libseccomp.so.2`. Run `sudo scripts/fix-kata-initrd.sh`
    and re-run it after any kernel update that regenerates the initrd.
@@ -199,7 +200,8 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
 9. **Size `/dev/shm` for the guests.** Kata keeps each guest's RAM in a file under `/dev/shm`
    (`memory-backend-file,mem-path=/dev/shm`). The default size is half of RAM; when it fills, guests die with
    `kvm run failed Bad address` while RAM is still free (measured, [sizing.md](sizing.md)). Make it MemTotal
-   minus an 8 GiB host reserve, in [`deploy/dev-shm.fstab`](../deploy/dev-shm.fstab). Recompute `size=` for
+   minus an 8 GiB host reserve, in [`deploy/dev-shm.fstab`](../deploy/dev-shm.fstab). (`sudo ac-ctl tune --apply` adds or
+   updates the line from MemTotal; it prints the remount instead of running it.) Recompute `size=` for
    another host with `awk '/MemTotal/ {printf "%dM\n", $2/1024 - 8192}' /proc/meminfo`, then:
    ```
    findmnt /dev/shm                                         # note its options; keep them in the line
@@ -426,6 +428,48 @@ afterwards (`KEEP_A1=1` leaves it running). It takes about 30 s.
 
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).
+
+## Host settings: `ac-ctl doctor` and `ac-ctl tune` (ADR-014)
+
+`doctor` checks this host's settings against what its facts recommend, with each figure marked `measured`
+(reproduces [sizing.md](sizing.md) on a host of that shape) or `extrapolated`. `tune` makes the settings it owns
+match: Kata's `default_memory`, `default_vcpus` and `default_maxmemory` (notes 3 and 9 above), the `gateway.env`
+keys and the `/dev/shm` fstab line. Neither opens the registry, so both work while the gateway runs.
+
+```bash
+cargo build --release -p ac-ctl && sudo install -m 0755 target/release/ac-ctl /usr/local/bin/
+ac-ctl doctor                        # as a user: gateway.env and the firewall are skipped, and it says so
+sudo ac-ctl doctor --profile build   # everything; exit 0 all ok, 1 warnings, 4 errors
+sudo ac-ctl doctor --json | python3 -m json.tool
+ac-ctl doctor --explain              # every rule, its evidence and its manual fix
+ac-ctl doctor --facts-file deploy/hosts/32g-8core-nvme.json --profile build   # plan a host you do not have
+sudo ac-ctl tune                     # dry run: the diffs it would make, then any manual steps
+sudo ac-ctl tune --apply             # with every Kata VM paused; then doctor again
+sudo ac-ctl tune --apply --restart-gateway   # also restart the gateway and wait for its port
+```
+
+- *Profiles.* `idle`, `build` (default) or `heavy` choose `default_memory`. `tune --profile heavy --apply` also
+  writes `AC_PROFILE=heavy` to `gateway.env`, which doctor and the gateway then judge against.
+- *Backups.* Every file `--apply` changes is first copied to `<file>.ac-tune-<UTC stamp>`, for example
+  `/etc/kata-containers/configuration.toml.ac-tune-20261023T150102Z`. To undo, copy it back.
+- *What it will not do.* Reboot, remount (it prints `sudo mount -o remount,size=<N>M /dev/shm`), rebuild the
+  initrd (`sudo scripts/fix-kata-initrd.sh`) or touch the firewall and units: it prints those as manual steps.
+  It refuses while a Kata VM runs (`--force` overrides; the agents it names keep the old settings until paused
+  and resumed) and refuses a `/dev/shm` smaller than what is in use.
+- *Trying it on copies.* `--root DIR` reads and edits `DIR/etc/fstab`, `DIR/etc/kata-containers/configuration.toml`
+  and `DIR/etc/agent-cloud/gateway.env` instead (no root needed); the other facts are still this host's:
+  ```bash
+  R=$(mktemp -d); mkdir -p $R/etc/kata-containers $R/etc/agent-cloud
+  cp /etc/fstab $R/etc/; cp /etc/kata-containers/configuration.toml $R/etc/kata-containers/
+  sudo cat /etc/agent-cloud/gateway.env > $R/etc/agent-cloud/gateway.env
+  ac-ctl tune --root $R && ac-ctl tune --root $R --apply && ac-ctl tune --root $R
+  ```
+- *Facts files.* `sudo ac-ctl doctor --json` includes `facts`; save them (or write a subset by hand: only
+  `mem_total_mib` and `cores` are required) and pass the file to `--facts-file`. `deploy/hosts/` has this host
+  and a hypothetical 32 GiB / 8 core / NVMe box.
+- *The gateway* logs one line at startup when its settings differ from the recommendation
+  (`journalctl -u ac-gateway | grep 'settings differ'`); it never changes them.
+- `scripts/post-reboot-check.sh` runs `ac-ctl doctor --json`: errors FAIL, warnings PASS with their count.
 
 ## Operations: commands not to run
 

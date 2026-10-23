@@ -1,0 +1,9 @@
+{
+  "note": "Hypothetical host for planning (ADR-014): 32 GiB RAM, 8 cores, NVMe. MemTotal is ~97% of installed RAM, as on BaileyServ (23909 of 24576 MiB). Facts left out are skipped. Try: ac-ctl doctor --facts-file deploy/hosts/32g-8core-nvme.json --profile build",
+  "mem_total_mib": 31880,
+  "cores": 8,
+  "phys_bits": 39,
+  "virt": "vmx",
+  "disk": "solid",
+  "kvm": "usable"
+}

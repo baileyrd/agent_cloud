@@ -25,6 +25,7 @@ Built as one deployable with clear module boundaries (see [ADR-005](decisions.md
 |---|---|
 | Gateway | Entry point, scoped bearer tokens (ADR-011), lifecycle API, the terminal viewer (one streamed response per viewer, tmux control mode into the VM; ADR-006), the task API (jobs: `claude -p` in a tmux window, supervised from the host; ADR-010; started through a host-wide gate, ADR-013) |
 | Spawner | Creates, pauses and destroys agents; provisions workspace volumes |
+| Host settings | `ac-ctl doctor`/`tune`: settings recommended from host facts and a workload profile, each marked measured or extrapolated; never takes the registry lock (ADR-014) |
 | Session store | Embedded registry on `rusty_multimodal_db_engine` (agents, lifecycle state, jobs) plus an append-only segment log per agent for events ([ADR-009](decisions.md)) |
 | Workspace volumes | One quota-limited volume per agent |
 | Secrets | Root-owned 0600 env files; never readable by the agent user |

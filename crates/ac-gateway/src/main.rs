@@ -17,6 +17,8 @@
 //! Job start gate (ADR-013; defaults in [`Limits::for_cores`]): `AC_MAX_RUNNING_JOBS` (host-wide,
 //! default the core count), `AC_JOB_CPU_PSI_MAX` (start only while cpu PSI some avg10 is below
 //! this, 40), `AC_JOB_START_SPACING` (least seconds between starts, 15).
+//! Settings (ADR-014): `AC_PROFILE` (`idle`, `build` or `heavy`, default build); at startup the
+//! gateway logs one line if its settings differ from what `ac-ctl doctor` recommends.
 //! Admission (ADR-012): `AC_SHM_MARGIN_MIB` (MiB of `/dev/shm` kept free, default 512),
 //! `AC_VM_MEMORY_MIB` (guest size, instead of `default_memory` in `AC_KATA_CONFIG`, default
 //! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
@@ -44,10 +46,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ac_ctr::capacity::{CapacityConfig, GuestSource, HostCapacity};
+use ac_ctr::facts::{collect, LinuxHost, Paths, Scope};
 use ac_ctr::host::{Monotonic, ProcPressure};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_domain::health::Thresholds;
 use ac_domain::schedule::Limits;
+use ac_domain::tune::rules::drift;
+use ac_domain::tune::{recommend, Fact, Profile};
 use ac_domain::GuestMemory;
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Jobs};
@@ -252,6 +257,38 @@ fn watch_tokens(mut file: TokenFile, legacy: Option<Token>, keys: Keys) -> Resul
     Ok(())
 }
 
+/// One log line when this gateway's settings (its environment, Kata's configuration, `/dev/shm`)
+/// differ from what `ac-ctl doctor` recommends for this host and `AC_PROFILE` (ADR-014). It
+/// only warns; it never changes anything.
+fn settings_check() {
+    let kata = env("AC_KATA_CONFIG", "/etc/kata-containers/configuration.toml");
+    let mut facts = match collect(
+        &LinuxHost::new(LinuxSpawner),
+        &Paths::system(kata.into()),
+        Scope::Settings,
+    ) {
+        Ok(f) => f,
+        Err(e) => return eprintln!("ac-gateway: settings check skipped: {e}"),
+    };
+    facts.gateway = Fact::Known(
+        std::env::vars()
+            .filter(|(k, _)| k.starts_with("AC_"))
+            .collect(),
+    );
+    let name = env("AC_PROFILE", "build");
+    let Some(profile) = Profile::parse(&name) else {
+        return eprintln!(
+            "ac-gateway: AC_PROFILE={name}: want idle, build or heavy; run ac-ctl doctor"
+        );
+    };
+    if let Some(line) = drift(&recommend(&facts, profile)) {
+        eprintln!(
+            "ac-gateway: settings differ from the recommendation for this host (profile {name}): \
+             {line}; run ac-ctl doctor"
+        );
+    }
+}
+
 fn run() -> Result<(), String> {
     let mut file = tokens_file()?;
     let (tokens, legacy) = load_tokens(&mut file)?;
@@ -298,6 +335,7 @@ fn run() -> Result<(), String> {
     )?;
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let gate = limits()?;
+    settings_check();
     eprintln!(
         "ac-gateway: jobs: at most {} running; a job starts while cpu PSI some < {} and load < {} x \
          cores, at least {}s after the last start",

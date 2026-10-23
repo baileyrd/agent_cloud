@@ -550,24 +550,13 @@ fn random_hex() -> Result<String, String> {
     Ok(hex(&b))
 }
 
-/// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ`.
+/// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (`rusty_time`); past its range (a year beyond `i32`),
+/// the raw seconds as `@<secs>`.
 pub fn utc(secs: u64) -> String {
-    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
-    // Days to civil date (H. Hinnant, chrono-compatible algorithms).
-    let z = days + 719_468;
-    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60
-    )
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| rusty_time::DateTime::from_unix_secs(s).ok())
+        .map_or_else(|| format!("@{secs}"), |t| t.to_iso8601())
 }
 
 #[cfg(test)]

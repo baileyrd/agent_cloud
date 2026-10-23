@@ -322,6 +322,31 @@ the next one starts. The two layers relate to the build measurements above like 
   `AC_JOB_START_SPACING=60`. Neither was measured with real builds.
 - The gate only decides starts. A job that starts idle and then builds is not slowed down.
 
+## Settings from host facts (ADR-014)
+
+`ac-ctl doctor` turns the figures above into rules over a host's facts; `ac-ctl tune` applies them
+([install.md](install.md#host-settings-ac-ctl-doctor-and-ac-ctl-tune-adr-014)). A recommendation is `measured` only
+where it reproduces a measurement on this shape of host; elsewhere it is `extrapolated`. The PSI limit is a third
+case, `measured input, gate unvalidated`: its input was measured here, its effect as a gate was not.
+
+| Rule | From | Measured | Carried over |
+|---|---|---|---|
+| `/dev/shm` = MemTotal − 8 GiB (MemTotal/2 below 16 GiB; error below 8 GiB) | the staircase's N=6 failure with RAM free; ADR-012's 15717 MiB | MemTotal 23909 MiB (± 2 GiB) | the 8 GiB reserve on bigger hosts: this host used ~1.5 GiB idle plus page cache |
+| `default_maxmemory` = 8192 at ≤ 36 address bits | install.md note 3: QEMU's "phys-bits too low (36)" | 36 bits | fewer than 36 bits; above 36 Kata's default is left alone, untested here |
+| `default_vcpus` = 2 at ≥ 4 cores, else 1, never above 2 | Builds at once: 2 vCPUs ~40% faster, 3 builds at 2 vCPUs 7% slower | 4 cores | any other core count; more than 2 vCPUs per guest was never run |
+| `default_memory` idle 2048, build 2048, heavy 4096 | Claude Code ~475 MiB used; this repo's builds 468 MiB used, ≥ 65% free | idle, build | heavy: bigger builds were not measured |
+| `AC_MAX_RUNNING_JOBS` = cores | ADR-013, Jobs at once | 4 cores | other core counts |
+| `AC_JOB_CPU_PSI_MAX` = 20 on 4 cores with 2-vCPU guests, else 40 | Builds at once: 2 builds peaked at CPU PSI 23.7, 3 at 59.9 | the input only: on 4 cores, 2 vCPUs it is `measured input, gate unvalidated` (the gate at 20 never ran against real builds) | every other shape: the default 40, "uncalibrated" |
+| Forecast: agents = floor((`/dev/shm` − 512) / guest), builds = floor(cores / vCPUs) | Admission capacity; Builds at once | 7 agents and 2 builds here | the builds figure on other core counts |
+| Boot class | Real builds: cold boot 18–19 s against 3.5 s warm | rotational | SSD and NVMe: no SSD was measured |
+
+**Uncalibrated on other hardware.** On any host but this shape: how many builds at once a core count carries
+(the CPU-bound limit was measured on 4 cores only), the PSI limit that holds them there, more than 2 vCPUs per
+guest, the host reserve above 24 GiB, and every SSD figure. Run `scripts/real-build-bench.sh` (`matrix`, then
+`concurrent`) on such a host before trusting `extrapolated` figures for builds. For planning,
+`ac-ctl doctor --facts-file deploy/hosts/32g-8core-nvme.json --profile build` forecasts 11 agents at 2048 MiB
+(admission, measured arithmetic) and 4 builds at once (extrapolated).
+
 ## What this implies for hardware
 
 Planning numbers, from the measurements above:

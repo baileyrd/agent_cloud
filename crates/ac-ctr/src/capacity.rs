@@ -3,7 +3,7 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ac_domain::capacity::kata_default_memory;
 use ac_domain::GuestMemory;
@@ -61,16 +61,20 @@ impl HostCapacity {
     }
 }
 
+/// (total, free) MiB of the filesystem holding `path`, from statfs(2).
+pub fn statfs_total_free(path: &Path) -> Result<(u64, u64), PortError> {
+    let fail = |cause: String| PortError {
+        op: "statfs",
+        cause: format!("{}: {cause}", path.display()),
+    };
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(|e| fail(e.to_string()))?;
+    let stats = rusty_libc::fs::statfs(&c).map_err(|e| fail(e.to_string()))?;
+    Ok(statfs_mib(&stats))
+}
+
 impl Capacity for HostCapacity {
     fn shm(&self) -> Result<Shm, PortError> {
-        let path = &self.cfg.shm;
-        let fail = |cause: String| PortError {
-            op: "statfs",
-            cause: format!("{}: {cause}", path.display()),
-        };
-        let c = CString::new(path.as_os_str().as_bytes()).map_err(|e| fail(e.to_string()))?;
-        let stats = rusty_libc::fs::statfs(&c).map_err(|e| fail(e.to_string()))?;
-        let (total, free) = statfs_mib(&stats);
+        let (total, free) = statfs_total_free(&self.cfg.shm)?;
         Ok(limit(total, free, self.cfg.shm_limit_mib))
     }
 

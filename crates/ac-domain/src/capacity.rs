@@ -128,33 +128,15 @@ impl GuestMemory {
     }
 }
 
-/// `default_memory` of the first `[hypervisor.*]` table of a Kata `configuration.toml` that sets
-/// it. Takes `default_memory = 4096`, `default_memory=4096 # note` and `default_memory = "4096"`;
-/// commented-out lines and other tables are ignored. A value that is not a positive integer is an
+/// `default_memory` of the first `[hypervisor.*]` table of a Kata `configuration.toml`, read by
+/// [`crate::tune::facts::kata`]. A value that is not a positive integer, or a key set twice, is an
 /// error, not a fallback.
 pub fn kata_default_memory(toml: &str) -> Result<GuestMemory, String> {
-    let mut in_hypervisor = false;
-    for line in toml.lines() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        if line.starts_with('[') {
-            in_hypervisor = line.starts_with("[hypervisor.");
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if !in_hypervisor || key.trim() != "default_memory" {
-            continue;
-        }
-        let value = value.trim().trim_matches('"');
-        return match value.parse::<u64>() {
-            Ok(mib) if mib > 0 => Ok(GuestMemory::Configured(mib)),
-            _ => Err(format!(
-                "default_memory = {value:?} is not a positive number of MiB"
-            )),
-        };
+    match crate::tune::facts::kata(toml)?.default_memory {
+        None => Ok(GuestMemory::KataDefault),
+        Some(0) => Err("default_memory = 0 is not a positive number of MiB".into()),
+        Some(mib) => Ok(GuestMemory::Configured(mib)),
     }
-    Ok(GuestMemory::KataDefault)
 }
 
 #[cfg(test)]

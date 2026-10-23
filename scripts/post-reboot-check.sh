@@ -185,9 +185,11 @@ out=$(gx api 'curl -sS -m 8 -I https://api.anthropic.com')
 st=$(echo "$out" | grep '^HTTP/' | sed -n 2p | tr -d '\r')
 [ -n "$st" ] && pass "api.anthropic.com via proxy: $st" || bad "api.anthropic.com: $(echo "$out" | head -n 3 | tr '\n' ' ')"
 
-out=$(gx deny 'curl -sS -m 8 -I https://example.com')
+# Only the proxy's CONNECT status, on stdout: curl's error line (stderr) and headers (stdout) come back
+# interleaved through the exec, which once split the phrase this used to match.
+out=$(gx deny 'curl -s -m 8 -o /dev/null -w "connect=%{http_connect}" https://example.com')
 case $out in
-    *'CONNECT tunnel failed, response 403'*) pass "example.com denied by the proxy (403)" ;;
+    *connect=403*) pass "example.com denied by the proxy (403)" ;;
     *) bad "example.com not denied: $(echo "$out" | head -n 3 | tr '\n' ' ')" ;;
 esac
 

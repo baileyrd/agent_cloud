@@ -56,12 +56,13 @@ pub fn report(facts: HostFacts, given: Option<Profile>, source: &str) -> Result<
     })
 }
 
-/// 0 when nothing is worse than info, 1 with warnings, 2 with errors.
+/// 0 when nothing is worse than info, 1 with warnings, 4 with errors: ac-ctl already exits 2 for
+/// bad usage and 3 when the gateway holds the data directory.
 pub fn exit_code(findings: &[Finding]) -> u8 {
     match worst(findings) {
         Status::Ok | Status::Info => 0,
         Status::Warn => 1,
-        Status::Error => 2,
+        Status::Error => 4,
     }
 }
 
@@ -251,7 +252,7 @@ mod tests {
         // An error: no /dev/kvm.
         let mut f = facts();
         f.kvm = ac_domain::tune::Fact::Absent;
-        assert_eq!(exit(f), 2);
+        assert_eq!(exit(f), 4);
     }
 
     #[test]

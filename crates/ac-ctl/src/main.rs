@@ -6,8 +6,8 @@
 //! runs): use the gateway's API instead, or stop it. `reconcile` prints one `<id> paused` line
 //! per agent it changed. `create` and `resume` are refused when the guest would not fit `/dev/shm`
 //! (ADR-012; the gateway's `AC_SHM_MARGIN_MIB`, `AC_VM_MEMORY_MIB`, `AC_KATA_CONFIG` and
-//! `AC_SHM_LIMIT_MIB` apply here too). `doctor`: 0 all ok, 1 warnings, 2 errors (or it could not
-//! run). `tune`: 0 shown or applied, 1 refused or failed.
+//! `AC_SHM_LIMIT_MIB` apply here too). `doctor`: 0 all ok, 1 warnings, 4 errors found (2: bad
+//! usage, or it could not run). `tune`: 0 shown or applied, 1 refused or failed.
 
 mod args;
 mod doctor;

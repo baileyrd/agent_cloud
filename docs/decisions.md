@@ -539,7 +539,9 @@ NVMe host forecasts 11 agents at 2048 MiB and 4 builds at once (extrapolated).
   until `scripts/real-build-bench.sh` calibrates it there.
 - A setting a person chose deliberately below the recommendation (fewer job slots, a calibrated PSI limit on
   other hardware) is `info`, not a warning, and tune leaves it.
-- Exit codes: doctor 0 ok, 1 warnings, 2 errors; `post-reboot-check.sh` FAILs on errors only.
+- Exit codes: doctor 0 ok, 1 warnings, 4 errors (ac-ctl's 2 is bad usage, or doctor could not run, and 3 is
+  "the gateway holds the data dir"); `post-reboot-check.sh` reads the JSON `errors` count, not the exit code,
+  and FAILs on errors only.
 - MemTotal moves by a few MiB across kernels, so `/dev/shm` within 1% of the target is ok.
 
 **Not now:** calibrating the PSI limit automatically; editing the initrd, firewall or units; per-agent memory

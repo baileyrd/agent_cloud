@@ -16,7 +16,7 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
   destroy keeps the agent's workspace; destroy --purge removes it (also after a plain destroy).
   reconcile marks agents recorded running but with no VM (after a reboot) paused, for resume.
   doctor compares this host's settings with what its facts recommend for the profile (ADR-014):
-    read-only; exit 0 all ok, 1 warnings, 2 errors. --facts-file plans a host from a JSON file of
+    read-only; exit 0 all ok, 1 warnings, 4 errors. --facts-file plans a host from a JSON file of
     facts (deploy/hosts/) instead of this one; --explain lists every rule and its evidence.
   tune prints the edits doctor recommends as diffs; --apply (root) makes them, with backups, and
     refuses while a Kata VM runs unless --force. --root DIR edits copies under DIR instead.
@@ -435,6 +435,8 @@ mod tests {
         ] {
             assert!(USAGE.contains(flag), "{flag}");
         }
+        // doctor's codes stay clear of bad usage (2) and "data dir in use" (3).
+        assert!(USAGE.contains("exit 0 all ok, 1 warnings, 4 errors"));
     }
 
     #[test]

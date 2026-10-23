@@ -439,7 +439,7 @@ keys and the `/dev/shm` fstab line. Neither opens the registry, so both work whi
 ```bash
 cargo build --release -p ac-ctl && sudo install -m 0755 target/release/ac-ctl /usr/local/bin/
 ac-ctl doctor                        # as a user: gateway.env and the firewall are skipped, and it says so
-sudo ac-ctl doctor --profile build   # everything; exit 0 all ok, 1 warnings, 2 errors
+sudo ac-ctl doctor --profile build   # everything; exit 0 all ok, 1 warnings, 4 errors
 sudo ac-ctl doctor --json | python3 -m json.tool
 ac-ctl doctor --explain              # every rule, its evidence and its manual fix
 ac-ctl doctor --facts-file deploy/hosts/32g-8core-nvme.json --profile build   # plan a host you do not have

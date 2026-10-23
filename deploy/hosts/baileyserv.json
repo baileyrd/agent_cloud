@@ -1,0 +1,51 @@
+{
+  "allowlist_mode": {
+    "gid": 0,
+    "mode": "0600",
+    "uid": 0
+  },
+  "cores": 4,
+  "disk": "rotational",
+  "firewall": {
+    "skipped": "nft and firewall-cmd need root: run with sudo"
+  },
+  "gateway": {
+    "skipped": "/etc/agent-cloud/gateway.env is root-only: run with sudo"
+  },
+  "initrd_net": true,
+  "kata": {
+    "default_maxmemory": 8192,
+    "default_maxvcpus": 0,
+    "default_memory": 2048,
+    "default_vcpus": 2,
+    "initrd": "/var/cache/kata-containers/kata-containers-initrd.img"
+  },
+  "kvm": "usable",
+  "mem_total_mib": 23909,
+  "phys_bits": 36,
+  "shm": {
+    "options": [
+      "nosuid",
+      "nodev",
+      "inode64",
+      "usrquota"
+    ],
+    "size_mib": 15717
+  },
+  "shm_fstab": {
+    "options": [
+      "nosuid",
+      "nodev",
+      "inode64",
+      "usrquota"
+    ],
+    "size_mib": 15717
+  },
+  "shm_used_mib": 1,
+  "tokens_mode": {
+    "gid": 0,
+    "mode": "0600",
+    "uid": 0
+  },
+  "virt": "vmx"
+}

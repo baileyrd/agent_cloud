@@ -12,6 +12,8 @@ dependencies = [
  "ac-ports",
  "ac-store",
  "platform-linux",
+ "rusty_atomic_file",
+ "rusty_json",
 ]
 
 [[package]]

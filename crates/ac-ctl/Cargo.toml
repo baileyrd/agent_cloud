@@ -1,6 +1,6 @@
 [package]
 name = "ac-ctl"
-description = "Command-line driver for the agent fleet: create, pause, resume, destroy, status."
+description = "Command-line driver for the agent fleet (create, pause, resume, destroy, status) and the host's settings (doctor, tune)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,8 @@ ac-fleet = { path = "../ac-fleet" }
 ac-ctr = { path = "../ac-ctr" }
 ac-store = { path = "../ac-store" }
 platform-linux.workspace = true
+rusty_json.workspace = true
+rusty_atomic_file.workspace = true
 
 [lints]
 workspace = true

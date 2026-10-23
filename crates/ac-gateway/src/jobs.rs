@@ -5,9 +5,14 @@
 //! - `POST jobs` `{"prompt", "timeout_secs"?, "idempotency_key"?}`: 202 and the job (200 and the
 //!   existing job for a known key);
 //! - `GET jobs`: the agent's jobs, newest first;
-//! - `GET jobs/{job}[?wait=N]`: the job; with `wait` (at most 30 s), once its state changes;
+//! - `GET jobs/{job}[?wait=N]`: the job; with `wait` (at most 30 s), once its state changes. A
+//!   queued job says why it waits in `queued_reason` (ADR-013; `null` until the supervisor's next
+//!   tick, within a second);
 //! - `GET jobs/{job}/output[?part=stream]`: the final message, or the stream-json log, as text;
 //! - `POST jobs/{job}/cancel`.
+//!
+//! A queued job starts when its agent is free and the host-wide gate is open ([`schedule`]): fewer
+//! than `max_running` jobs run, the CPU is not saturated, and the last start was long enough ago.
 //!
 //! The registry ([`JobStore`]) holds state, times, timeout and exit code. What the agent writes
 //! (result, log) is untrusted: it is read in the VM through capped execs, kept capped under
@@ -19,18 +24,20 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ac_ctr::CtrRuntime;
+use ac_domain::health::Pressure;
 use ac_domain::job;
+use ac_domain::schedule::{self, Limits, Wait};
 use ac_domain::{AgentId, Job, JobEvent, JobId, JobState, State};
-use ac_ports::{JobStore, SessionStore};
+use ac_ports::{HostLoad, JobStore, SessionStore};
 use platform::process::Spawner;
 use rusty_json::Value;
 
-use crate::{error, escape, Busy, Reply};
+use crate::{error, escape, Busy, JobCounts, Reply};
 
 /// Jobs waiting behind the running one, per agent.
 pub const MAX_QUEUE: usize = 8;
@@ -437,12 +444,13 @@ pub fn parse_request(body: &[u8]) -> Result<Request, Reply> {
     })
 }
 
-/// A job as JSON.
-pub fn render(j: &Job) -> String {
+/// A job as JSON; `wait` is why it is still queued, if known.
+pub fn render(j: &Job, wait: Option<Wait>) -> String {
     let opt = |v: Option<String>| v.unwrap_or_else(|| "null".to_owned());
     let text = |v: &Option<String>| opt(v.as_deref().map(|s| format!("\"{}\"", escape(s))));
+    let wait = wait.filter(|_| j.state == JobState::Queued);
     format!(
-        r#"{{"job_id":"{}","agent":"{}","state":"{}","created_ms":{},"started_ms":{},"finished_ms":{},"timeout_secs":{},"exit_code":{},"idempotency_key":{},"reason":{}}}"#,
+        r#"{{"job_id":"{}","agent":"{}","state":"{}","created_ms":{},"started_ms":{},"finished_ms":{},"timeout_secs":{},"exit_code":{},"idempotency_key":{},"reason":{},"queued_reason":{}}}"#,
         j.id,
         j.agent,
         j.state.name(),
@@ -453,6 +461,7 @@ pub fn render(j: &Job) -> String {
         opt(j.exit_code.map(|v| v.to_string())),
         text(&j.key),
         text(&j.reason),
+        opt(wait.map(|w| format!("\"{}\"", w.name()))),
     )
 }
 
@@ -468,6 +477,12 @@ pub struct Jobs {
     claude: Vec<String>,
     notes: Notes,
     clock: Clock,
+    limits: Limits,
+    load: Option<Box<dyn HostLoad + Send + Sync>>,
+    /// Why each queued job waited at the last tick (by job id).
+    waits: Mutex<HashMap<String, Wait>>,
+    /// The last pressure read failed (logged once per failure streak).
+    blind: AtomicBool,
     /// Serialises read-modify-write of job records; holds when each running job was last polled.
     book: Mutex<HashMap<String, u64>>,
     changed: Condvar,
@@ -492,6 +507,10 @@ impl Jobs {
             claude,
             notes: Box::new(|_, _| {}),
             clock: Box::new(now_ms),
+            limits: Limits::OPEN,
+            load: None,
+            waits: Mutex::new(HashMap::new()),
+            blind: AtomicBool::new(false),
             book: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
             waiters: AtomicUsize::new(0),
@@ -507,6 +526,18 @@ impl Jobs {
     /// Read the time (ms since the epoch) from `clock`.
     pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Box::new(clock);
+        self
+    }
+
+    /// Start queued jobs only within `limits`, reading host pressure from `load` (ADR-013).
+    /// Without this, every agent starts its next job at once.
+    pub fn with_gate(
+        mut self,
+        limits: Limits,
+        load: impl HostLoad + Send + Sync + 'static,
+    ) -> Self {
+        self.limits = limits;
+        self.load = Some(Box::new(load));
         self
     }
 
@@ -531,7 +562,7 @@ impl Jobs {
             Err(e) => return error(500, &e.to_string()),
         };
         if let Some(j) = jobs.iter().find(|j| req.key.is_some() && j.key == req.key) {
-            return ok(200, render(j));
+            return ok(200, self.render(j));
         }
         if jobs.iter().filter(|j| j.state == JobState::Queued).count() >= MAX_QUEUE {
             return error(429, &format!("{MAX_QUEUE} jobs already queued for {agent}"));
@@ -554,7 +585,7 @@ impl Jobs {
         }
         (self.notes)(agent, &format!("job {} queued", j.id));
         self.changed.notify_all();
-        ok(202, render(&j))
+        ok(202, self.render(&j))
     }
 
     /// Answer a job route other than [`Route::Submit`].
@@ -584,7 +615,7 @@ impl Jobs {
         match self.store.jobs(agent) {
             Ok(mut jobs) => {
                 jobs.sort_by_key(|j| std::cmp::Reverse(j.created_ms));
-                let items: Vec<String> = jobs.iter().map(render).collect();
+                let items: Vec<String> = jobs.iter().map(|j| self.render(j)).collect();
                 ok(200, format!(r#"{{"jobs":[{}]}}"#, items.join(",")))
             }
             Err(e) => error(500, &e.to_string()),
@@ -597,7 +628,7 @@ impl Jobs {
             Err(reply) => return reply,
         };
         if wait == 0 || first.state.is_terminal() {
-            return ok(200, render(&first));
+            return ok(200, self.render(&first));
         }
         if self.waiters.fetch_add(1, Ordering::SeqCst) >= MAX_WAITERS {
             self.waiters.fetch_sub(1, Ordering::SeqCst);
@@ -607,11 +638,11 @@ impl Jobs {
         let mut book = self.lock();
         let reply = loop {
             match self.find(agent, id) {
-                Ok(j) if j.state != first.state => break ok(200, render(&j)),
+                Ok(j) if j.state != first.state => break ok(200, self.render(&j)),
                 Ok(j) => {
                     let left = end.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        break ok(200, render(&j));
+                        break ok(200, self.render(&j));
                     }
                     book = match self.changed.wait_timeout(book, left) {
                         Ok((b, _)) => b,
@@ -660,30 +691,92 @@ impl Jobs {
             }
         }
         match self.transition(agent, id, JobEvent::Cancel, Some("cancelled by a caller")) {
-            Ok(j) => ok(200, render(&j)),
+            Ok(j) => ok(200, self.render(&j)),
             Err(reply) => reply,
         }
     }
 
-    /// One supervisor step: end jobs of agents that stopped, then per agent poll or time out the
-    /// running job, or start the oldest queued one. Called every second by the gateway.
+    /// One supervisor step: end jobs of agents that stopped, poll or time out the running jobs,
+    /// then start what the gate allows, oldest first ([`schedule::plan`]). Decisions use the
+    /// snapshot taken at the start of the tick, so a job that just ended frees its agent and its
+    /// slot at the next tick. Called every second by the gateway.
     pub fn tick(&self) {
         self.reconcile();
-        let mut by_agent: HashMap<String, Vec<Job>> = HashMap::new();
-        match self.store.active_jobs() {
-            Ok(all) => all.into_iter().for_each(|j| {
-                by_agent.entry(j.agent.to_string()).or_default().push(j);
-            }),
-            Err(e) => eprintln!("ac-gateway: jobs: {e}"),
+        let mut active = match self.store.active_jobs() {
+            Ok(all) => all,
+            Err(e) => {
+                eprintln!("ac-gateway: jobs: {e}");
+                return;
+            }
+        };
+        for j in active.iter().filter(|j| j.state == JobState::Running) {
+            self.supervise(j);
         }
-        for mut jobs in by_agent.into_values() {
-            jobs.sort_by_key(|j| j.created_ms);
-            if let Some(running) = jobs.iter().find(|j| j.state == JobState::Running) {
-                self.supervise(running);
-            } else if let Some(next) = jobs.first() {
-                self.start(next);
+        let queued = active.iter().any(|j| j.state == JobState::Queued);
+        let pressure = if queued { self.pressure() } else { None };
+        let plan = loop {
+            let now = (self.clock)();
+            let plan = schedule::plan(&active, pressure.as_ref(), now, &self.limits);
+            let Some(j) = plan
+                .start
+                .as_ref()
+                .and_then(|id| active.iter_mut().find(|j| j.id == *id))
+            else {
+                break plan;
+            };
+            self.start(j);
+            // Counted as running from now on in this tick's decisions, however its start went.
+            let _ = j.apply(JobEvent::Start, now);
+        };
+        self.remember(plan, &active);
+    }
+
+    /// Host pressure for the gate; `None` (gate skipped) without a source or when unreadable.
+    fn pressure(&self) -> Option<Pressure> {
+        match self.load.as_ref()?.pressure() {
+            Ok(p) => {
+                if self.blind.swap(false, Ordering::SeqCst) {
+                    eprintln!("ac-gateway: jobs: host pressure readable again");
+                }
+                Some(p)
+            }
+            Err(e) => {
+                if !self.blind.swap(true, Ordering::SeqCst) {
+                    eprintln!("ac-gateway: jobs: {e}; starting jobs without the pressure gate");
+                }
+                None
             }
         }
+    }
+
+    /// Keep why each queued job waits, for `queued_reason`, and log each change of reason.
+    fn remember(&self, plan: schedule::Plan, active: &[Job]) {
+        let mut waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+        let next: HashMap<String, Wait> = plan
+            .waits
+            .into_iter()
+            .map(|(id, w)| (id.to_string(), w))
+            .collect();
+        for (id, w) in &next {
+            if waits.get(id) != Some(w) {
+                let why = match (w, &plan.busy) {
+                    (Wait::HostBusy, Some(b)) => format!(" ({b})"),
+                    _ => String::new(),
+                };
+                let agent = active
+                    .iter()
+                    .find(|j| j.id.as_str() == id)
+                    .map(|j| &j.agent);
+                let agent = agent.map_or_else(String::new, |a| format!("{a}/"));
+                eprintln!("ac-gateway: jobs: {agent}{id}: waits: {}{why}", w.name());
+            }
+        }
+        *waits = next;
+    }
+
+    fn render(&self, j: &Job) -> String {
+        let waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+        render(j, waits.get(j.id.as_str()).copied())
     }
 
     /// End the jobs of agents that are not running: running ones become `interrupted`, queued
@@ -867,6 +960,19 @@ impl Jobs {
 }
 
 impl Busy for Jobs {
+    fn counts(&self) -> Option<JobCounts> {
+        let active = self.store.active_jobs().ok()?;
+        let running = active
+            .iter()
+            .filter(|j| j.state == JobState::Running)
+            .count();
+        Some(JobCounts {
+            running,
+            queued: active.len() - running,
+            max_running: self.limits.max_running,
+        })
+    }
+
     fn busy(&self, id: &AgentId) -> bool {
         self.store
             .jobs(id)

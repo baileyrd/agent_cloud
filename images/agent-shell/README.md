@@ -19,11 +19,12 @@ sudo ctr -n agents images ls            # note the name, expected localhost/agen
 Claude Code's [setup docs](https://code.claude.com/docs/en/troubleshoot-install) ask for 4 GB of RAM;
 Kata's default VM is 2 GB. Measured here, 2048 MiB is enough for Claude Code (peak ~190 MiB) and for a
 release build of this repo (guest used ≤ 468 MiB); see [docs/sizing.md](../../docs/sizing.md#real-builds).
-The current setting, in `/etc/kata-containers/configuration.toml` (not yet changed, see the roadmap):
+The current setting, in `/etc/kata-containers/configuration.toml`:
 
 ```
-default_memory = 4096
+default_memory = 2048
 default_maxmemory = 8192
+default_vcpus = 2
 ```
 
 ## Start an agent and attach
@@ -46,8 +47,8 @@ subscription) prints a login URL to open in your own browser. Or export `ANTHROP
 on it, with a new network namespace. The image sets `CLAUDE_CONFIG_DIR=/workspace/.claude`, so Claude Code's
 `.claude.json`, login (`.credentials.json`) and sessions live on the workspace volume and survive
 pause/resume (verified on a fresh agent: VM up 0 min after resume, `claude -p` still logged in). Agents
-created from an older image keep them in `/home/agent`, on the image layer, and lose them on pause. Verified with Claude Code 2.1.302:
-the VM reports 3.9 GB total with `default_memory = 4096`, and 1 vCPU by default.
+created from an older image keep them in `/home/agent`, on the image layer, and lose them on pause. Verified with Claude Code 2.1.302,
+when the setting was `default_memory = 4096` and 1 vCPU: the VM reported 3.9 GB total.
 
 A create that fails or times out cleans up after itself: it kills the sandbox's QEMU, shim and virtiofsd,
 removes `/run/vc/{vm,sbs}/<id>`, the container, its snapshot and the network. Each create also first removes

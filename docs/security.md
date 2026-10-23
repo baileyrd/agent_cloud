@@ -165,6 +165,12 @@ egress allowlist. A headless `claude` cannot ask for approval, so the gateway pa
   second layer that stops a confused or prompt-injected job from casually running commands outside it.
   Recommendation: keep `acceptEdits` with a list sized to the work.
 
+**Shared start gate (ADR-013):** jobs of all agents share a host-wide cap and a CPU-pressure gate, so one
+agent's jobs can delay another's: a token for several agents can occupy several slots (one per agent), and a
+CPU-heavy job can hold every start at "host busy". A job's `queued_reason` and `GET /api/v1/capacity`
+(`agents:read`) tell a caller that the host is full or busy and how many jobs run, never whose. Nothing about
+what a job may do changes.
+
 **Untrusted output:** the result and the stream log are written by the agent, and a prompt-injected agent
 writes what it likes. The gateway caps them (256 KiB, the last 1 MiB), never parses them, and serves them as
 `text/plain; charset=utf-8` with `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src

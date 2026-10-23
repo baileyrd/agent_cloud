@@ -100,10 +100,16 @@ leftovers() {
     l=$(leases_of "$id"); [ -n "$l" ] && left="$left lease:$l"
     echo "$left"
 }
+# Destroyed agents are checked one by one but reported on one line; a FAIL names the agent.
+dead=0 dead_clean=0
 while read -r id state; do
     [ -n "$id" ] || continue
     case $state in
-        paused|destroyed) pass "$id is $state" ;;
+        destroyed)
+            dead=$((dead + 1)) left=$(leftovers "$id")
+            if [ -z "$left" ]; then dead_clean=$((dead_clean + 1)); else bad "$id (destroyed) leftovers:$left"; fi
+            continue ;;
+        paused) pass "$id is paused" ;;
         *) bad "$id is $state, want paused" ;;
     esac
     [ "$state" = running ] && continue
@@ -112,6 +118,8 @@ while read -r id state; do
 done <<EOF
 $agents
 EOF
+[ "$dead_clean" -eq "$dead" ] && n=$dead || n="$dead_clean of $dead"
+[ "$dead_clean" -eq 0 ] || pass "$n destroyed agent(s): no netns, Kata processes, task or lease"
 was=$(echo "$agents" | awk -v id="$AGENT" '$1 == id { print $2 }')
 
 # --- resume a1 and test it from inside ------------------------------------------------------
@@ -177,9 +185,11 @@ out=$(gx api 'curl -sS -m 8 -I https://api.anthropic.com')
 st=$(echo "$out" | grep '^HTTP/' | sed -n 2p | tr -d '\r')
 [ -n "$st" ] && pass "api.anthropic.com via proxy: $st" || bad "api.anthropic.com: $(echo "$out" | head -n 3 | tr '\n' ' ')"
 
-out=$(gx deny 'curl -sS -m 8 -I https://example.com')
+# Only the proxy's CONNECT status, on stdout: curl's error line (stderr) and headers (stdout) come back
+# interleaved through the exec, which once split the phrase this used to match.
+out=$(gx deny 'curl -s -m 8 -o /dev/null -w "connect=%{http_connect}" https://example.com')
 case $out in
-    *'CONNECT tunnel failed, response 403'*) pass "example.com denied by the proxy (403)" ;;
+    *connect=403*) pass "example.com denied by the proxy (403)" ;;
     *) bad "example.com not denied: $(echo "$out" | head -n 3 | tr '\n' ' ')" ;;
 esac
 

@@ -23,7 +23,8 @@ guest memory, and with more than one at once CPU, not the disk, is the limit ([R
   a1, which already has a login (see [Claude Code](#claude-code-measured-on-a1)).
 - **Watchdog.** A 2 s watchdog stopped the run on the first threshold crossed: MemAvailable < 1.5 GiB, swap
   traffic, memory PSI, host OOM, ac-gateway or ac-egress not answering, or load > 8 for 60 s. The io PSI
-  `full` limit was 80 during load phases and 40 elsewhere.
+  `full` limit was 80 during load phases and 40 elsewhere. (Since 2026-10-23 the settle right after a
+  workspace purge also has 80: a purge's own disk I/O tripped 40.10 > 40 in a `--max-n 2` run.)
 - **Runs.** There were four runs. A run is labelled by the time it started, which is also its directory name.
 
   | Run | Scope | How it ended |
@@ -300,11 +301,26 @@ holds, and keep the running count at the figures above.
   and refuses (507) a create or resume unless the total plus the new guest plus 512 MiB fits `/dev/shm`. The new
   guest plus 512 MiB must also fit what is free. Admission counts the configured size, not what a guest uses,
   because touched pages never come back.
-- *Running agents now.* At `default_memory = 4096`, 3 agents run (3 × 4096 + 512 = 12800 ≤ 15717) and a fourth
-  is refused instead of crashing a VM. At 2048 it would be 7.
+- *Running agents now.* At `default_memory = 2048`, the setting now, 7 agents run (7 × 2048 + 512 = 14848 ≤
+  15717) and an eighth is refused instead of crashing a VM. At 4096 it was 3.
 - *Checking.* `GET /api/v1/capacity` and `scripts/capacity.sh` show the figures.
 
 Still open: a way for guests to return memory, such as free page reporting or virtio-mem.
+
+**Jobs at once (ADR-013).** Admission bounds running *agents*; the job gate bounds running *jobs* and when
+the next one starts. The two layers relate to the build measurements above like this:
+- *The cap*, `AC_MAX_RUNNING_JOBS` = cores (4), is the most API-bound jobs that run at once. Those use ~5% of a
+  core each, so the cap, not the CPU, is their limit. It is also never more than the running agents, one job
+  each.
+- *The pressure gate* is what limits builds. One build at 2 vCPUs drove load to 2.4 (its PSI was not
+  computed); two drove load to 5.8 and PSI to 23.7 (+27% cold, +49% warm); three to load 7.0 and PSI 59.9 (+86%,
+  +166%). With 2 builds running the load is above the core count, so a third waits ("host busy"): builds
+  settle at 2, the recommended figure in the table above.
+- *The spacing* (15 s) gives a started job time to show in PSI (a 10 s average) before the next decision. The
+  load average lags about a minute, so builds submitted together can still reach 3 before it shuts the gate.
+  To keep a burst of builds at 2: `AC_JOB_CPU_PSI_MAX=20` (below the 23.7 of two builds) or
+  `AC_JOB_START_SPACING=60`. Neither was measured with real builds.
+- The gate only decides starts. A job that starts idle and then builds is not slowed down.
 
 ## What this implies for hardware
 

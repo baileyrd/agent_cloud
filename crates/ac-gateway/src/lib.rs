@@ -10,7 +10,8 @@
 //!
 //! Admission (ADR-012): a create or resume whose guest would not fit `/dev/shm` is refused with
 //! 507 and `{"error","rule","needed_mib","available_mib","more_agents"}`; `GET /api/v1/capacity`
-//! reports the figures.
+//! reports the figures, and with the task API also `running_jobs`, `queued_jobs` and
+//! `max_running_jobs` (ADR-013).
 
 pub mod access;
 pub mod bind;
@@ -44,8 +45,23 @@ pub struct Reply {
 /// Agents the watchdog found wedged (by id). Shared with [`Api`], which reports them.
 pub type Unhealthy = Arc<Mutex<HashSet<String>>>;
 
+/// Jobs host-wide, for `GET /api/v1/capacity` (ADR-013).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobCounts {
+    /// Running now.
+    pub running: usize,
+    /// Waiting to start.
+    pub queued: usize,
+    /// Most that may run at once.
+    pub max_running: u32,
+}
+
 /// What the lifecycle API asks of an agent's jobs (ADR-010).
 pub trait Busy: Send + Sync {
+    /// Jobs host-wide; `None` without a task API or when the registry cannot be read.
+    fn counts(&self) -> Option<JobCounts> {
+        None
+    }
     /// Whether the agent has a queued or running job.
     fn busy(&self, id: &AgentId) -> bool;
     /// The agent's VM is about to go away: kill its running job and mark it interrupted; cancel the
@@ -166,11 +182,17 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
     }
 
     fn capacity(&self) -> Reply {
+        let jobs = self.jobs.counts().map_or_else(String::new, |c| {
+            format!(
+                r#","running_jobs":{},"queued_jobs":{},"max_running_jobs":{}"#,
+                c.running, c.queued, c.max_running
+            )
+        });
         match self.fleet.capacity() {
             Ok(Some(r)) => Reply {
                 status: 200,
                 body: format!(
-                    r#"{{"shm_total_mib":{},"shm_free_mib":{},"guest_mib":{},"running_agents":{},"committed_mib":{},"margin_mib":{},"max_more_agents":{}}}"#,
+                    r#"{{"shm_total_mib":{},"shm_free_mib":{},"guest_mib":{},"running_agents":{},"committed_mib":{},"margin_mib":{},"max_more_agents":{}{jobs}}}"#,
                     r.shm_total_mib,
                     r.shm_free_mib,
                     r.guest_mib,
@@ -584,6 +606,34 @@ mod tests {
         assert_eq!(call(&a, "POST", "/api/v1/agents/adm-1/resume").0, 507);
         assert_eq!(call(&a, "POST", CAPACITY).0, 405);
         assert_eq!(call(&api(false), "GET", CAPACITY).0, 404);
+    }
+
+    /// Two jobs running and three queued, of at most four.
+    struct Counted;
+    impl Busy for Counted {
+        fn counts(&self) -> Option<JobCounts> {
+            Some(JobCounts {
+                running: 2,
+                queued: 3,
+                max_running: 4,
+            })
+        }
+        fn busy(&self, _: &AgentId) -> bool {
+            false
+        }
+        fn interrupt(&self, _: &AgentId) {}
+        fn forget(&self, _: &AgentId) {}
+    }
+
+    #[test]
+    fn capacity_reports_job_slots_with_the_task_api() {
+        let fleet =
+            Fleet::new(Rt { fail: false }, Store::default()).with_admission(Box::new(Shm9000), 512);
+        let a = Api::new(fleet).with_jobs(Arc::new(Counted));
+        assert_eq!(
+            call(&a, "GET", CAPACITY).1,
+            r#"{"shm_total_mib":9000,"shm_free_mib":9000,"guest_mib":4096,"running_agents":0,"committed_mib":0,"margin_mib":512,"max_more_agents":2,"running_jobs":2,"queued_jobs":3,"max_running_jobs":4}"#
+        );
     }
 
     /// A runtime whose create takes a while, so two creates overlap unless serialized.

@@ -170,7 +170,8 @@ Phases 0-3 worked with these changes. Each was found by failure; `scripts/m0-smo
    sudo mkdir -p /etc/kata-containers
    sudo cp /usr/share/kata-containers/defaults/configuration.toml /etc/kata-containers/configuration.toml
    sudo sed -i 's/^#\?default_maxmemory *=.*/default_maxmemory = 8192/' /etc/kata-containers/configuration.toml
-   sudo sed -i 's/^#\?default_memory *=.*/default_memory = 4096/' /etc/kata-containers/configuration.toml   # see sizing.md: 2048 measured enough
+   sudo sed -i 's/^#\?default_memory *=.*/default_memory = 2048/' /etc/kata-containers/configuration.toml   # measured enough, sizing.md
+   sudo sed -i 's/^#\?default_vcpus *=.*/default_vcpus = 2/' /etc/kata-containers/configuration.toml
    ```
 4. **Repair the guest initrd.** Symptom: `timed out connecting to vsock`; booting the initrd by hand shows
    `kata-agent: error while loading shared libraries: libseccomp.so.2`. Run `sudo scripts/fix-kata-initrd.sh`
@@ -373,6 +374,20 @@ in `gateway.env` (restart the gateway after a change):
   `git` without push, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`);
 - `AC_JOB_UNSAFE=1`: `--dangerously-skip-permissions` instead. Read [security.md](security.md#task-api) first.
 
+When a queued job starts (ADR-013): its agent must have no running job, and host-wide all of these must hold.
+
+| Setting | Default | A queued job starts only while |
+|---|---|---|
+| `AC_MAX_RUNNING_JOBS` | the core count (4 here) | fewer jobs than this run, on all agents together |
+| `AC_JOB_CPU_PSI_MAX` | 40 | `/proc/pressure/cpu` some avg10 is below this (and the 1-minute load is below the core count) |
+| `AC_JOB_START_SPACING` | 15 (seconds) | the newest running job started at least this long ago |
+
+The oldest waiting job goes first, whatever its agent. A queued job's JSON says why it waits in
+`queued_reason` (`agent busy`, `job slots full`, `host busy`, `start spacing`); `GET /api/v1/capacity` shows
+`running_jobs`, `queued_jobs` and `max_running_jobs`; the journal logs each change of reason
+(`journalctl -u ac-gateway | grep waits`). The timeout counts from the start, not the submit. The gateway logs
+the limits at startup. [sizing.md](sizing.md#recommended-settings-for-this-host) relates them to measured builds.
+
 With curl (the token goes to curl on stdin, not on its command line; it needs `jobs:read` and `jobs:write` for
 the agent):
 
@@ -381,7 +396,7 @@ the agent):
 H() { printf 'Authorization: Bearer %s\n' "$(sudo cat /etc/agent-cloud/owner.token)"; }
 J=http://$AC_BIND/api/v1/agents/a1/jobs
 H | curl -sS -H @- -d '{"prompt":"reply with exactly the word pong","timeout_secs":300}' $J
-# {"job_id":"6b941feec45a4c25","agent":"a1","state":"queued",...}         202
+# {"job_id":"6b941feec45a4c25","agent":"a1","state":"queued",...,"queued_reason":null}   202
 H | curl -sS -H @- "$J/6b941feec45a4c25?wait=30"     # returns when the state changes (or after 30 s)
 H | curl -sS -H @- $J/6b941feec45a4c25/output        # pong (the final message, plain text)
 H | curl -sS -H @- "$J/6b941feec45a4c25/output?part=stream"   # the stream-json log
@@ -400,7 +415,8 @@ lives in `/var/lib/agent-cloud/jobs.mmap`; prompts and collected output in `/var
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the
 allowlist's owner and mode, and that the gateway and proxy listen only on private addresses. It checks that
 every agent the gateway lists (`GET /api/v1/agents`) is paused or destroyed and has no netns, Kata processes,
-containerd task or CNI lease left. Then it resumes `a1` through the gateway and, inside it, checks
+containerd task or CNI lease left (destroyed agents share one PASS line; a FAIL names the agent and what is left).
+Then it resumes `a1` through the gateway and, inside it, checks
 `claude auth status`, `claude -p`, the API through the proxy, a denied host (example.com) and an unreachable
 LAN address (192.168.50.1), and runs a job through the task API ("reply with exactly the word pong", expecting
 `succeeded`). It submits that job with a throwaway token (`post-reboot-check-<pid>`, `jobs:read,jobs:write` for
@@ -410,3 +426,21 @@ afterwards (`KEEP_A1=1` leaves it running). It takes about 30 s.
 
 Debugging tip: to see why a guest dies, boot it directly with `-serial file:/tmp/serial.log`
 (do not pipe the console through `sudo ... | tail`; the output is lost).
+
+## Operations: commands not to run
+
+- **No prune against the agent image store without listing first.** `ctr content prune`, `ctr images prune`,
+  `podman system prune` and `podman image prune` delete whatever they consider unreferenced, and that has
+  included images in use: one run deleted the layers of `localhost/agent-shell:dev` and `nginx:alpine`, and both
+  had to be re-imported at their original digests. Before any of them, list what is there and what it would
+  delete (`sudo ctr -n agents images ls`, `sudo ctr -n agents content ls`, `podman images -a`) and compare
+  digests afterwards. To restore an image from podman: `podman save localhost/agent-shell:dev | sudo ctr -n
+  agents images import -`, then check the digest in `sudo ctr -n agents images ls` against the one noted before.
+- **Never give a live `ctr task exec` EOF on stdin**: no pipe, no file, not `< /dev/null`. It wedges the Kata
+  shim for that agent ([Fedora note 8](#fedora-44-notes-verified-on-baileyserv-i5-3550-2026-10-18), ADR-006,
+  ADR-010); hold stdin open from a FIFO instead. The watchdog recovers a wedge in about 2 minutes (ADR-012), but
+  do not cause one.
+- **No `dnf install` after the proxy `ENV` lines in `images/agent-shell/Containerfile`.** From that point every
+  build step goes through `HTTPS_PROXY=http://10.89.0.1:3128`, which allows only the model API, so the mirrors
+  are refused and the step fails. Put packages in the `dnf install` above the `ENV` lines, or, for a step that
+  must come later, pass the proxy settings as build-time `--build-arg` values instead.

@@ -1,3 +1,4 @@
+#!/bin/bash
 # Sourced by capacity-bench.sh and real-build-bench.sh, never run: host readers, the gateway API with a
 # scoped throwaway token, the watchdog (trip() names the threshold), held-stdin execs and the per-VM
 # figures. The caller sets OUT and MAIN (its $$) and traps USR1 to its cleanup; EXEC_TAG prefixes exec

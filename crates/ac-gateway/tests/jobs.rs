@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ac_ctr::{CtrConfig, CtrRuntime};
+use ac_domain::health::Pressure;
+use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Answer, JobRunner, Jobs, Part, Probe, Route};
@@ -18,7 +20,7 @@ use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::web::App;
 use ac_gateway::{Api, Busy};
-use ac_ports::{JobStore, PortError, Runtime, SessionStore};
+use ac_ports::{HostLoad, JobStore, PortError, Runtime, SessionStore};
 use ac_store::EngineStore;
 use platform::process::ExitStatus;
 use platform_mock::MockSpawner;
@@ -135,6 +137,21 @@ fn jobs_over(store: &Arc<EngineStore>, runner: impl JobRunner, root: &Path) -> J
 }
 
 fn rig() -> Rig {
+    let (store, root) = registry();
+    with_store(store, Fake::default(), root)
+}
+
+/// A rig whose jobs start through the host-wide gate, under the returned pressure (idle at first).
+fn gated(limits: Limits) -> (Rig, Load) {
+    let (store, root) = registry();
+    let load = Load::default();
+    load.set(Some(IDLE));
+    let gate = Some((limits, load.clone()));
+    (build(store, Fake::default(), root, gate), load)
+}
+
+/// A registry with agents a1 and a2 running and p1 paused.
+fn registry() -> (Arc<EngineStore>, PathBuf) {
     let root = tmp();
     let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
     for (id, s) in [
@@ -144,14 +161,57 @@ fn rig() -> Rig {
     ] {
         let _ = store.set_state(&agent(id), s);
     }
-    with_store(store, Fake::default(), root)
+    (store, root)
 }
 
 fn with_store(store: Arc<EngineStore>, fake: Fake, root: PathBuf) -> Rig {
+    build(store, fake, root, None)
+}
+
+/// Host pressure as a test sets it; `None` reads as an error.
+#[derive(Clone, Default)]
+struct Load(Arc<Mutex<Option<Pressure>>>);
+
+impl Load {
+    fn set(&self, p: Option<Pressure>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    }
+}
+
+impl HostLoad for Load {
+    fn pressure(&self) -> Result<Pressure, PortError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or_else(|| PortError {
+                op: "pressure",
+                cause: "unreadable".into(),
+            })
+    }
+}
+
+const IDLE: Pressure = Pressure {
+    load1: 0.2,
+    cores: 4,
+    cpu_some: 0.5,
+    io_some: 0.0,
+};
+const HOT: Pressure = Pressure {
+    load1: 0.2,
+    cores: 4,
+    cpu_some: 80.0,
+    io_some: 0.0,
+};
+
+fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limits, Load)>) -> Rig {
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let notes = Arc::new(Mutex::new(Vec::new()));
     let (c, n) = (Arc::clone(&clock), Arc::clone(&notes));
-    let jobs = jobs_over(&store, fake.clone(), &root)
+    let mut jobs = jobs_over(&store, fake.clone(), &root);
+    if let Some((limits, load)) = gate {
+        jobs = jobs.with_gate(limits, load);
+    }
+    let jobs = jobs
         .with_clock(move || c.load(Ordering::SeqCst))
         .with_notes(move |id, text| {
             let _ = n.lock().map(|mut v| v.push(format!("{id}: {text}")));
@@ -192,6 +252,14 @@ impl Rig {
 
     fn state(&self, id: &str, job: &str) -> String {
         field(&self.get(id, job), "state")
+    }
+
+    fn reason(&self, id: &str, job: &str) -> String {
+        field(&self.get(id, job), "queued_reason")
+    }
+
+    fn started(&self) -> Vec<String> {
+        self.fake.w().starts.iter().map(|s| s.0.clone()).collect()
     }
 
     fn advance(&self, ms: u64) {
@@ -1228,4 +1296,205 @@ fn running_job_is_probed_rarely_until_it_says_it_finished() {
     r.advance(2_000);
     r.jobs.tick();
     assert_eq!(r.state("a1", &id), "succeeded");
+}
+
+// ---- the start gate (ADR-013) -----------------------------------------------------------------
+
+#[test]
+fn queued_reason_follows_the_gate_and_fifo_holds_across_agents() {
+    let (r, load) = gated(Limits {
+        max_running: 1,
+        ..Limits::for_cores(4)
+    });
+    load.set(Some(HOT));
+    let first = r.ok("a1", "one");
+    r.advance(1);
+    let behind = r.ok("a1", "two");
+    r.advance(1);
+    let other = r.ok("a2", "three");
+    assert_eq!(r.reason("a1", &first), "null", "not looked at yet");
+    r.jobs.tick();
+    assert!(r.started().is_empty(), "host busy: nothing starts");
+    assert_eq!(r.reason("a1", &first), "host busy");
+    assert_eq!(r.reason("a1", &behind), "agent busy");
+    assert_eq!(r.reason("a2", &other), "host busy");
+    load.set(Some(IDLE));
+    r.jobs.tick();
+    assert_eq!(r.started(), std::slice::from_ref(&first), "the oldest");
+    assert_eq!(r.reason("a1", &first), "null", "running");
+    assert_eq!(r.reason("a2", &other), "job slots full");
+    let counts = r
+        .jobs
+        .counts()
+        .map(|c| (c.running, c.queued, c.max_running));
+    assert_eq!(counts, Some((1, 2, 1)));
+    r.fake.set(&first, Probe::Exited(Some(0)));
+    r.tick();
+    assert_eq!(r.state("a1", &first), "succeeded");
+    assert_eq!(r.started().len(), 1, "its slot frees at the next tick");
+    r.tick();
+    // a1's second job is older than a2's: it goes first although a1 just ran one.
+    assert_eq!(r.started(), [first, behind.clone()]);
+    assert_eq!(r.reason("a2", &other), "job slots full");
+}
+
+#[test]
+fn starts_are_spaced_host_wide() {
+    let (r, _load) = gated(Limits::for_cores(4));
+    let a = r.ok("a1", "one");
+    r.advance(1);
+    let b = r.ok("a2", "two");
+    r.jobs.tick();
+    assert_eq!(r.started(), std::slice::from_ref(&a));
+    assert_eq!(r.reason("a2", &b), "start spacing");
+    r.advance(14_999);
+    r.jobs.tick();
+    assert_eq!(r.started().len(), 1);
+    r.advance(1);
+    r.jobs.tick();
+    assert_eq!(r.started(), [a.clone(), b.clone()]);
+    let gap = |j: &str, id: &str| {
+        field(&r.get(j, id), "started_ms")
+            .parse::<u64>()
+            .unwrap_or(0)
+    };
+    assert_eq!(gap("a2", &b) - gap("a1", &a), 15_000);
+}
+
+#[test]
+fn queue_wait_does_not_count_against_the_timeout() {
+    let (r, _load) = gated(Limits {
+        max_running: 1,
+        ..Limits::for_cores(4)
+    });
+    let long = r.ok("a1", "long");
+    r.jobs.tick();
+    let (status, body) = r.submit("a2", r#"{"prompt":"short","timeout_secs":60}"#);
+    assert_eq!(status, 202);
+    let short = field(&body, "job_id");
+    // Ten minutes in the queue, ten times its timeout.
+    for _ in 0..120 {
+        r.tick();
+    }
+    assert_eq!(r.state("a2", &short), "queued");
+    assert_eq!(r.reason("a2", &short), "job slots full");
+    r.fake.set(&long, Probe::Exited(Some(0)));
+    r.tick();
+    r.tick();
+    assert_eq!(r.state("a2", &short), "running");
+    r.advance(55_000);
+    r.jobs.tick();
+    assert_eq!(
+        r.state("a2", &short),
+        "running",
+        "its 60 s run from its start"
+    );
+    r.advance(5_000);
+    r.jobs.tick();
+    assert_eq!(r.state("a2", &short), "timed_out");
+}
+
+#[test]
+fn a_job_cancelled_while_queued_never_starts() {
+    let (r, load) = gated(Limits::for_cores(4));
+    load.set(Some(HOT));
+    let id = r.ok("a1", "never");
+    r.jobs.tick();
+    let (status, body) = r.json(Route::Cancel(agent("a1"), job_id(&id)), "");
+    assert_eq!((status, field(&body, "state")), (200, "cancelled".into()));
+    assert_eq!(field(&body, "queued_reason"), "null");
+    load.set(Some(IDLE));
+    r.tick();
+    r.tick();
+    assert!(r.started().is_empty());
+    assert_eq!(r.jobs.counts().map(|c| (c.running, c.queued)), Some((0, 0)));
+}
+
+#[test]
+fn unreadable_pressure_skips_only_the_pressure_gate() {
+    let (r, load) = gated(Limits {
+        max_running: 1,
+        ..Limits::for_cores(4)
+    });
+    load.set(None);
+    let a = r.ok("a1", "one");
+    r.advance(1);
+    let b = r.ok("a2", "two");
+    r.jobs.tick();
+    assert_eq!(r.started(), [a]);
+    assert_eq!(r.reason("a2", &b), "job slots full");
+}
+
+/// A restarted gateway finds the running job in the registry: it is polled, not started again,
+/// and it fills its slot.
+#[test]
+fn restart_counts_re_attached_jobs_against_the_cap() {
+    let one = Limits {
+        max_running: 1,
+        ..Limits::for_cores(4)
+    };
+    let (r, load) = gated(one);
+    let id = r.ok("a1", "long");
+    r.jobs.tick();
+    let mut r = r;
+    let root = std::mem::take(&mut r.root);
+    let fake = r.fake.clone();
+    drop(r);
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let r = build(store, fake, root, Some((one, load)));
+    r.jobs.reconcile();
+    let waiting = r.ok("a2", "next");
+    r.tick();
+    assert_eq!(r.state("a1", &id), "running");
+    assert_eq!(r.reason("a2", &waiting), "job slots full");
+    assert_eq!(
+        r.started(),
+        std::slice::from_ref(&id),
+        "never started again"
+    );
+    assert_eq!(r.jobs.counts().map(|c| c.running), Some(1));
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    r.tick();
+    assert_eq!(r.started(), [id, waiting]);
+}
+
+/// Through the real `ctr` runner (mock spawner): no start exec while the gate is shut, one as soon
+/// as it opens.
+#[test]
+fn queued_job_starts_through_ctr_when_the_gate_opens_and_not_before() {
+    let root = tmp();
+    let (rt, log) = ctr(&root, "");
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let _ = store.set_state(&agent("a1"), State::Running);
+    let load = Load::default();
+    load.set(Some(HOT));
+    let jobs = jobs_over(&store, rt, &root).with_gate(Limits::for_cores(4), load.clone());
+    let r = jobs.submit(&agent("a1"), Some(State::Running), br#"{"prompt":"hi"}"#);
+    assert_eq!(r.status, 202);
+    let id = field(&r.body, "job_id");
+    let starts = || {
+        argvs(&log)
+            .iter()
+            .filter(|a| a.iter().any(|x| x == "ac-job-start") && a.contains(&id))
+            .count()
+    };
+    for _ in 0..3 {
+        jobs.tick();
+    }
+    assert_eq!(
+        starts(),
+        0,
+        "nothing reaches the agent while the host is busy"
+    );
+    let get = |q| match jobs.handle(Route::Get(agent("a1"), job_id(&id)), q) {
+        Answer::Json(r) => r.body,
+        Answer::Output(_) => String::new(),
+    };
+    assert_eq!(field(&get(""), "queued_reason"), "host busy");
+    load.set(Some(IDLE));
+    jobs.tick();
+    assert_eq!(starts(), 1);
+    assert_eq!(field(&get(""), "state"), "running");
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -59,6 +59,10 @@
 - [ ] Measure a bigger build (a larger Rust workspace, C++ or npm) before trusting 2048 for every build
 - [ ] Measure on an SSD (every figure in sizing.md is from one rotational disk)
 - [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s)
+- [x] Job start gate: a host-wide cap (cores), CPU PSI and load, and 15 s between starts; FIFO across agents;
+  `queued_reason` and job counts in `GET /api/v1/capacity` (ADR-013)
+- [ ] Measure the gate with real builds submitted together; whether `AC_JOB_CPU_PSI_MAX=20` or a 60 s spacing
+  keeps a burst at 2 builds
 
 ## Later
 - Local model option for an offline posture

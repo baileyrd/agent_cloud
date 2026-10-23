@@ -306,6 +306,21 @@ holds, and keep the running count at the figures above.
 
 Still open: a way for guests to return memory, such as free page reporting or virtio-mem.
 
+**Jobs at once (ADR-013).** Admission bounds running *agents*; the job gate bounds running *jobs* and when
+the next one starts. The two layers relate to the build measurements above like this:
+- *The cap*, `AC_MAX_RUNNING_JOBS` = cores (4), is the most API-bound jobs that run at once. Those use ~5% of a
+  core each, so the cap, not the CPU, is their limit. It is also never more than the running agents, one job
+  each.
+- *The pressure gate* is what limits builds. One build at 2 vCPUs drove load to 2.4 (its PSI was not
+  computed); two drove load to 5.8 and PSI to 23.7 (+27% cold, +49% warm); three to load 7.0 and PSI 59.9 (+86%,
+  +166%). With 2 builds running the load is above the core count, so a third waits ("host busy"): builds
+  settle at 2, the recommended figure in the table above.
+- *The spacing* (15 s) gives a started job time to show in PSI (a 10 s average) before the next decision. The
+  load average lags about a minute, so builds submitted together can still reach 3 before it shuts the gate.
+  To keep a burst of builds at 2: `AC_JOB_CPU_PSI_MAX=20` (below the 23.7 of two builds) or
+  `AC_JOB_START_SPACING=60`. Neither was measured with real builds.
+- The gate only decides starts. A job that starts idle and then builds is not slowed down.
+
 ## What this implies for hardware
 
 Planning numbers, from the measurements above:

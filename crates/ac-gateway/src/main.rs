@@ -14,6 +14,9 @@
 //! span, 90), `AC_BUSY_LOAD_PER_CORE` (1.0), `AC_BUSY_IO_SOME` (20), `AC_BUSY_CPU_SOME` (50). Jobs (ADR-010):
 //! `AC_JOB_PERMISSION_MODE` (default `acceptEdits`), `AC_JOB_ALLOWED_TOOLS` (comma-separated,
 //! default [`jobs::DEFAULT_TOOLS`]), `AC_JOB_UNSAFE=1` (`--dangerously-skip-permissions` instead).
+//! Job start gate (ADR-013; defaults in [`Limits::for_cores`]): `AC_MAX_RUNNING_JOBS` (host-wide,
+//! default the core count), `AC_JOB_CPU_PSI_MAX` (start only while cpu PSI some avg10 is below
+//! this, 40), `AC_JOB_START_SPACING` (least seconds between starts, 15).
 //! Admission (ADR-012): `AC_SHM_MARGIN_MIB` (MiB of `/dev/shm` kept free, default 512),
 //! `AC_VM_MEMORY_MIB` (guest size, instead of `default_memory` in `AC_KATA_CONFIG`, default
 //! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
@@ -44,6 +47,7 @@ use ac_ctr::capacity::{CapacityConfig, GuestSource, HostCapacity};
 use ac_ctr::host::{Monotonic, ProcPressure};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_domain::health::Thresholds;
+use ac_domain::schedule::Limits;
 use ac_domain::GuestMemory;
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Jobs};
@@ -61,19 +65,21 @@ const TOKENS: &str = "/etc/agent-cloud/tokens";
 
 type Gateway = App<CtrRuntime<LinuxSpawner>, Arc<EngineStore>>;
 
+/// A number >= 0 from the environment, `default` when unset.
+fn num(key: &str, default: f64) -> Result<f64, String> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .ok_or_else(|| format!("{key}={v}: want a number >= 0")),
+        Err(_) => Ok(default),
+    }
+}
+
 /// The watchdog's thresholds: [`Thresholds::default`], each overridable from the environment.
 fn thresholds() -> Result<Thresholds, String> {
     let d = Thresholds::default();
-    let num = |key: &str, default: f64| -> Result<f64, String> {
-        match std::env::var(key) {
-            Ok(v) => v
-                .parse::<f64>()
-                .ok()
-                .filter(|n| n.is_finite() && *n >= 0.0)
-                .ok_or_else(|| format!("{key}={v}: want a number >= 0")),
-            Err(_) => Ok(default),
-        }
-    };
     let secs = |key: &str, default: Duration| -> Result<Duration, String> {
         Ok(Duration::from_secs_f64(num(key, default.as_secs_f64())?))
     };
@@ -85,6 +91,24 @@ fn thresholds() -> Result<Thresholds, String> {
         load_per_core: num("AC_BUSY_LOAD_PER_CORE", d.load_per_core)?,
         io_some: num("AC_BUSY_IO_SOME", d.io_some)?,
         cpu_some: num("AC_BUSY_CPU_SOME", d.cpu_some)?,
+    })
+}
+
+/// The job start gate: [`Limits::for_cores`] for this host, each overridable from the environment.
+fn limits() -> Result<Limits, String> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let d = Limits::for_cores(u32::try_from(cores).unwrap_or(u32::MAX));
+    let max = num("AC_MAX_RUNNING_JOBS", f64::from(d.max_running))?;
+    if max < 1.0 || max.fract() != 0.0 {
+        return Err(format!(
+            "AC_MAX_RUNNING_JOBS={max}: want a whole number >= 1"
+        ));
+    }
+    Ok(Limits {
+        max_running: max as u32,
+        cpu_some_max: num("AC_JOB_CPU_PSI_MAX", d.cpu_some_max)?,
+        spacing_ms: (num("AC_JOB_START_SPACING", d.spacing_ms as f64 / 1000.0)? * 1000.0) as u64,
+        ..d
     })
 }
 
@@ -273,6 +297,15 @@ fn run() -> Result<(), String> {
         env("AC_JOB_UNSAFE", "") == "1",
     )?;
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
+    let gate = limits()?;
+    eprintln!(
+        "ac-gateway: jobs: at most {} running; a job starts while cpu PSI some < {} and load < {} x \
+         cores, at least {}s after the last start",
+        gate.max_running,
+        gate.cpu_some_max,
+        gate.load_per_core,
+        gate.spacing_ms as f64 / 1000.0
+    );
     let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
     let fleet =
@@ -312,6 +345,7 @@ fn run() -> Result<(), String> {
             data.join("jobs"),
             claude,
         )
+        .with_gate(gate, ProcPressure)
         .with_notes(move |id, text| notes.note(id, text)),
     );
     jobs.reconcile();

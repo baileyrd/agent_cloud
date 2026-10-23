@@ -373,6 +373,20 @@ in `gateway.env` (restart the gateway after a change):
   `git` without push, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`);
 - `AC_JOB_UNSAFE=1`: `--dangerously-skip-permissions` instead. Read [security.md](security.md#task-api) first.
 
+When a queued job starts (ADR-013): its agent must have no running job, and host-wide all of these must hold.
+
+| Setting | Default | A queued job starts only while |
+|---|---|---|
+| `AC_MAX_RUNNING_JOBS` | the core count (4 here) | fewer jobs than this run, on all agents together |
+| `AC_JOB_CPU_PSI_MAX` | 40 | `/proc/pressure/cpu` some avg10 is below this (and the 1-minute load is below the core count) |
+| `AC_JOB_START_SPACING` | 15 (seconds) | the newest running job started at least this long ago |
+
+The oldest waiting job goes first, whatever its agent. A queued job's JSON says why it waits in
+`queued_reason` (`agent busy`, `job slots full`, `host busy`, `start spacing`); `GET /api/v1/capacity` shows
+`running_jobs`, `queued_jobs` and `max_running_jobs`; the journal logs each change of reason
+(`journalctl -u ac-gateway | grep waits`). The timeout counts from the start, not the submit. The gateway logs
+the limits at startup. [sizing.md](sizing.md#recommended-settings-for-this-host) relates them to measured builds.
+
 With curl (the token goes to curl on stdin, not on its command line; it needs `jobs:read` and `jobs:write` for
 the agent):
 
@@ -381,7 +395,7 @@ the agent):
 H() { printf 'Authorization: Bearer %s\n' "$(sudo cat /etc/agent-cloud/owner.token)"; }
 J=http://$AC_BIND/api/v1/agents/a1/jobs
 H | curl -sS -H @- -d '{"prompt":"reply with exactly the word pong","timeout_secs":300}' $J
-# {"job_id":"6b941feec45a4c25","agent":"a1","state":"queued",...}         202
+# {"job_id":"6b941feec45a4c25","agent":"a1","state":"queued",...,"queued_reason":null}   202
 H | curl -sS -H @- "$J/6b941feec45a4c25?wait=30"     # returns when the state changes (or after 30 s)
 H | curl -sS -H @- $J/6b941feec45a4c25/output        # pong (the final message, plain text)
 H | curl -sS -H @- "$J/6b941feec45a4c25/output?part=stream"   # the stream-json log

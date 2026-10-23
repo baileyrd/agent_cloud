@@ -400,3 +400,61 @@ probe, process list, kill, pressure and clock as ports faked in tests):
 - Giving guest memory back (free page reporting, virtio-mem).
 - Per-agent memory sizes; admission assumes every guest has the current `default_memory`.
 - A probe that bypasses `ctr`.
+
+## ADR-013: Starting jobs: a host-wide cap, CPU pressure and spacing
+**Status:** accepted (2026-10-23).
+**Context:** A queued job started as soon as its agent had no running job (ADR-010). For builds, CPU is the
+host's limit ([sizing.md](sizing.md#builds-at-once-2048-mib)): with 2 vCPUs per guest on 4 cores, 2 builds at
+once ran +27% cold and +49% warm, and 3 at once +86% and +166%, with CPU PSI some up to 60 and load 7. Most
+Claude Code jobs wait on the model API and use almost no CPU, so a flat "N jobs at once" cap sized for builds
+would throttle them for nothing.
+
+**Decision.** A queued job starts only when all of these hold:
+- its agent has no running job (unchanged);
+- fewer than `AC_MAX_RUNNING_JOBS` jobs run host-wide (default: the host's core count);
+- the CPU is not saturated: `/proc/pressure/cpu` some avg10 < `AC_JOB_CPU_PSI_MAX` (40) and the 1-minute load
+  < the core count;
+- the newest running job started at least `AC_JOB_START_SPACING` seconds ago (15), so it shows in the pressure
+  figures before the next start is decided.
+
+The oldest eligible job goes first, across agents (by accept time). There is no other starvation rule: a job
+that waited long starts as soon as the gate opens.
+
+How it works:
+- *Code.* `ac_domain::schedule::plan` is pure: the active jobs, a pressure snapshot, the time and the limits go
+  in; the job to start and why each other queued job waits come out. The supervisor (`ac_gateway::jobs`, every
+  second) reads pressure through `ac_ports::HostLoad`, the watchdog's port and `/proc` adapter, faked in tests.
+  It decides again after each start, with that job counted as running.
+- *Restart.* Running jobs and their start times are in the registry, so after a gateway restart the
+  re-attached jobs fill their slots and count for spacing; none is lost or started twice (tested).
+- *Timeout.* Counted from the start, not from the submit (tested: queued 10 minutes, then killed 60 s after
+  its start).
+- *Cancel.* A job cancelled while queued is terminal, and its start is refused, so it never starts (tested).
+  A paused or destroyed agent cancels its queued jobs as before.
+- *Unreadable pressure.* The pressure gate is skipped and the journal says so once; the cap and the spacing
+  still hold. Failing closed would stop every job on a host without PSI, with no error a caller sees.
+- *Visibility.* A queued job's JSON has `queued_reason`: `agent busy` (its agent runs a job or has an older
+  one queued), `job slots full`, `host busy` or `start spacing`, checked in that order. It is `null` when the
+  job is not queued, and for up to a second after the submit, until the supervisor's first look.
+  `GET /api/v1/capacity` adds `running_jobs`, `queued_jobs` and `max_running_jobs`. Each change of a job's
+  reason goes to the journal, with the figures for `host busy`.
+- *Live (2026-10-23, a1 and a2, five short jobs).* With `AC_JOB_CPU_PSI_MAX=0` a job on a1 stayed queued 27 s
+  with `host busy` (journal: `waits: host busy (cpu PSI some 1.00 >= 0.00)`); it survived a gateway restart
+  without the drop-in, started 0.7 s after the port came up, and succeeded. With `AC_MAX_RUNNING_JOBS=1`, two
+  jobs running `sleep 20`: a2's waited with `job slots full` while a1's ran (25.6 s), then started 1.2 s after it
+  ended. With the defaults, the same two jobs: a2's waited with `start spacing`, started 15.3 s after a1's, and
+  both ran at once (`running_jobs` 2) and succeeded.
+
+**Consequences:**
+- On this host (4 cores, 2 vCPUs per guest) up to 4 API-bound jobs run at once. Once 2 builds run, load passes
+  the core count (5.8 measured) and the next start waits.
+- The gate acts only at start. A job that starts idle and then builds is not slowed down or stopped.
+- The load average lags by about a minute, longer than the 15 s spacing, so a burst of build jobs can start a
+  third before the load gate shuts; CPU PSI reacts in about 10 s but 2 builds peaked at 23.7, below 40. To hold
+  builds at 2, lower `AC_JOB_CPU_PSI_MAX` to about 20 or raise the spacing to 60 s (not measured).
+- A token for several agents can fill several slots, delaying other agents' jobs. `queued_reason` tells a
+  `jobs:read` caller that the host is full or busy, not with whose jobs.
+- Starts are at least 15 s apart: a burst of N jobs takes (N − 1) × 15 s to start.
+
+**Not now:** priorities or per-agent fairness beyond FIFO; limiting the CPU of a running job; io pressure in
+the gate.

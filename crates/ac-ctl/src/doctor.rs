@@ -247,8 +247,8 @@ mod tests {
     fn exit_codes() {
         // This host as shipped: ok (info only).
         assert_eq!(exit(facts()), 0);
-        // A warning: the PSI limit unset on the measured shape.
-        assert_eq!(exit(with_env(&[])), 1);
+        // A warning: the old PSI limit of 20 on the measured shape (it did not hold a burst).
+        assert_eq!(exit(with_env(&[("AC_JOB_CPU_PSI_MAX", "20")])), 1);
         // An error: no /dev/kvm.
         let mut f = facts();
         f.kvm = ac_domain::tune::Fact::Absent;
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(
             psi.and_then(|f| f.get("confidence"))
                 .and_then(Value::as_str),
-            Some("measured input, gate unvalidated")
+            Some("measured: 20 did not hold a burst")
         );
         // The JSON reads back as the same facts.
         assert_eq!(factsjson::from_json(&j), Ok(r.facts.clone()));

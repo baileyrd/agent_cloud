@@ -17,7 +17,6 @@
   "gateway": {
     "AC_BIND": "127.0.0.1:8780",
     "AC_IMAGE": "localhost/agent-shell:dev",
-    "AC_JOB_CPU_PSI_MAX": "20",
     "AC_NETWORK": "1"
   },
   "initrd_net": true,

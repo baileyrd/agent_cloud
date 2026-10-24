@@ -48,7 +48,6 @@ fn this_host() -> HostFacts {
             ("AC_IMAGE", "localhost/agent-shell:dev"),
             ("AC_BIND", "127.0.0.1:8780"),
             ("AC_NETWORK", "1"),
-            ("AC_JOB_CPU_PSI_MAX", "20"),
         ])),
         kvm: Fact::Known(Kvm::Usable),
         initrd_net: Fact::Known(true),
@@ -89,7 +88,7 @@ fn verdict(fs: &[Finding], rule: &str) -> (Status, String, Confidence) {
     (f.status, f.recommended.clone(), f.confidence)
 }
 
-use Confidence::{Extrapolated as X, Measured as M, MeasuredInput as MI};
+use Confidence::{Extrapolated as X, Measured as M, MeasuredNoHold as MN};
 use Status::{Error as E, Info as I, Ok as K, Warn as W};
 
 #[test]
@@ -99,9 +98,9 @@ fn this_host_is_as_recommended_and_measured() {
         for f in &fs {
             let want = if f.rule == "disk.class" { I } else { K };
             assert_eq!(f.status, want, "{p:?} {f:?}");
-            // The PSI limit's input was measured; the gate at that limit was not.
+            // The PSI limit: 20 was measured and did not hold a burst, so the default stays.
             let conf = if f.rule == "gateway.cpu_psi_max" {
-                MI
+                MN
             } else {
                 M
             };
@@ -116,7 +115,7 @@ fn this_host_is_as_recommended_and_measured() {
     assert_eq!(rec("kata.default_memory"), "2048");
     assert_eq!(rec("kata.default_vcpus"), "2");
     assert_eq!(rec("kata.default_maxmemory"), "8192");
-    assert_eq!(rec("gateway.cpu_psi_max"), "20");
+    assert_eq!(rec("gateway.cpu_psi_max"), "40");
     assert_eq!(rec("gateway.max_running_jobs"), "4");
     // Heavy wants 4096: a warning, extrapolated, with the edit.
     let heavy = recommend(&this_host(), Profile::Heavy);
@@ -158,7 +157,7 @@ fn shapes() {
             vec![
                 ("shm.size", K, "7850 MiB", X),
                 ("kata.default_vcpus", W, "2", M),
-                ("gateway.cpu_psi_max", W, "20", MI),
+                ("gateway.cpu_psi_max", K, "40", MN),
             ],
             (3, 2),
         ),
@@ -397,8 +396,8 @@ fn vcpus_and_psi_boundaries() {
         ),
         (1, 1, 2, 2)
     );
-    assert_eq!(psi_target(4), (20.0, MI));
-    assert_eq!(MI.name(), "measured input, gate unvalidated");
+    assert_eq!(psi_target(4), (40.0, MN));
+    assert_eq!(MN.name(), "measured: 20 did not hold a burst");
     assert_eq!(psi_target(3), (40.0, X));
     assert_eq!(psi_target(5), (40.0, X));
     // A Kata config above 2 vCPUs: warned down to 2.
@@ -427,19 +426,20 @@ fn gateway_values() {
         )
     };
     let status = |fs: &[Finding], rule| get(fs, rule).status;
-    // The PSI limit unset on the measured shape: warned to 20.
-    let fs = with(&[]);
-    let psi = get(&fs, "gateway.cpu_psi_max");
-    assert_eq!(
-        (psi.status, psi.change.clone()),
-        (W, Some(Change::Env("AC_JOB_CPU_PSI_MAX", "20".into())))
-    );
+    // The PSI limit: unset or 40 is ok; the old 20 on the measured shape is warned back to 40.
+    assert_eq!(status(&with(&[]), "gateway.cpu_psi_max"), K);
     assert_eq!(
         status(
-            &with(&[("AC_JOB_CPU_PSI_MAX", "20.0")]),
+            &with(&[("AC_JOB_CPU_PSI_MAX", "40.0")]),
             "gateway.cpu_psi_max"
         ),
         K
+    );
+    let fs = with(&[("AC_JOB_CPU_PSI_MAX", "20")]);
+    let psi = get(&fs, "gateway.cpu_psi_max");
+    assert_eq!(
+        (psi.status, psi.change.clone()),
+        (W, Some(Change::Env("AC_JOB_CPU_PSI_MAX", "40".into())))
     );
     assert_eq!(
         status(
@@ -451,7 +451,7 @@ fn gateway_values() {
     // The cap: above the core count warned, below informational, not a number an error.
     let jobs = |v| {
         status(
-            &with(&[("AC_JOB_CPU_PSI_MAX", "20"), ("AC_MAX_RUNNING_JOBS", v)]),
+            &with(&[("AC_MAX_RUNNING_JOBS", v)]),
             "gateway.max_running_jobs",
         )
     };
@@ -703,6 +703,6 @@ fn drift_names_only_settings_that_differ() {
     assert_eq!(
         line,
         "default_maxmemory unset (0: all host RAM) -> 8192, default_vcpus unset (Kata's default 1) -> 2, \
-         default_memory 4096 -> 2048, AC_JOB_CPU_PSI_MAX unset (40) -> 20"
+         default_memory 4096 -> 2048"
     );
 }

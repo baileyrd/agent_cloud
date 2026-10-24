@@ -381,7 +381,7 @@ When a queued job starts (ADR-013): its agent must have no running job, and host
 | Setting | Default | A queued job starts only while |
 |---|---|---|
 | `AC_MAX_RUNNING_JOBS` | the core count (4 here) | fewer jobs than this run, on all agents together |
-| `AC_JOB_CPU_PSI_MAX` | 40 | `/proc/pressure/cpu` some avg10 is below this (and the 1-minute load is below the core count) |
+| `AC_JOB_CPU_PSI_MAX` | 40, recommended on every host | `/proc/pressure/cpu` some avg10 is below this (and the 1-minute load is below the core count). A safety valve against CPU saturation (3 builds reach 56–59), not a burst limiter: 20 did not hold a burst of builds at 2 ([sizing.md](sizing.md#job-start-gate-under-real-builds)). The cap and `/dev/shm` admission bound the load |
 | `AC_JOB_START_SPACING` | 15 (seconds) | the newest running job started at least this long ago |
 
 The oldest waiting job goes first, whatever its agent. A queued job's JSON says why it waits in

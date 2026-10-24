@@ -567,3 +567,52 @@ NVMe host forecasts 11 agents at 2048 MiB and 4 builds at once (extrapolated).
 
 **Not now:** calibrating the PSI limit automatically; editing the initrd, firewall or units; per-agent memory
 classes; telling nested virtualization from bare metal.
+
+## ADR-015: The gateway tells systemd when it is ready (`Type=notify`)
+**Status:** accepted (2026-10-24; verified on BaileyServ, a reboot still to test).
+**Context:** `ac-gateway.service` was `Type=simple`, so systemd reported it active as soon as the process
+started, before the startup reconcile ran and before it listened. `systemctl restart ac-gateway && curl`
+failed with connection refused, and every script and `ac-ctl tune --restart-gateway` had to poll the port.
+
+**Decision.**
+- `Type=notify`, `NotifyAccess=main`. The gateway sends `READY=1` with a `STATUS=` line
+  (`listening on <addr>; N agents (M running); reconcile done`) once the tokens are loaded (a bad tokens file
+  refuses the start), the startup reconcile has run, admission is set up and the listener is bound, just before
+  it accepts. Connections queue in the listen backlog from the bind, so READY means a connect succeeds. A start
+  that fails exits non-zero before READY, and `systemctl restart` fails at once instead of timing out.
+- A failed reconcile is still logged and served through (as before); the status then says `reconcile
+  failed (see the log)` and `post-reboot-check.sh` FAILs on it. Making it fatal would turn a containerd hiccup
+  at boot into a restart loop with the API down.
+- SIGTERM or SIGINT sends `STOPPING=1`, stops the server and exits 0 within a second (the signal thread ticks
+  each second); before, the process died on the signal. SIGHUP still re-reads the tokens.
+- Std only (`crates/ac-gateway/src/notify.rs`): one `UnixDatagram` send per message, abstract names through
+  `SocketAddrExt`, no unsafe. rusty_mill has no sd_notify crate, and the protocol is a single datagram, so
+  libsystemd or a crate would add more than it saves. Without `NOTIFY_SOCKET` (run by hand, or under a
+  `Type=simple` unit, which gets none) nothing is sent. A malformed `NOTIFY_SOCKET` or a failed send is logged
+  as a warning and the gateway carries on.
+- `TimeoutStartSec=180`. Measured startup is 0.1–1.1 s. A gateway SIGKILLed with a1 running took 0.14 and
+  0.18 s. The slower case is a1's VM killed too, so the reconcile pauses it and cleans up: 0.51, 0.66, 0.77 and
+  1.11 s. 180 s outlasts one external command (`ctr`, `ip`, CNI) at its 120 s `command_timeout`, which the
+  reconcile logs and serves through.
+
+**Evidence (2026-10-24, BaileyServ).** Before: `time systemctl restart ac-gateway && curl .../capacity` 0.04 s,
+then `curl: (7) ... Could not connect`. After: 0.88 s, then the capacity JSON. With systemd at debug level:
+`Got notification message from PID ...: READY=1, STATUS=listening on 127.0.0.1:8780; 2 agents (0 running);
+reconcile done`, `Changed start -> running`; on stop `STOPPING=1`, `Changed stop-sigterm -> dead`, exit 0. After
+a gateway SIGKILL the unit went `activating/auto-restart` → `activating/start` → `active` with the port closed
+until `active`. A bad tokens file under a transient `Type=notify` unit failed the start in 0.06 s. The
+integration tests (`crates/ac-gateway/tests/notify.rs`) run the binary against a fake `NOTIFY_SOCKET` (a path
+and an abstract name).
+
+**Consequences:**
+- Install order matters: the binary before the unit. A binary from before this ADR never sends READY, so under
+  the new unit systemd kills it after 180 s and restarts it, over and over. The new binary under the old unit
+  works as before (install.md, *Readiness*).
+- `ac-ctl tune --restart-gateway` and the scripts keep their port waits: a cheap second check, and the only
+  one when they run against an old unit.
+- A start that hangs (for example a wedged containerd) now fails after 180 s, visibly, instead of reporting
+  active and refusing connections.
+
+**Not now:** `WatchdogSec` (the gateway has its own agent watchdog; a systemd watchdog would need a heartbeat
+from a thread that proves the server is healthy); `Type=notify-reload` (SIGHUP's `ExecReload` stays);
+`ac-egress` and `ac-agentfw`, whose readiness means something else.

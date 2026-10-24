@@ -283,6 +283,35 @@ TOKEN=$(sudo cat /etc/agent-cloud/owner.token)
 curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1
 ```
 
+**Readiness** (ADR-015): the unit is `Type=notify`, so `systemctl start|restart ac-gateway` returns once the
+gateway listens, after its tokens, the startup reconcile and admission. `systemctl status ac-gateway` shows
+`Status: "listening on 127.0.0.1:8780; 2 agents (0 running); reconcile done"`. A start that fails (a bad tokens
+file, a bad setting, a port in use) fails the command at once, and one that hangs fails after
+`TimeoutStartSec=180`. A failed reconcile is logged and the gateway serves anyway, with `reconcile failed` in its
+status; `post-reboot-check.sh` FAILs on that.
+
+*Upgrading from the `Type=simple` unit:* install the binary first, then the unit. A binary from before ADR-015
+never sends READY, so under the new unit systemd would kill it after 180 s and restart it in a loop. The new
+binary under the old unit gets no `NOTIFY_SOCKET` and sends nothing; until the unit is replaced, the old caveat
+holds: it reports active before it listens.
+
+```bash
+cargo build --release -p ac-gateway
+sudo install -m 0755 target/release/ac-gateway /usr/local/bin/
+sudo systemctl restart ac-gateway                       # new binary, old unit: starts as before
+sudo cp -p /etc/systemd/system/ac-gateway.service /etc/agent-cloud/ac-gateway.service.simple   # for rollback
+sudo install -m 0644 deploy/ac-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl restart ac-gateway
+systemctl show -p Type -p StatusText ac-gateway         # Type=notify, StatusText=listening on ...
+```
+
+Rollback (the new binary can stay; it works under either unit):
+
+```bash
+sudo install -m 0644 /etc/agent-cloud/ac-gateway.service.simple /etc/systemd/system/ac-gateway.service
+sudo systemctl daemon-reload && sudo systemctl restart ac-gateway
+```
+
 **API tokens** (ADR-011): every caller gets its own token, with scopes and agents. Scopes: `agents:read`
 (status, list), `agents:write` (create, pause, resume, destroy, purge), `jobs:read`, `jobs:write` (submit,
 cancel), `viewer:read` (watch, history), `viewer:control` (take over, type), `admin` (everything). The route

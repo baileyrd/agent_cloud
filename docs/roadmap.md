@@ -61,8 +61,25 @@
 - [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s)
 - [x] Job start gate: a host-wide cap (cores), CPU PSI and load, and 15 s between starts; FIFO across agents;
   `queued_reason` and job counts in `GET /api/v1/capacity` (ADR-013)
-- [ ] Measure the gate with real builds submitted together; whether `AC_JOB_CPU_PSI_MAX=20` or a 60 s spacing
-  keeps a burst at 2 builds (until then `ac-ctl doctor` tags the 20 `measured input, gate unvalidated`)
+- [x] Measure the gate with real build jobs submitted together (`scripts/burst-test.sh`, 2026-10-24,
+  [sizing.md](sizing.md#job-start-gate-under-real-builds)). `AC_JOB_CPU_PSI_MAX=20` with 15 s spacing does
+  **not** keep a burst at 2: in 3 of 3 runs a third build started after the spacing, before PSI showed the
+  second build. The doctor tag stays `measured input, gate unvalidated`.
+- [ ] Run B of `scripts/burst-test.sh` again (9 jobs) at `AC_JOB_CPU_PSI_MAX=10`, which the replay of the 20
+  runs says holds warm bursts at 2. If it does, change the rule, its reason text and the tag (doctor, tests,
+  ADR-014, sizing.md, `deploy/hosts/baileyserv.json`). Cold bursts would need a spacing of about 45–60 s.
+- [ ] Light jobs and the gate (design note, not implemented). A gate strict enough to hold builds at 2 holds
+  every job. At PSI 10 the replay puts a tiny job about 75 s behind two warm builds, ten times its own 6–8 s
+  run (measured at 20 the cost was only the 15 s spacing). And no start-time gate sees a build until after the
+  job's first model turn (4–7 s warm, 24–42 s cold) plus its signal's lag (PSI avg10: 10–13 s). Options:
+  - *Count builds instead of pressure.* A running job whose VM used more than one core over the last few
+    seconds counts as a build, from the VM's own CPU (the gateway knows each agent's QEMU and virtiofsd). A new
+    job waits only while `floor(cores / vCPUs)` jobs count as builds. Light jobs then run beside two builds, and
+    the signal follows a build within a sample, not avg10's 10 s. A burst still needs a spacing about as long
+    as a job's time to its first command.
+  - *A job declares itself light* (`"light": true` on submit, or a per-token default) and skips the pressure
+    gate and the spacing, keeping the cap. It is simpler, but a mislabelled build runs unchecked.
+  - Preferred: counting builds. It also fixes the lag, which a light flag does not.
 - [x] Settings from host facts: `ac-ctl doctor` (read-only; each figure `measured` or `extrapolated`, with its
   source) and `ac-ctl tune` (diffs; `--apply` with backups); `--facts-file` plans other hardware; the gateway
   logs one line when its settings differ (ADR-014)

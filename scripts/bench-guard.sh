@@ -156,7 +156,8 @@ destroy() {  # 404: already gone
 
 # --- the gateway and the build ----------------------------------------------------------------
 gw_image() { tr '\0' '\n' < "/proc/$(pgrep -x ac-gateway | head -n 1)/environ" | sed -n 's/^AC_IMAGE=//p'; }
-# Restart and wait until it answers: it reports active before it listens.
+# Restart and wait until it answers: an older Type=simple unit reports active before it listens
+# (ADR-015).
 gw_restart() {
     local i=0 ph
     ph=$(cat "$OUT/phase"); echo "restart 0" > "$OUT/phase"

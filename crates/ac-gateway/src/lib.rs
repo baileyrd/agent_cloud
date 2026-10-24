@@ -16,6 +16,7 @@
 pub mod access;
 pub mod bind;
 pub mod jobs;
+pub mod notify;
 pub mod tokens;
 pub mod viewer;
 pub mod watchdog;

@@ -170,8 +170,9 @@ fn text_of(path: &Path) -> (PathBuf, Result<String, String>) {
     (path.to_owned(), text)
 }
 
-/// Wait up to `limit` for something to listen on `bind`: the gateway reports active before it
-/// listens.
+/// Wait up to `limit` for something to listen on `bind`. Under the `Type=notify` unit (ADR-015)
+/// the restart returns only once the gateway listens, so this is a cheap second check; under an
+/// older `Type=simple` unit, which reports active before it listens, it is the only one.
 fn wait_for_port(bind: &str, limit: Duration) -> Result<Duration, String> {
     let addr: SocketAddr = bind.parse().map_err(|e| format!("AC_BIND={bind}: {e}"))?;
     let start = Instant::now();

@@ -24,6 +24,14 @@ LAN_HOST=192.168.50.1
 
 # --- host services --------------------------------------------------------------------------
 for u in ac-agentfw ac-egress ac-gateway; do check "$u active" systemctl is-active --quiet "$u"; done
+# The gateway serves through a failed startup reconcile and says so in its status (ADR-015); a
+# reboot check must not pass it. A Type=simple unit (before ADR-015) has no status.
+st=$(systemctl show -p StatusText --value ac-gateway)
+case $st in
+    *"reconcile failed"*) bad "ac-gateway startup: $st" ;;
+    "") echo "info  ac-gateway has no status: a Type=simple unit (install.md, readiness)" ;;
+    *) pass "ac-gateway startup: $st" ;;
+esac
 
 # Rules in one chain (lines with a handle, minus the table and chain lines).
 rules() { nft -a list chain "$@" 2>/dev/null | grep '# handle' | grep -cvE '^\s*(table|chain) '; }

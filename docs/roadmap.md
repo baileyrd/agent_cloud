@@ -89,6 +89,9 @@
   logs one line when its settings differ (ADR-014)
 - [ ] Calibrate `default_vcpus` and builds at once on another core count with
   `scripts/real-build-bench.sh`, so doctor can mark them measured there
+- [x] `ac-gateway.service` is `Type=notify` (ADR-015): a restart returns once the gateway listens, with its
+  status (`reconcile done` or `failed`); verified 2026-10-24 (restart then curl with no sleep, gateway SIGKILL
+  with a1 running and with a1's VM killed). A reboot is still to test.
 
 ## Later
 - Local model option for an offline posture

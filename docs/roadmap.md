@@ -64,12 +64,13 @@
 - [x] Measure the gate with real build jobs submitted together (`scripts/burst-test.sh`, 2026-10-24,
   [sizing.md](sizing.md#job-start-gate-under-real-builds)). `AC_JOB_CPU_PSI_MAX=20` with 15 s spacing does
   **not** keep a burst at 2: in 3 of 3 runs a third build started after the spacing, before PSI showed the
-  second build. The doctor tag stays `measured input, gate unvalidated`.
-- [ ] Run B of `scripts/burst-test.sh` again (9 jobs) at `AC_JOB_CPU_PSI_MAX=10`, which the replay of the 20
-  runs says holds warm bursts at 2. If it does, change the rule, its reason text and the tag (doctor, tests,
-  ADR-014, sizing.md, `deploy/hosts/baileyserv.json`). Cold bursts would need a spacing of about 45–60 s.
+  second build. `ac-ctl doctor` now recommends the default 40 on every host, tagged `measured: 20 did not hold
+  a burst`: a safety valve against saturation, not a burst limiter.
+- Dropped (2026-10-24): running B again at `AC_JOB_CPU_PSI_MAX=10`. A PSI gate cannot see a build before it
+  starts. The makespan was the same with and without the gate (B warm 153–159 s, D 158 s). A gate strict enough
+  to hold builds at 2 would cost a tiny job about 75 s (an estimate from the replay).
 - [ ] Light jobs and the gate (design note, not implemented). A gate strict enough to hold builds at 2 holds
-  every job. At PSI 10 the replay puts a tiny job about 75 s behind two warm builds, ten times its own 6–8 s
+  every job. At PSI 10 the replay estimates a tiny job about 75 s behind two warm builds, ten times its own 6–8 s
   run (measured at 20 the cost was only the 15 s spacing). And no start-time gate sees a build until after the
   job's first model turn (4–7 s warm, 24–42 s cold) plus its signal's lag (PSI avg10: 10–13 s). Options:
   - *Count builds instead of pressure.* A running job whose VM used more than one core over the last few
@@ -80,10 +81,13 @@
   - *A job declares itself light* (`"light": true` on submit, or a per-token default) and skips the pressure
     gate and the spacing, keeping the cap. It is simpler, but a mislabelled build runs unchecked.
   - Preferred: counting builds. It also fixes the lag, which a light flag does not.
+  - Revisit when jobs time out under concurrent builds, when tiny-job waits become a real complaint, or when
+    more than 2 concurrent builds become routine. It is moot at 8+ cores, where three 2-vCPU builds no longer
+    oversubscribe the CPU.
 - [x] Settings from host facts: `ac-ctl doctor` (read-only; each figure `measured` or `extrapolated`, with its
   source) and `ac-ctl tune` (diffs; `--apply` with backups); `--facts-file` plans other hardware; the gateway
   logs one line when its settings differ (ADR-014)
-- [ ] Calibrate `default_vcpus`, builds at once and `AC_JOB_CPU_PSI_MAX` on another core count with
+- [ ] Calibrate `default_vcpus` and builds at once on another core count with
   `scripts/real-build-bench.sh`, so doctor can mark them measured there
 
 ## Later

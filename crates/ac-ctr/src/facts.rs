@@ -660,7 +660,7 @@ mod tests {
                  default_memory = 2048\ndefault_maxmemory = 8192\n"
             ),
         )
-        .file("/etc/agent-cloud/gateway.env", "AC_JOB_CPU_PSI_MAX=20\n")
+        .file("/etc/agent-cloud/gateway.env", "AC_BIND=127.0.0.1:8780\n")
         .stat("/var/lib/agent-cloud", Stat { dev: 36, ..file_stat(0, 0o755) })
         .stat("/dev/sda3", Stat { rdev: (8 << 8) | 3, ..file_stat(0, 0o660) })
         .stat("/dev/kvm", file_stat(0, 0o666))

@@ -55,7 +55,6 @@ LOUD_PHASES="build create"  # create: boots read the image cold (caches dropped)
 [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] || { echo "run through sudo: cargo vendor runs as you" >&2; exit 2; }
 ctr -n "$NS" images ls -q | grep -qxF "$IMAGE" || { echo "$IMAGE is not in containerd (see the header)" >&2; exit 2; }
 [ -z "$(val AC_VM_MEMORY_MIB)" ] || { echo "AC_VM_MEMORY_MIB is set: admission would not follow default_memory" >&2; exit 2; }
-gw_image() { tr '\0' '\n' < "/proc/$(pgrep -x ac-gateway | head -n 1)/environ" | sed -n 's/^AC_IMAGE=//p'; }
 IMAGE0=$(gw_image)
 MEM0=$(kata default_memory) VCPU0=$(kata default_vcpus)
 guard_token real-build-bench rb-1,rb-2,rb-3
@@ -102,19 +101,6 @@ echo "ts,agent,pss_mib" > "$OUT/pss.csv"
 echo "stage,n,mem_mib,vcpus,agent,kind,rep,exit,wall_s,user_s,sys_s,maxrss_mib,top,guest_total_mib,min_avail_mib,min_avail_pct,peak_used_mib,peak_cached_mib,swap_peak_mib,guest_oom,dmesg_oom,pss_before_mib,pss_peak_mib,pss_after_mib,shm_before_mib,shm_after_mib,host_min_avail_mib,psi_mem_some,psi_mem_full,psi_io_some,psi_io_full,psi_cpu_some,load_max,disk_busy_mean,disk_busy_max,egress_lines,writeback_s" > "$OUT/runs.csv"
 
 # --- the gateway and Kata ------------------------------------------------------------------------
-# Restart and wait until it answers: it reports active before it listens.
-gw_restart() {
-    local i=0 ph
-    ph=$(cat "$OUT/phase"); echo "restart 0" > "$OUT/phase"
-    systemctl restart ac-gateway || return 1
-    until [ "$(API_SECS=3 api GET /whoami | cut -d' ' -f1)" = 200 ]; do
-        i=$((i + 1)); [ "$i" -lt 60 ] || { echo "ac-gateway not answering 60 s after restart"; return 1; }
-        sleep 1
-    done
-    echo "$ph" > "$OUT/phase"
-    echo "  ac-gateway restarted, answering after ${i} s; AC_IMAGE=$(gw_image)"
-    echo "  capacity: $(api GET /capacity)"
-}
 # A later EnvironmentFile overrides gateway.env; Environment= would not.
 use_image() {
     mkdir -p "${DROPIN%/*}" || return 1
@@ -151,15 +137,6 @@ restore() {
 }
 
 # --- the build -----------------------------------------------------------------------------------
-# HEAD plus vendored dependencies, made as the sudo user (their cargo cache, offline).
-bundle() {
-    SRC=$(runuser -u "$SUDO_USER" -- mktemp -d /var/tmp/rb-src.XXXXXX) || return 1
-    runuser -u "$SUDO_USER" -- sh -c 'git -C "$1" archive HEAD | tar -x -C "$2" && cd "$2" &&
-        cargo vendor --offline --locked vendor > config.toml 2> vendor.log && mkdir .cargo && mv config.toml .cargo/' \
-        sh "$REPO" "$SRC" || { echo "source bundle: $(tail -n 3 "$SRC/vendor.log" 2>/dev/null)"; return 1; }
-    echo "sources: $(du -sm "$SRC" | cut -f1) MiB, $(ls "$SRC/vendor" | wc -l) vendored crates"
-}
-
 BUILD=$OUT/build.py
 cat > "$BUILD" <<'PY'
 import os, resource, shutil, subprocess, sys, threading, time
@@ -262,7 +239,6 @@ create() {  # create <id>: through the API; BOOT = create call to first exec
     stage_ws "$1" || { echo "$1: staging the sources failed"; return 1; }
     echo "  $1 up in ${BOOT}s; guest: $(GX_USER=0 gx "$1" 'echo "$(nproc) cpu, $(free -m | awk "/^Mem/ { print \$2 }") MiB, swap $(free -m | awk "/^Swap/ { print \$2 }") MiB, /tmp on $(df --output=fstype /tmp | tail -n 1), dmesg_restrict $(cat /proc/sys/kernel/dmesg_restrict)"')"
 }
-drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches; }
 pss() { set -- $(mem $(vm_pids "$1")); echo $(( ${2:-0} / 1024 )); }
 shm() { df -m --output=used /dev/shm | tail -n 1; }
 kv() { awk -v k="$1" '{ for (i = 1; i <= NF; i++) if (index($i, k "=") == 1) { print substr($i, length(k) + 2); exit } }' <<< "$2"; }

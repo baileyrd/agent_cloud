@@ -21,10 +21,9 @@ pub const SHORT_PHYS_MAXMEMORY: u64 = 8192;
 pub const MIN_MEM_TOTAL_MIB: u64 = 8192;
 /// Admission's default margin (`AC_SHM_MARGIN_MIB`, ADR-012).
 pub const SHM_MARGIN_MIB: u64 = 512;
-/// The job gate's default CPU PSI limit (ADR-013).
+/// The job gate's default CPU PSI limit (ADR-013), recommended on every shape: a safety valve
+/// against saturation, not a burst limiter (sizing.md, Job start gate under real builds).
 pub const DEFAULT_CPU_PSI_MAX: f64 = 40.0;
-/// The limit for the measured shape: two 2-vCPU builds peaked at 23.7 (sizing.md).
-pub const MEASURED_CPU_PSI_MAX: f64 = 20.0;
 /// Kata's defaults for keys the configuration does not set.
 pub const KATA_DEFAULT_VCPUS: u64 = 1;
 
@@ -100,19 +99,19 @@ pub enum Confidence {
     Measured,
     /// Derived from a rule; not measured on this shape of hardware.
     Extrapolated,
-    /// The figure it rests on was measured on this shape, but the setting's own effect was not:
-    /// `AC_JOB_CPU_PSI_MAX = 20` comes from the measured PSI of 2 builds (23.7), and the gate at
-    /// 20 has never run against a burst of real builds.
-    MeasuredInput,
+    /// The lower limit it replaces was measured on this shape and failed: `AC_JOB_CPU_PSI_MAX =
+    /// 20` let a third build start in 3 of 3 bursts, so the default 40 stays (sizing.md, Job start
+    /// gate under real builds).
+    MeasuredNoHold,
 }
 
 impl Confidence {
-    /// `measured`, `extrapolated` or `measured input, gate unvalidated`.
+    /// `measured`, `extrapolated` or `measured: 20 did not hold a burst`.
     pub fn name(self) -> &'static str {
         match self {
             Self::Measured => "measured",
             Self::Extrapolated => "extrapolated",
-            Self::MeasuredInput => "measured input, gate unvalidated",
+            Self::MeasuredNoHold => "measured: 20 did not hold a burst",
         }
     }
 }
@@ -235,11 +234,12 @@ pub const RULES: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "gateway.cpu_psi_max",
-        rule: "AC_JOB_CPU_PSI_MAX = 20 on 4 cores with 2-vCPU guests (keeps builds at 2); else the \
-               default 40, uncalibrated",
-        evidence: "sizing.md (Builds at once): 2 builds at 2 vCPUs peaked at CPU PSI 23.7, 3 at 59.9; the \
-                   gate at 20 itself is not yet exercised by a real-build burst (roadmap)",
-        fix: "ac-ctl tune --apply; calibrate other hosts with scripts/real-build-bench.sh",
+        rule: "AC_JOB_CPU_PSI_MAX = 40 (the default) on every shape: a safety valve against CPU \
+               saturation, not a burst limiter",
+        evidence: "sizing.md (Job start gate under real builds): at 20 three builds started at CPU PSI \
+                   2.8, 16.8 and 16.1, before PSI showed the second; 3 builds peak at 56-59; the job cap \
+                   and /dev/shm admission bound the load",
+        fix: "ac-ctl tune --apply",
     },
     RuleDoc {
         id: "disk.class",
@@ -332,10 +332,11 @@ pub fn vcpus_target(cores: u32) -> u64 {
     }
 }
 
-/// The job gate's CPU PSI limit for this shape, and how far it was measured.
+/// The job gate's CPU PSI limit for this shape (the default on every one), and how far it was
+/// measured: on the measured shape a lower limit (20) was tried and did not hold a burst.
 pub fn psi_target(cores: u32) -> (f64, Confidence) {
     if cores == MEASURED_CORES && vcpus_target(cores) == 2 {
-        (MEASURED_CPU_PSI_MAX, Confidence::MeasuredInput)
+        (DEFAULT_CPU_PSI_MAX, Confidence::MeasuredNoHold)
     } else {
         (DEFAULT_CPU_PSI_MAX, Confidence::Extrapolated)
     }
@@ -688,11 +689,14 @@ fn cpu_psi(f: &HostFacts, env: &Env) -> Finding {
     let current = set.map_or_else(|| format!("unset ({DEFAULT_CPU_PSI_MAX})"), String::clone);
     let reason = match confidence {
         Confidence::Extrapolated => {
-            "uncalibrated: run scripts/real-build-bench.sh to calibrate (only 4 cores were measured)"
+            "the default: a safety valve against CPU saturation, not a burst limiter; on 4 cores a \
+             limit of 20 did not hold a burst (sizing.md, Job start gate under real builds)"
         }
         _ => {
-            "4 cores, 2-vCPU guests: 2 builds peaked at CPU PSI 23.7 (measured), so 20 should hold \
-             a burst at 2; the gate at 20 has not run against real builds (sizing.md, Builds at once)"
+            "4 cores, 2-vCPU guests: at 20 three builds started at CPU PSI 2.8, 16.8 and 16.1, before \
+             PSI showed the second; 3 builds peak at 56-59, so 40 is a safety valve against \
+             saturation, not a burst limiter; the job cap and /dev/shm admission bound the load \
+             (sizing.md, Job start gate under real builds)"
         }
     };
     let base = finding(
@@ -718,7 +722,7 @@ fn cpu_psi(f: &HostFacts, env: &Env) -> Finding {
     }
     match confidence {
         Confidence::Extrapolated => base.status(Status::Info).reason(
-            "set by hand on an uncalibrated shape: keep it if scripts/real-build-bench.sh calibrated it",
+            "set by hand on an unmeasured shape: keep it if scripts/burst-test.sh showed it holds there",
         ),
         _ => base
             .status(Status::Warn)

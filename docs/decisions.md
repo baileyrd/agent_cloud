@@ -444,14 +444,32 @@ How it works:
   jobs running `sleep 20`: a2's waited with `job slots full` while a1's ran (25.6 s), then started 1.2 s after it
   ended. With the defaults, the same two jobs: a2's waited with `start spacing`, started 15.3 s after a1's, and
   both ran at once (`running_jobs` 2) and succeeded.
+- *Real builds (2026-10-24, a1, a2 and a3, 21 jobs, `scripts/burst-test.sh`;
+  [sizing.md](sizing.md#job-start-gate-under-real-builds)).* With `AC_JOB_CPU_PSI_MAX=20`, two build jobs were
+  submitted together and a third once both ran. In 3 of 3 runs the third started after the spacing alone
+  (15.2–15.6 s, `start spacing`) and three builds ran at once, with CPU PSI peaking at 56–59. At the third start
+  PSI was 2.8–16.8 and load 1.7–2.4; `host busy` never appeared.
+  - Cause: a build starts 4–7 s after its job (24–42 s cold, Claude's own start), and PSI avg10 shows it 10–13 s
+    later still. Two builds then hold PSI at 12.6–29.8, so 20 is inside their band.
+  - Two builds cost +30% cold and +34% to +38% warm against one alone; three at once (the gate off) +143% to
+    +148% warm.
+  - A tiny job waited the spacing, 15 s. The watchdog took no action.
+  - Decided (2026-10-24): no lower limit. A PSI gate cannot see a build before it starts, the time to finish all
+    three builds was the same with and without the gate (B 151–156 s, D 153 s), and a gate strict enough to
+    hold builds at 2 would hold a tiny job about 75 s (an estimate). `AC_JOB_CPU_PSI_MAX` stays at the default
+    40 on every host: a safety valve against saturation (3 builds reach 56–59), not a burst limiter. The cap
+    and `/dev/shm` admission (ADR-012) are what bound the load.
 
 **Consequences:**
-- On this host (4 cores, 2 vCPUs per guest) up to 4 API-bound jobs run at once. Once 2 builds run, load passes
-  the core count (5.8 measured) and the next start waits.
+- On this host (4 cores, 2 vCPUs per guest) up to 4 jobs run at once, builds included. With real build jobs, 2
+  builds held load at 3.8–4.1, under the core count, and CPU PSI at 12.6–29.8, under 40, so a third build
+  starts after the spacing. Each of 3 builds at once takes +143% to +148% (warm, 1 run), but all three finish in
+  about the same time as when staggered.
 - The gate acts only at start. A job that starts idle and then builds is not slowed down or stopped.
-- The load average lags by about a minute, longer than the 15 s spacing, so a burst of build jobs can start a
-  third before the load gate shuts; CPU PSI reacts in about 10 s but 2 builds peaked at 23.7, below 40. To hold
-  builds at 2, lower `AC_JOB_CPU_PSI_MAX` to about 20 or raise the spacing to 60 s (not measured).
+- The gate decides when a job starts, but its CPU arrives later: first the model's turn, then the build, then
+  PSI's 10 s average. So no PSI limit holds a burst of build jobs at 2 unless the spacing covers that delay
+  (about 45–60 s cold), which every job, tiny ones included, would pay. The roadmap keeps a design note
+  (counting builds) and when to revisit it.
 - A token for several agents can fill several slots, delaying other agents' jobs. `queued_reason` tells a
   `jobs:read` caller that the host is full or busy, not with whose jobs.
 - Starts are at least 15 s apart: a burst of N jobs takes (N − 1) × 15 s to start.
@@ -474,8 +492,8 @@ would be on other hardware, or said which figures were measured and which were c
   `default_memory`; `AC_PROFILE` in `gateway.env` records the host's profile.
 - *Every recommendation is labelled.* It has a stable rule id, a one-line reason citing sizing.md or install.md,
   and a confidence: `measured` (reproduces what sizing.md measured on the i5-3550, on a host of that shape),
-  `extrapolated` (derived from a rule; not measured on this shape of hardware), or `measured input, gate
-  unvalidated` (the figure it rests on was measured on this shape, the setting's own effect was not).
+  `extrapolated` (derived from a rule; not measured on this shape of hardware), or `measured: 20 did not hold a
+  burst` (the PSI limit: the lower limit was run on this shape and failed, so the default stands).
 - *Nothing is applied silently.* `ac-ctl doctor` only reads. `ac-ctl tune` prints diffs; only `--apply` (root)
   writes, and the gateway only logs one line at startup when its settings differ.
 - *Neither takes the registry lock.* Both read files and `/proc`, so they work while `ac-gateway` runs.
@@ -513,30 +531,33 @@ How it works:
 | `kata.default_vcpus` | 2 at ≥ 4 cores, else 1; never above 2 | 4 cores |
 | `kata.default_memory` | idle 2048, build 2048, heavy 4096 | idle and build (any host); heavy never |
 | `gateway.max_running_jobs` | the core count (the default) | 4 cores |
-| `gateway.cpu_psi_max` | 20 on 4 cores with 2-vCPU guests, else the default 40, "uncalibrated" | never: on 4 cores with 2 vCPUs it is `measured input, gate unvalidated` (see below) |
+| `gateway.cpu_psi_max` | the default 40 on every shape: a safety valve, not a burst limiter | 4 cores, 2 vCPUs: `measured: 20 did not hold a burst` (see below) |
 | `disk.class` | information: the measured cold-start cost of a rotational disk | rotational |
 | `prereq.*` | `/dev/kvm`, vmx/svm, Kata config, initrd drop-in, fstab line = running mount, firewall, modes | (checks) |
 
-`gateway.cpu_psi_max = 20` is `measured input, gate unvalidated`: the PSI it rests on was measured (two 2-vCPU
-builds peaked at 23.7), but the gate set to 20 has never run against a burst of real builds (roadmap). It
-becomes `measured` once that run shows it holds builds at 2.
+`gateway.cpu_psi_max` recommended 20 on 4 cores with 2-vCPU guests until 2026-10-24, from the measured PSI of two
+builds (23.7), tagged `measured input, gate unvalidated`. Run against bursts of real build jobs (ADR-013) it did
+not hold builds at 2: three builds started at CPU PSI 2.8, 16.8 and 16.1. The rule now recommends the default 40
+on every shape, tagged `measured: 20 did not hold a burst` on this shape. 3 builds peak at 56–59, so 40 is a
+safety valve against saturation, not a burst limiter; the job cap and `/dev/shm` admission bound the load. On
+this shape a different value set by hand is a warning (tune sets 40); elsewhere it is information.
 
 *Live (2026-10-23, BaileyServ, gateway running).* `sudo ac-ctl doctor --profile build`: 17 ok, 1 info (disk
-class), every finding measured, exit 0 (since relabelled: the PSI limit is `measured input, gate unvalidated`; as a user: gateway.env and the firewall skipped, still exit 0). `tune`
+class), every finding measured, exit 0 (since relabelled: since 2026-10-24 the PSI rule recommends 40, tagged `measured: 20 did not hold a burst`; as a user: gateway.env and the firewall skipped, still exit 0). `tune`
 showed no changes. `--json` parsed with `python3 -m json.tool`. On copies of the live files with
 `default_memory = 4096`, `default_vcpus = 1`, `default_maxmemory` commented out, no PSI line and no fstab line
 (`--root`): doctor exit 2 (2 errors, 3 warnings; errors exit 4 since); `tune --apply` wrote exactly those five edits, three backups
 equal to the copies, gateway.env still 0600, the rest of each file byte-identical; a second run changed nothing.
 With a1 running, `--apply` was refused naming a1 and wrote nothing. The gateway started on the untuned copy
 logged `settings differ ... default_maxmemory unset (0: all host RAM) -> 8192, default_vcpus 1 -> 2,
-default_memory 4096 -> 2048, AC_JOB_CPU_PSI_MAX unset (40) -> 20; run ac-ctl doctor`, and nothing on the live
+default_memory 4096 -> 2048, AC_JOB_CPU_PSI_MAX unset (40) -> 20; run ac-ctl doctor` (the rule then recommended 20), and nothing on the live
 settings. `post-reboot-check.sh` passed with its new line. The facts file of the hypothetical 32 GiB / 8 core /
 NVMe host forecasts 11 agents at 2048 MiB and 4 builds at once (extrapolated).
 
 **Consequences:**
 - A new host gets its numbers, with their provenance, before anything is installed: `doctor --facts-file`.
-- On another shape most figures are `extrapolated`, and the doctor says so; the PSI limit stays at the default
-  until `scripts/real-build-bench.sh` calibrates it there.
+- On another shape most figures are `extrapolated`, and the doctor says so; the PSI limit is the default 40 on
+  every shape.
 - A setting a person chose deliberately below the recommendation (fewer job slots, a calibrated PSI limit on
   other hardware) is `info`, not a warning, and tune leaves it.
 - Exit codes: doctor 0 ok, 1 warnings, 4 errors (ac-ctl's 2 is bad usage, or doctor could not run, and 3 is

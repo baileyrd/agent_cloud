@@ -249,10 +249,11 @@ mod tests {
 
     const KATA: &str = "# Kata\n[hypervisor.qemu]\n# keep me\ninitrd = \"/i\"\n#default_vcpus = 1\n\
                         default_memory = 4096 # MiB\nunknown_key = \"x\"\n\n[agent.kata]\nfoo = 1\n";
-    const ENV: &str = "# settings\nAC_IMAGE=localhost/agent-shell:dev\nAC_BIND=127.0.0.1:8780\n";
+    const ENV: &str =
+        "# settings\nAC_IMAGE=localhost/agent-shell:dev\nAC_BIND=127.0.0.1:8780\nAC_JOB_CPU_PSI_MAX=20\n";
     const FSTAB: &str = "UUID=x / btrfs subvol=root,compress=zstd:1 0 0\n";
 
-    /// This host's shape with a fresh Kata config, no PSI setting and no fstab line.
+    /// This host's shape with a fresh Kata config, the old PSI limit of 20 and no fstab line.
     fn untuned() -> ac_domain::tune::HostFacts {
         let mut f =
             crate::factsjson::from_json(include_str!("../../../deploy/hosts/baileyserv.json"))
@@ -306,7 +307,8 @@ mod tests {
             assert!(shown.contains(line), "{line}: {shown}");
         }
         assert!(shown.contains("+default_vcpus = 2\n"), "{shown}");
-        assert!(shown.contains("+AC_JOB_CPU_PSI_MAX=20\n"), "{shown}");
+        assert!(shown.contains("-AC_JOB_CPU_PSI_MAX=20\n"), "{shown}");
+        assert!(shown.contains("+AC_JOB_CPU_PSI_MAX=40\n"), "{shown}");
         assert!(
             shown.contains("+tmpfs  /dev/shm  tmpfs  nosuid,nodev,size=15717M  0  0\n"),
             "{shown}"

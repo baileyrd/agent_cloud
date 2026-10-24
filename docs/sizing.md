@@ -317,7 +317,8 @@ the next one starts. The two layers relate to the build measurements above like 
   ([Job start gate under real builds](#job-start-gate-under-real-builds)): a third build started in 3 of 3 runs,
   15 s after the second, before PSI reached 20. Two builds held PSI at 12.6–29.8, so 20 sits inside their band;
   one build stays at ≤ 1.3. The load gate never shut: two builds peaked at load 3.8–4.1 there (5.8 in the
-  bench above).
+  bench above). The limit is now the default 40 on every host: a safety valve against saturation (3 builds
+  reach 56–59), not a burst limiter. The cap and `/dev/shm` admission bound the load.
 - *The spacing* (15 s) is what actually spaced the starts: every wait seen was `start spacing`. A job's build
   starts 4–7 s after the job (warm) or 24–42 s (cold: Claude's own start), and PSI avg10 takes another 10–13 s
   to show it, so 15 s is too short for PSI 20 to see the second build.
@@ -406,8 +407,22 @@ supervisor's first second):
 | 3, staggered 15 s: B | 151.3 / 151.4 / 151.9: +104% to +105% (1 run) | 99.3 / 109.6 / 117.6: +71% to +103% (2 runs, 6 builds) |
 | 3 at once: D | — | 141.2 / 141.6 / 143.8: **+143% to +148%** (1 run) |
 
-The time to finish all three (submit to the last build's end) was about the same with and without the gate:
-B warm 151.1 and 156.1 s, D 152.8 s. The 15 s stagger only shortened the first builds.
+**Time to result** (submit to the job's result, seconds; per run, the three jobs and their mean; makespan is
+submit of the first to the result of the last):
+
+| Run | Per job (a1, a2, a3) | Mean time to result | Makespan | Last build ends |
+|---|---|---|---|---|
+| B #1 cold | 194.6, 196.7, 180.8 | 190.7 | 197.3 | 193.7 |
+| B #2 | 106.1, 133.3, 136.8 | 125.4 | 153.2 | 151.1 |
+| B #3 | 109.9, 143.6, 142.8 | 132.1 | 159.4 | 156.1 |
+| D (gate off, warm, 1 run) | 150.9, 153.6, 156.1 | 153.5 | 157.5 | 152.8 |
+
+- Warm, the 15 s stagger of B cut the mean time to result by 21–28 s against D (125.4 and 132.1 against 153.5).
+  It did not change the makespan: 153.2 and 159.4 s against 157.5 s. There is no cold D to compare B #1 with.
+- In C the tiny job's time to result was 21.8–23.0 s: 14.8–15.6 s queued, then 6.2–8.3 s.
+- *Estimate, not measured:* a gate that held the third build until one of two ended would release it about
+  91 s in (C's first build ends at 83–84 s, and PSI falls 7 s later). That gives a makespan of about 160 s and
+  a mean time to result of about 112 s. No run held a third build.
 
 **Verdict on each claim.**
 1. *At most 2 builds at once with PSI 20:* **not held.** In all 3 B runs three builds ran at once, for 61–151 s.
@@ -418,8 +433,8 @@ B warm 151.1 and 156.1 s, D 152.8 s. The 15 s stagger only shortened the first b
    Three at once cost +143% to +148% warm (D, 1 run), against +166% before.
 3. *Cost to a tiny job:* it waited 14.8–15.6 s, all `start spacing`, then ran 6.2–8.3 s. That cost is
    acceptable, but it is only the spacing: the pressure gate never shut. A gate that held builds at 2 would hold
-   the tiny job too. With the limit proposed below, the replay puts that wait at about 75 s warm (until a build
-   ends), roughly ten times the job's own run time. See the roadmap.
+   the tiny job too. *Estimate, not measured:* at a limit of 10 the replay below puts that wait at about 75 s
+   warm (until a build ends), roughly ten times the job's own run time. See the roadmap.
 4. *PSI avg10's lag:* **yes, it lets a third build in.** The gate decides when a job starts. The build starts
    4.3–7.4 s later warm, or 24–42 s later cold (Claude's own start), and PSI avg10 then needs 10–13 s to show it.
    - Warm: PSI passed 20 17.3–19.3 s after a2's job start. a3 had started 15.4–16.2 s after it, 1.3–3.8 s
@@ -438,7 +453,8 @@ B warm 151.1 and 156.1 s, D 152.8 s. The 15 s stagger only shortened the first b
 - The egress allowlist was unchanged (sha256). ac-egress logged no deny; its only allows were
   api.anthropic.com:443 (25, the jobs' model calls and the login checks) and platform.claude.com:443 (1).
 
-**What would hold a burst at 2.** This is a replay of the measured curves against other limits, not run:
+**What a lower limit would have done.** This is a replay of the measured curves against other limits, an
+estimate, not run:
 
 | CPU PSI some reached, after a2's job start | Warm (4 runs) | Cold (2 runs) |
 |---|---|---|
@@ -448,19 +464,21 @@ B warm 151.1 and 156.1 s, D 152.8 s. The 15 s stagger only shortened the first b
 
 - One build alone peaked at 1.3 and idle agents at ≤ 3.6, while two builds never went below 12.6 after their
   ramp. After the first of two builds ended, PSI fell below 10 within 7.1–7.6 s.
-- So **`AC_JOB_CPU_PSI_MAX=10` with the 15 s spacing** holds warm bursts at 2, with a 3.8–5.3 s margin, and
-  reopens about 7 s after a build ends.
-- Cold starts need a spacing of at least 45 s (60 for a margin), which every burst would pay, tiny jobs
-  included.
-- Proposed: 10 and 15 s, to be validated by running B again. Defaults and rules are unchanged.
+- So a limit of 10 with the 15 s spacing would have held the warm bursts at 2, with a 3.8–5.3 s margin, and
+  reopened about 7 s after a build ended. Cold starts would need a spacing of at least 45 s (60 for a
+  margin), which every burst would pay, tiny jobs included.
+- **Decided (2026-10-24): no lower limit, and no rerun.** A PSI gate cannot see a build before it starts. The
+  makespan was the same with and without the gate. A strict gate would cost a tiny job about 75 s (estimate).
+  `AC_JOB_CPU_PSI_MAX` stays at the default 40 on every host, and `ac-ctl doctor` recommends it
+  (`measured: 20 did not hold a burst`).
 
 ## Settings from host facts (ADR-014)
 
 `ac-ctl doctor` turns the figures above into rules over a host's facts; `ac-ctl tune` applies them
 ([install.md](install.md#host-settings-ac-ctl-doctor-and-ac-ctl-tune-adr-014)). A recommendation is `measured` only
 where it reproduces a measurement on this shape of host; elsewhere it is `extrapolated`. The PSI limit is a third
-case, `measured input, gate unvalidated`: its input was measured here. Its effect as a gate was measured on
-2026-10-24 and did not hold ([Job start gate under real builds](#job-start-gate-under-real-builds)).
+case, `measured: 20 did not hold a burst`: the lower limit was run here and failed
+([Job start gate under real builds](#job-start-gate-under-real-builds)), so the default 40 stands.
 
 | Rule | From | Measured | Carried over |
 |---|---|---|---|
@@ -469,12 +487,12 @@ case, `measured input, gate unvalidated`: its input was measured here. Its effec
 | `default_vcpus` = 2 at ≥ 4 cores, else 1, never above 2 | Builds at once: 2 vCPUs ~40% faster, 3 builds at 2 vCPUs 7% slower | 4 cores | any other core count; more than 2 vCPUs per guest was never run |
 | `default_memory` idle 2048, build 2048, heavy 4096 | Claude Code ~475 MiB used; this repo's builds 468 MiB used, ≥ 65% free | idle, build | heavy: bigger builds were not measured |
 | `AC_MAX_RUNNING_JOBS` = cores | ADR-013, Jobs at once | 4 cores | other core counts |
-| `AC_JOB_CPU_PSI_MAX` = 20 on 4 cores with 2-vCPU guests, else 40 | Builds at once: 2 builds peaked at CPU PSI 23.7, 3 at 59.9 | the input only: on 4 cores, 2 vCPUs it is `measured input, gate unvalidated`. The gate at 20 ran against real build jobs on 2026-10-24 and did not hold a burst at 2 ([Job start gate under real builds](#job-start-gate-under-real-builds); 10 proposed) | every other shape: the default 40, "uncalibrated" |
+| `AC_JOB_CPU_PSI_MAX` = 40 (the default) on every shape | Job start gate under real builds: at 20 three builds started at CPU PSI 2.8, 16.8 and 16.1; 3 builds peak at 56–59, so 40 is a safety valve against saturation, not a burst limiter; the job cap and `/dev/shm` admission bound the load | 4 cores, 2 vCPUs: `measured: 20 did not hold a burst` | every other shape: `extrapolated` |
 | Forecast: agents = floor((`/dev/shm` − 512) / guest), builds = floor(cores / vCPUs) | Admission capacity; Builds at once | 7 agents and 2 builds here | the builds figure on other core counts |
 | Boot class | Real builds: cold boot 18–19 s against 3.5 s warm | rotational | SSD and NVMe: no SSD was measured |
 
 **Uncalibrated on other hardware.** On any host but this shape: how many builds at once a core count carries
-(the CPU-bound limit was measured on 4 cores only), the PSI limit that holds them there, more than 2 vCPUs per
+(the CPU-bound limit was measured on 4 cores only), more than 2 vCPUs per
 guest, the host reserve above 24 GiB, and every SSD figure. Run `scripts/real-build-bench.sh` (`matrix`, then
 `concurrent`) on such a host before trusting `extrapolated` figures for builds. For planning,
 `ac-ctl doctor --facts-file deploy/hosts/32g-8core-nvme.json --profile build` forecasts 11 agents at 2048 MiB
@@ -526,9 +544,9 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
 - Memory give-back: a build agent keeps its peak until it is paused.
 - Claude Code's own memory in several agents at once. Up to 3 jobs ran together (2026-10-24), but per-agent
   memory was not sampled; the model adds a1's single-job peak to each agent.
-- The job gate at the proposed `AC_JOB_CPU_PSI_MAX=10`. Its effect is a replay of the 20 runs' curves. Also
-  unmeasured: a cold burst at any spacing above 15 s, more than 3 build jobs, a job that starts idle and builds
-  later, and any other core count.
+- A job gate that holds a third build. A PSI limit of 10 is only a replay of the 20 runs' curves, and was
+  dropped. Also unmeasured: a cold burst at any spacing above 15 s, more than 3 build jobs, a job that starts
+  idle and builds later, and any other core count.
 - Long runs: hours of drift, many jobs in one agent, Chromium or desktop agents.
 - N=8. The staircase stopped at N=6, as `--max-n 6` intended, and the N=6 load already failed.
 - The proxy under real model traffic. Only 6 concurrent HEAD requests went through it, and its CPU was

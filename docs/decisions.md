@@ -444,14 +444,27 @@ How it works:
   jobs running `sleep 20`: a2's waited with `job slots full` while a1's ran (25.6 s), then started 1.2 s after it
   ended. With the defaults, the same two jobs: a2's waited with `start spacing`, started 15.3 s after a1's, and
   both ran at once (`running_jobs` 2) and succeeded.
+- *Real builds (2026-10-24, a1, a2 and a3, 21 jobs, `scripts/burst-test.sh`;
+  [sizing.md](sizing.md#job-start-gate-under-real-builds)).* With `AC_JOB_CPU_PSI_MAX=20`, two build jobs were
+  submitted together and a third once both ran. In 3 of 3 runs the third started after the spacing alone
+  (15.2–15.6 s, `start spacing`) and three builds ran at once, with CPU PSI peaking at 56–59. At the third start
+  PSI was 2.8–16.8 and load 1.7–2.4; `host busy` never appeared.
+  - Cause: a build starts 4–7 s after its job (24–42 s cold, Claude's own start), and PSI avg10 shows it 10–13 s
+    later still. Two builds then hold PSI at 12.6–29.8, so 20 is inside their band.
+  - Two builds cost +30% cold and +34% to +38% warm against one alone; three at once (the gate off) +143% to
+    +148% warm.
+  - A tiny job waited the spacing, 15 s. The watchdog took no action.
+  - Replaying the curves, PSI 10 with 15 s spacing would hold warm bursts at 2, but not cold ones; not changed
+    without a live run.
 
 **Consequences:**
-- On this host (4 cores, 2 vCPUs per guest) up to 4 API-bound jobs run at once. Once 2 builds run, load passes
-  the core count (5.8 measured) and the next start waits.
+- On this host (4 cores, 2 vCPUs per guest) up to 4 API-bound jobs run at once. With real build jobs, 2
+  builds held load at 3.8–4.1, under the core count, and CPU PSI at 12.6–29.8. At the limit of 20 a third build
+  was not held back (above, Real builds).
 - The gate acts only at start. A job that starts idle and then builds is not slowed down or stopped.
-- The load average lags by about a minute, longer than the 15 s spacing, so a burst of build jobs can start a
-  third before the load gate shuts; CPU PSI reacts in about 10 s but 2 builds peaked at 23.7, below 40. To hold
-  builds at 2, lower `AC_JOB_CPU_PSI_MAX` to about 20 or raise the spacing to 60 s (not measured).
+- The gate decides when a job starts, but its CPU arrives later: first the model's turn, then the build, then
+  PSI's 10 s average, so a burst of build jobs can start a third build before PSI shows the second. At 20 it
+  did, in every run (above). Replayed, 10 would hold warm bursts at 2; cold ones need a spacing of about 45–60 s.
 - A token for several agents can fill several slots, delaying other agents' jobs. `queued_reason` tells a
   `jobs:read` caller that the host is full or busy, not with whose jobs.
 - Starts are at least 15 s apart: a burst of N jobs takes (N − 1) × 15 s to start.
@@ -518,8 +531,9 @@ How it works:
 | `prereq.*` | `/dev/kvm`, vmx/svm, Kata config, initrd drop-in, fstab line = running mount, firewall, modes | (checks) |
 
 `gateway.cpu_psi_max = 20` is `measured input, gate unvalidated`: the PSI it rests on was measured (two 2-vCPU
-builds peaked at 23.7), but the gate set to 20 has never run against a burst of real builds (roadmap). It
-becomes `measured` once that run shows it holds builds at 2.
+builds peaked at 23.7). The gate set to 20 ran against bursts of real build jobs on 2026-10-24 (ADR-013) and did
+not hold builds at 2, so the tag stays. A limit of 10 is proposed from that run's curves. Rule, reason text
+and tag change only once a live run shows the new limit holding.
 
 *Live (2026-10-23, BaileyServ, gateway running).* `sudo ac-ctl doctor --profile build`: 17 ok, 1 info (disk
 class), every finding measured, exit 0 (since relabelled: the PSI limit is `measured input, gate unvalidated`; as a user: gateway.env and the firewall skipped, still exit 0). `tune`

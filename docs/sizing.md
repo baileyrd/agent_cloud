@@ -312,22 +312,155 @@ the next one starts. The two layers relate to the build measurements above like 
 - *The cap*, `AC_MAX_RUNNING_JOBS` = cores (4), is the most API-bound jobs that run at once. Those use ~5% of a
   core each, so the cap, not the CPU, is their limit. It is also never more than the running agents, one job
   each.
-- *The pressure gate* is what limits builds. One build at 2 vCPUs drove load to 2.4 (its PSI was not
-  computed); two drove load to 5.8 and PSI to 23.7 (+27% cold, +49% warm); three to load 7.0 and PSI 59.9 (+86%,
-  +166%). With 2 builds running the load is above the core count, so a third waits ("host busy"): builds
-  settle at 2, the recommended figure in the table above.
-- *The spacing* (15 s) gives a started job time to show in PSI (a 10 s average) before the next decision. The
-  load average lags about a minute, so builds submitted together can still reach 3 before it shuts the gate.
-  To keep a burst of builds at 2: `AC_JOB_CPU_PSI_MAX=20` (below the 23.7 of two builds) or
-  `AC_JOB_START_SPACING=60`. Neither was measured with real builds.
+- *The pressure gate* was meant to limit builds: two builds drove PSI to 23.7 and three to 59.9, so a limit of
+  20 was to hold a burst at 2. **Measured with real build jobs it does not**
+  ([Job start gate under real builds](#job-start-gate-under-real-builds)): a third build started in 3 of 3 runs,
+  15 s after the second, before PSI reached 20. Two builds held PSI at 12.6–29.8, so 20 sits inside their band;
+  one build stays at ≤ 1.3. The load gate never shut: two builds peaked at load 3.8–4.1 there (5.8 in the
+  bench above).
+- *The spacing* (15 s) is what actually spaced the starts: every wait seen was `start spacing`. A job's build
+  starts 4–7 s after the job (warm) or 24–42 s (cold: Claude's own start), and PSI avg10 takes another 10–13 s
+  to show it, so 15 s is too short for PSI 20 to see the second build.
 - The gate only decides starts. A job that starts idle and then builds is not slowed down.
+
+## Job start gate under real builds
+
+Measured on 2026-10-24 with [`scripts/burst-test.sh`](../scripts/burst-test.sh), live gate settings: CPU PSI
+some < 20, load < 4, 15 s spacing, at most 4 jobs (the gateway's startup line). Raw data in
+`/var/tmp/ac-burst-20261024-133504/` (baseline) and `/var/tmp/ac-burst-20261024-134346/` (B, C, D): `burst.csv`
+(1 s samples: CPU PSI, load, capacity, each job's state and `queued_reason`), `jobs.csv`, `checks.csv`, the
+journal.
+
+**Setup.**
+- Agents a1, a2 and a3 (2048 MiB, 2 vCPUs, each with its own Claude login), resumed on the measurement image
+  of [Real builds](#real-builds) (cargo 1.99.0).
+- Workload: this repo at HEAD with vendored dependencies in `/workspace/burst`. Every build is
+  `cargo build --release --workspace --offline --locked` from a clean target dir.
+- *Build job:* a job through the API (`timeout_secs` 900) asking Claude to run exactly that build and reply
+  `built`. *Tiny job:* "reply with exactly: pong".
+- *Build time* is read on the host side of the workspace: `target/`'s birth time to the newest mtime under
+  `target/release`. Model latency is not in it; the job's own start and finish are reported separately.
+- *Cold* as in Real builds: the agents boot fresh after a host page-cache drop, then the cache is dropped again
+  before the run. Run 1 of base, B and C is cold; the rest are warm; D ran warm.
+- Before each run the host was quiet: load1 < 1, CPU PSI < 2.
+- 21 jobs, all succeeded (`built` or `pong`). Every cold figure and all of D are **single runs**.
+
+**Experiments.**
+- *base:* the build alone in a1 by direct exec (no Claude call), 3 times.
+- *A, derived from B/C starts:* the first two jobs of every B and C run (a build job on a1, then at once one on
+  a2). Queueing figures come from all 6 runs. Wall times come from C only, since in B a third build joined.
+- *B:* A, then a build job on a3 once both jobs run. 3 runs.
+- *C:* as B, with the tiny job on a3. 3 runs.
+- *D:* B with `AC_JOB_CPU_PSI_MAX=1000` and `AC_JOB_START_SPACING=0` (a temporary drop-in), once. The load gate
+  has no setting and stayed.
+
+**Baseline.** Cold 74.0 s; warm 58.2 and 57.9 s. Peak CPU PSI some 1.0–1.2, load ≤ 2.1. The warm figure is
+12% above Real builds' 51.8 s: here three VMs are up and the time is taken on the host side. Slowdowns below
+are against this baseline.
+
+**Timeline** (seconds from a1's submit; "build" is start..end; reasons from the 1 s samples, `null` is the
+supervisor's first second):
+
+| Run | Job | Submit | Start | Build | Finish | Queued (reason) | CPU PSI / load at start |
+|---|---|---|---|---|---|---|---|
+| B #1 cold | a1 build | 0.0 | 0.3 | 41.8..193.2 | 194.6 | 0.3 | 0.27 / 1.01 |
+| | a2 build | 0.6 | 15.9 | 41.8..193.7 | 197.3 | 15.3 (start spacing) | 0.13 / 1.01 |
+| | a3 build | 16.2 | 31.4 | 42.1..193.4 | 197.0 | 15.2 (start spacing) | 2.79 / 1.68 |
+| B #2 | a1 build | 0.0 | 0.3 | 4.5..103.8 | 106.1 | 0.3 | 0.01 / 0.92 |
+| | a2 build | 0.6 | 15.8 | 21.7..132.5 | 133.9 | 15.3 (start spacing) | 1.40 / 1.46 |
+| | a3 build | 16.4 | 31.9 | 42.8..151.1 | 153.2 | 15.5 (start spacing) | 16.84 / 2.35 |
+| B #3 | a1 build | 0.0 | 0.5 | 6.1..107.9 | 109.9 | 0.5 | 0.33 / 0.93 |
+| | a2 build | 0.4 | 16.1 | 22.4..139.9 | 144.0 | 15.7 (start spacing) | 1.33 / 1.18 |
+| | a3 build | 16.6 | 32.2 | 41.1..156.1 | 159.4 | 15.6 (start spacing) | 16.10 / 2.03 |
+| C #1 cold | a1 build | 0.0 | 0.3 | 40.0..135.9 | 137.9 | 0.3 | 0.03 / 1.11 |
+| | a2 build | 0.5 | 15.9 | 40.0..135.9 | 139.3 | 15.3 (start spacing) | 0.25 / 1.08 |
+| | a3 pong | 16.1 | 30.9 | — | 39.2 | 14.8 (start spacing) | 2.02 / 1.37 |
+| C #2 | a1 build | 0.0 | 0.6 | 6.4..84.2 | 87.8 | 0.6 | 0.19 / 1.05 |
+| | a2 build | 0.9 | 16.2 | 23.6..103.2 | 105.1 | 15.3 (start spacing) | 1.24 / 1.13 |
+| | a3 pong | 16.5 | 31.6 | — | 38.7 | 15.1 (start spacing) | 13.77 / 2.01 |
+| C #3 | a1 build | 0.0 | 0.6 | 5.8..83.3 | 85.7 | 0.6 | 0.01 / 0.93 |
+| | a2 build | 0.3 | 16.1 | 23.2..103.4 | 106.0 | 15.8 (start spacing) | 1.25 / 1.03 |
+| | a3 pong | 16.7 | 32.3 | — | 38.5 | 15.6 (start spacing) | 15.56 / 1.62 |
+| D (gate off) | a1 build | 0.0 | 0.9 | 7.3..148.5 | 150.9 | 0.9 | 0.02 / 0.94 |
+| | a2 build | 0.6 | 1.1 | 10.0..151.6 | 154.2 | 0.5 | 0.02 / 0.94 |
+| | a3 build | 1.4 | 2.6 | 9.0..152.8 | 157.5 | 1.2 | 0.38 / 0.94 |
+
+| Run | Third job started, against both builds running | CPU PSI first ≥ 20 | Peak CPU PSI | Builds at once: peak (s at the peak) | Peak `running_jobs` | Peak load |
+|---|---|---|---|---|---|---|
+| B #1 cold | 10.4 s **before** | 66.5 | 59.2 | 3 (151) | 3 | 7.26 |
+| B #2 | 10.2 s after | 33.2 | 55.9 | 3 (61) | 3 | 5.89 |
+| B #3 | 9.8 s after | 35.1 | 57.0 | 3 (67) | 3 | 6.34 |
+| C #1 cold | 9.1 s **before** | 70.4 | 23.6 | 2 (96) | 3 | 4.06 |
+| C #2 | 8.0 s after | 35.4 | 29.8 | 2 (61) | 3 | 3.76 |
+| C #3 | 9.1 s after | 35.4 | 28.1 | 2 (60) | 3 | 3.76 |
+| D | 7.4 s **before** | 13.8 | 59.0 | 3 (138) | 3 | 6.74 |
+
+`queued_reason` was never `host busy`: the journal logged 12 waits, all `start spacing`.
+
+**Build wall times** (s; min / median / max; slowdown against the baseline above, 74.0 cold and 58.05 warm):
+
+| Builds | Cold | Warm |
+|---|---|---|
+| 1 (baseline) | 74.0 (1 run) | 57.9 / 58.05 / 58.2 (2 runs) |
+| 2: A (C's a1 and a2) | 95.9, 95.9: **+30%** (1 run) | 77.5 / 78.7 / 80.2: **+34% to +38%** (2 runs, 4 builds) |
+| 3, staggered 15 s: B | 151.3 / 151.4 / 151.9: +104% to +105% (1 run) | 99.3 / 109.6 / 117.6: +71% to +103% (2 runs, 6 builds) |
+| 3 at once: D | — | 141.2 / 141.6 / 143.8: **+143% to +148%** (1 run) |
+
+The time to finish all three (submit to the last build's end) was about the same with and without the gate:
+B warm 151.1 and 156.1 s, D 152.8 s. The 15 s stagger only shortened the first builds.
+
+**Verdict on each claim.**
+1. *At most 2 builds at once with PSI 20:* **not held.** In all 3 B runs three builds ran at once, for 61–151 s.
+   a3 waited only for the spacing (15.2–15.6 s), and at its start CPU PSI was 2.79, 16.84 and 16.10, load
+   1.68–2.35.
+2. *Overlapping builds within the measured +27% / +49%:* two builds cost +30% cold (1 run) and +34% to +38%
+   warm, so they are in range. In absolute terms, two warm builds (77.5–80.2 s) match the earlier 77.0–77.6 s.
+   Three at once cost +143% to +148% warm (D, 1 run), against +166% before.
+3. *Cost to a tiny job:* it waited 14.8–15.6 s, all `start spacing`, then ran 6.2–8.3 s. That cost is
+   acceptable, but it is only the spacing: the pressure gate never shut. A gate that held builds at 2 would hold
+   the tiny job too. With the limit proposed below, the replay puts that wait at about 75 s warm (until a build
+   ends), roughly ten times the job's own run time. See the roadmap.
+4. *PSI avg10's lag:* **yes, it lets a third build in.** The gate decides when a job starts. The build starts
+   4.3–7.4 s later warm, or 24–42 s later cold (Claude's own start), and PSI avg10 then needs 10–13 s to show it.
+   - Warm: PSI passed 20 17.3–19.3 s after a2's job start. a3 had started 15.4–16.2 s after it, 1.3–3.8 s
+     earlier.
+   - Cold: it passed 20 after 50.6–54.6 s, and a3 started before a2's build had begun.
+   - After the ramp, two builds held PSI at 12.6–29.8, below 20 in 31–68% of the samples (C runs). Even a longer
+     spacing would let a third in whenever PSI dips.
+   - The load gate never shut: two builds peaked at load 3.76–4.06.
+5. *Watchdog:* no action. No `rung` or `unhealthy` line and no `not acting` line in the gateway's journal.
+
+**Host.** No abort threshold tripped:
+- io PSI full ≤ 45.7, memory PSI some ≤ 0.72, no swap, host MemAvailable ≥ 18.9 GiB.
+- Between runs: no job running or queued and no cargo, rustc or claude left in any guest.
+- `/dev/shm` was 1.44 GiB after fresh boots and 2.65–3.28 GiB after builds (touched guest memory, plateauing
+  as in Real builds).
+- The egress allowlist was unchanged (sha256). ac-egress logged no deny; its only allows were
+  api.anthropic.com:443 (25, the jobs' model calls and the login checks) and platform.claude.com:443 (1).
+
+**What would hold a burst at 2.** This is a replay of the measured curves against other limits, not run:
+
+| CPU PSI some reached, after a2's job start | Warm (4 runs) | Cold (2 runs) |
+|---|---|---|
+| ≥ 20 | 17.3–19.3 s | 50.6–54.6 s |
+| ≥ 15 | 14.6–15.9 s | 48.4–49.0 s |
+| ≥ 10 | 9.7–11.2 s | 30.2–42.5 s |
+
+- One build alone peaked at 1.3 and idle agents at ≤ 3.6, while two builds never went below 12.6 after their
+  ramp. After the first of two builds ended, PSI fell below 10 within 7.1–7.6 s.
+- So **`AC_JOB_CPU_PSI_MAX=10` with the 15 s spacing** holds warm bursts at 2, with a 3.8–5.3 s margin, and
+  reopens about 7 s after a build ends.
+- Cold starts need a spacing of at least 45 s (60 for a margin), which every burst would pay, tiny jobs
+  included.
+- Proposed: 10 and 15 s, to be validated by running B again. Defaults and rules are unchanged.
 
 ## Settings from host facts (ADR-014)
 
 `ac-ctl doctor` turns the figures above into rules over a host's facts; `ac-ctl tune` applies them
 ([install.md](install.md#host-settings-ac-ctl-doctor-and-ac-ctl-tune-adr-014)). A recommendation is `measured` only
 where it reproduces a measurement on this shape of host; elsewhere it is `extrapolated`. The PSI limit is a third
-case, `measured input, gate unvalidated`: its input was measured here, its effect as a gate was not.
+case, `measured input, gate unvalidated`: its input was measured here. Its effect as a gate was measured on
+2026-10-24 and did not hold ([Job start gate under real builds](#job-start-gate-under-real-builds)).
 
 | Rule | From | Measured | Carried over |
 |---|---|---|---|
@@ -336,7 +469,7 @@ case, `measured input, gate unvalidated`: its input was measured here, its effec
 | `default_vcpus` = 2 at ≥ 4 cores, else 1, never above 2 | Builds at once: 2 vCPUs ~40% faster, 3 builds at 2 vCPUs 7% slower | 4 cores | any other core count; more than 2 vCPUs per guest was never run |
 | `default_memory` idle 2048, build 2048, heavy 4096 | Claude Code ~475 MiB used; this repo's builds 468 MiB used, ≥ 65% free | idle, build | heavy: bigger builds were not measured |
 | `AC_MAX_RUNNING_JOBS` = cores | ADR-013, Jobs at once | 4 cores | other core counts |
-| `AC_JOB_CPU_PSI_MAX` = 20 on 4 cores with 2-vCPU guests, else 40 | Builds at once: 2 builds peaked at CPU PSI 23.7, 3 at 59.9 | the input only: on 4 cores, 2 vCPUs it is `measured input, gate unvalidated` (the gate at 20 never ran against real builds) | every other shape: the default 40, "uncalibrated" |
+| `AC_JOB_CPU_PSI_MAX` = 20 on 4 cores with 2-vCPU guests, else 40 | Builds at once: 2 builds peaked at CPU PSI 23.7, 3 at 59.9 | the input only: on 4 cores, 2 vCPUs it is `measured input, gate unvalidated`. The gate at 20 ran against real build jobs on 2026-10-24 and did not hold a burst at 2 ([Job start gate under real builds](#job-start-gate-under-real-builds); 10 proposed) | every other shape: the default 40, "uncalibrated" |
 | Forecast: agents = floor((`/dev/shm` − 512) / guest), builds = floor(cores / vCPUs) | Admission capacity; Builds at once | 7 agents and 2 builds here | the builds figure on other core counts |
 | Boot class | Real builds: cold boot 18–19 s against 3.5 s warm | rotational | SSD and NVMe: no SSD was measured |
 
@@ -391,7 +524,11 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
   conclusion that 2048 MiB is enough holds only for builds of this size.
 - Real builds on an SSD; hours-long growth in a build agent; many builds of different projects in one agent.
 - Memory give-back: a build agent keeps its peak until it is paused.
-- Claude Code jobs in several agents at once. The model adds a1's single-job peak to each agent.
+- Claude Code's own memory in several agents at once. Up to 3 jobs ran together (2026-10-24), but per-agent
+  memory was not sampled; the model adds a1's single-job peak to each agent.
+- The job gate at the proposed `AC_JOB_CPU_PSI_MAX=10`. Its effect is a replay of the 20 runs' curves. Also
+  unmeasured: a cold burst at any spacing above 15 s, more than 3 build jobs, a job that starts idle and builds
+  later, and any other core count.
 - Long runs: hours of drift, many jobs in one agent, Chromium or desktop agents.
 - N=8. The staircase stopped at N=6, as `--max-n 6` intended, and the N=6 load already failed.
 - The proxy under real model traffic. Only 6 concurrent HEAD requests went through it, and its CPU was

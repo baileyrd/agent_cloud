@@ -8,6 +8,13 @@ Wants=ac-agentfw.service network-online.target
 After=containerd.service ac-agentfw.service network-online.target
 
 [Service]
+# Active only once it listens: READY=1 after the tokens, the reconcile and admission, with the
+# listener bound (ADR-015). Install the binary before this unit: an older one never sends READY.
+Type=notify
+NotifyAccess=main
+# Measured startup 0.1-1.1 s (a VM killed under it: 1.1 s). 180 s outlasts one external command
+# hitting its 120 s timeout during the reconcile, which is logged and served through.
+TimeoutStartSec=180
 EnvironmentFile=/etc/agent-cloud/gateway.env
 UnsetEnvironment=AC_ALLOW_PUBLIC_BIND
 ExecStart=/usr/local/bin/ac-gateway

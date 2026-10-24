@@ -109,7 +109,7 @@ fn ready_then_stopping(sock: &UnixDatagram, notify: &str) {
     assert!(listening(addr), "READY before the listener was bound");
     assert_eq!(
         ready,
-        format!("READY=1\nSTATUS=listening on {addr}; 0 agents; reconcile done\n")
+        format!("READY=1\nSTATUS=listening on {addr}; 0 agents (0 running); reconcile done\n")
     );
     assert_eq!(recv(sock, Duration::from_millis(1500)), None, "READY twice");
     let out = terminate(child);

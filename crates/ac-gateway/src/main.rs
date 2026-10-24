@@ -58,7 +58,7 @@ use ac_domain::health::Thresholds;
 use ac_domain::schedule::Limits;
 use ac_domain::tune::rules::drift;
 use ac_domain::tune::{recommend, Fact, Profile};
-use ac_domain::GuestMemory;
+use ac_domain::{GuestMemory, State};
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::notify::{self, Notify};
@@ -376,7 +376,12 @@ fn run() -> Result<(), String> {
             "reconcile failed (see the log)"
         }
     };
-    let agents = fleet.list().map_or(0, |a| a.len());
+    let listed = fleet.list().unwrap_or_default();
+    let agents = listed
+        .iter()
+        .filter(|(_, s)| *s != State::Destroyed)
+        .count();
+    let running = listed.iter().filter(|(_, s)| *s == State::Running).count();
     match fleet.capacity() {
         Ok(Some(r)) => eprintln!(
             "ac-gateway: admission: /dev/shm {} MiB ({} free), {} agent(s) running commit {} MiB, \
@@ -474,7 +479,7 @@ fn run() -> Result<(), String> {
     // queue until `run` accepts them).
     eprintln!("ac-gateway listening on {bound}");
     notify.send(&notify::ready(&format!(
-        "listening on {bound}; {agents} agents; {reconciled}"
+        "listening on {bound}; {agents} agents ({running} running); {reconciled}"
     )));
     watch(signals, file, legacy, keys, notify, stop);
     server.run().map_err(|e| e.to_string())

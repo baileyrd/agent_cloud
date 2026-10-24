@@ -521,8 +521,8 @@ How it works:
   nothing. It refuses while any Kata VM runs (unless `--force`; it names those that need a pause and resume)
   and refuses a `/dev/shm` smaller than what is in use. It never reboots, remounts (it prints the remount),
   rebuilds the initrd or touches the firewall or units: those are printed as manual steps with the command
-  from install.md. `--restart-gateway` restarts the gateway and waits for its port, since it reports active
-  before it listens. `--root DIR` edits copies under DIR, to try it without touching the host.
+  from install.md. `--restart-gateway` restarts the gateway and waits for its port (since ADR-015 the restart
+  itself waits for readiness; the port wait stays as a second check and for older units). `--root DIR` edits copies under DIR, to try it without touching the host.
 
 | Rule | Recommendation | Measured when |
 |---|---|---|

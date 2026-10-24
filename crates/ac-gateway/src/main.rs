@@ -27,6 +27,11 @@
 //! It refuses to start without a token, or with a tokens file that is unreadable, too open, owned
 //! by someone else or malformed. A bad later version is logged and the previous tokens stay.
 //!
+//! Readiness (ADR-015): with `NOTIFY_SOCKET` set (`Type=notify`) it sends `READY=1` once the
+//! tokens are loaded, the reconcile has run, admission is set up and the listener is bound; a
+//! start that fails exits non-zero first. SIGTERM or SIGINT sends `STOPPING=1` and exits 0
+//! within a second.
+//!
 //! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
 //! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
 //! logged and the gateway serves anyway. Jobs of agents that are not running are then ended
@@ -56,6 +61,7 @@ use ac_domain::tune::{recommend, Fact, Profile};
 use ac_domain::GuestMemory;
 use ac_fleet::Fleet;
 use ac_gateway::jobs::{self, Jobs};
+use ac_gateway::notify::{self, Notify};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::watchdog::Watchdog;
@@ -64,7 +70,7 @@ use ac_gateway::{bind, Api, Unhealthy};
 use ac_store::EngineStore;
 use platform::events::{SignalEvent, SignalSource};
 use platform_linux::{LinuxSignalSource, LinuxSpawner};
-use rusty_serve::Server;
+use rusty_serve::{Server, ShutdownHandle};
 
 const TOKENS: &str = "/etc/agent-cloud/tokens";
 
@@ -231,16 +237,26 @@ fn load_tokens(file: &mut TokenFile) -> Result<(Tokens, Option<Token>), String> 
     Ok((all, legacy))
 }
 
-/// Re-read the tokens file on SIGHUP and whenever it changes; a bad version keeps the current
-/// tokens.
-fn watch_tokens(mut file: TokenFile, legacy: Option<Token>, keys: Keys) -> Result<(), String> {
-    let signals = LinuxSignalSource;
-    signals
-        .install(&[SignalEvent::Hangup])
-        .map_err(|e| format!("install SIGHUP handler: {e:?}"))?;
+/// Each second: on SIGTERM or SIGINT, send `STOPPING=1` and stop the server; otherwise re-read
+/// the tokens file if it changed or on SIGHUP (a bad version keeps the current tokens). The
+/// handlers are installed by the caller.
+fn watch(
+    signals: LinuxSignalSource,
+    mut file: TokenFile,
+    legacy: Option<Token>,
+    keys: Keys,
+    notify: Notify,
+    stop: ShutdownHandle,
+) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
-        let force = signals.take() == Some(SignalEvent::Hangup);
+        let signal = signals.take();
+        if let Some(s @ (SignalEvent::Terminate | SignalEvent::Interrupt)) = signal {
+            eprintln!("ac-gateway: {s:?}: stopping");
+            notify.send(notify::STOPPING);
+            return stop.shutdown();
+        }
+        let force = signal == Some(SignalEvent::Hangup);
         let next = file
             .reload(force)
             .and_then(|t| t.map(|t| with_legacy(t, legacy.as_ref())).transpose());
@@ -254,7 +270,6 @@ fn watch_tokens(mut file: TokenFile, legacy: Option<Token>, keys: Keys) -> Resul
             Err(e) => eprintln!("ac-gateway: tokens not reloaded, keeping the current ones: {e}"),
         }
     });
-    Ok(())
 }
 
 /// One log line when this gateway's settings (its environment, Kata's configuration, `/dev/shm`)
@@ -290,6 +305,7 @@ fn settings_check() {
 }
 
 fn run() -> Result<(), String> {
+    let notify = Notify::from_env();
     let mut file = tokens_file()?;
     let (tokens, legacy) = load_tokens(&mut file)?;
     let keys = Keys::new(tokens);
@@ -348,14 +364,19 @@ fn run() -> Result<(), String> {
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
     let fleet =
         Fleet::new(runtime, Arc::clone(&store)).with_admission(Box::new(host_capacity()?), margin);
-    match fleet.reconcile() {
+    let reconciled = match fleet.reconcile() {
         Ok(changed) => {
             for id in changed {
                 eprintln!("ac-gateway: reconcile: {id} had no VM; marked paused");
             }
+            "reconcile done"
         }
-        Err(e) => eprintln!("ac-gateway: reconcile: {e}"),
-    }
+        Err(e) => {
+            eprintln!("ac-gateway: reconcile: {e}");
+            "reconcile failed (see the log)"
+        }
+    };
+    let agents = fleet.list().map_or(0, |a| a.len());
     match fleet.capacity() {
         Ok(Some(r)) => eprintln!(
             "ac-gateway: admission: /dev/shm {} MiB ({} free), {} agent(s) running commit {} MiB, \
@@ -400,8 +421,7 @@ fn run() -> Result<(), String> {
             eprintln!("ac-gateway: {id}: clearing old viewer clients: {e}");
         }
     }
-    watch_tokens(file, legacy, keys.clone())?;
-    let app = Arc::new(App::new(api, hub.clone(), keys).with_jobs(Arc::clone(&jobs)));
+    let app = Arc::new(App::new(api, hub.clone(), keys.clone()).with_jobs(Arc::clone(&jobs)));
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         jobs.tick();
@@ -436,7 +456,27 @@ fn run() -> Result<(), String> {
         });
     }
     let server = Server::bind_shared(addr, Shared(app)).map_err(|e| format!("bind {addr}: {e}"))?;
-    eprintln!("ac-gateway listening on {addr}");
+    let bound = server
+        .local_addr()
+        .map_err(|e| format!("bind {addr}: {e}"))?;
+    let stop = server
+        .shutdown_handle()
+        .map_err(|e| format!("bind {addr}: {e}"))?;
+    let signals = LinuxSignalSource;
+    signals
+        .install(&[
+            SignalEvent::Hangup,
+            SignalEvent::Terminate,
+            SignalEvent::Interrupt,
+        ])
+        .map_err(|e| format!("install signal handlers: {e:?}"))?;
+    // Ready: everything above that can fail has succeeded, and the listener is bound (connections
+    // queue until `run` accepts them).
+    eprintln!("ac-gateway listening on {bound}");
+    notify.send(&notify::ready(&format!(
+        "listening on {bound}; {agents} agents; {reconciled}"
+    )));
+    watch(signals, file, legacy, keys, notify, stop);
     server.run().map_err(|e| e.to_string())
 }
 

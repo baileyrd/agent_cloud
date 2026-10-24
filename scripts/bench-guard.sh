@@ -1,9 +1,9 @@
 #!/bin/bash
-# Sourced by capacity-bench.sh and real-build-bench.sh, never run: host readers, the gateway API with a
-# scoped throwaway token, the watchdog (trip() names the threshold), held-stdin execs and the per-VM
-# figures. The caller sets OUT and MAIN (its $$) and traps USR1 to its cleanup; EXEC_TAG prefixes exec
-# ids; LOUD_PHASES lists the phases whose io PSI full limit is 80 instead of 40 (phase "purged", the
-# settle after a workspace purge, always is).
+# Sourced by capacity-bench.sh, real-build-bench.sh and burst-test.sh, never run: host readers, the gateway
+# API with a scoped throwaway token, the watchdog (trip() names the threshold), held-stdin execs, the per-VM
+# figures, the gateway restart and the build's source bundle. The caller sets OUT and MAIN (its $$) and
+# traps USR1 to its cleanup; EXEC_TAG prefixes exec ids and names the bundle; LOUD_PHASES lists the phases
+# whose io PSI full limit is 80 instead of 40 (phase "purged", the settle after a workspace purge, always is).
 NS=agents
 DATA=/var/lib/agent-cloud
 KATA=/etc/kata-containers/configuration.toml
@@ -24,16 +24,18 @@ kata() { sed -n "s/^$1 = \([0-9]*\)$/\1/p" "$KATA" | head -n 1; }
 DISK=$(lsblk -no PKNAME "$(findmnt -no SOURCE -T "$DATA" | sed 's/\[.*//')" 2>/dev/null | head -n 1)
 busy_ms() { awk -v d="$DISK" '$3 == d { print $13 }' /proc/diskstats; }
 
-# The gateway API with the bench token (on curl's stdin). api <method> <path> -> "<status> <body>".
+# The gateway API with the bench token (on curl's stdin). api <method> <path> [<JSON body file>] ->
+# "<status> <body>".
 api() {
     printf 'Authorization: Bearer %s\n' "$TOKEN" |
-        curl -sS -m "${API_SECS:-300}" -H @- -X "$1" -w ' %{http_code}' "$URL/api/v1$2" 2>&1 |
+        curl -sS -m "${API_SECS:-300}" -H @- -X "$1" ${3:+-H 'Content-Type: application/json' --data-binary "@$3"} \
+            -w ' %{http_code}' "$URL/api/v1$2" 2>&1 |
         sed 's/^\(.*\) \([0-9]*\)$/\2 \1/'
 }
 
-# guard_token <name> <agents>: a token <name>-<pid> with agents:read,agents:write for <agents>, revoked
-# by an EXIT trap until the caller's cleanup takes over. A leftover <name>-* token means an earlier run
-# died: it is revoked and this run stops.
+# guard_token <name> <agents> [<scopes>]: a token <name>-<pid> with <scopes> (default agents:read,agents:write)
+# for <agents>, revoked by an EXIT trap until the caller's cleanup takes over. A leftover <name>-* token
+# means an earlier run died: it is revoked and this run stops.
 guard_token() {
     local old stale=
     URL=http://$(val AC_BIND)
@@ -45,7 +47,7 @@ guard_token() {
     done
     [ -z "$stale" ] || exit 2
     TNAME=$1-$$
-    TOKEN=$("$GW" token create "$TNAME" --scopes agents:read,agents:write --agents "$2") ||
+    TOKEN=$("$GW" token create "$TNAME" --scopes "${3:-agents:read,agents:write}" --agents "$2") ||
         { echo "token create failed" >&2; exit 2; }
     trap '"$GW" token revoke "$TNAME" >/dev/null' EXIT
     sleep 2  # the gateway re-reads the tokens file within a second of a change
@@ -105,7 +107,8 @@ sampler() {
         lim=40; case " ${LOUD_PHASES:-load} purged " in *" ${ph%% *} "*) lim=80 ;; esac
         awk -v v="$iof" -v m=$lim 'BEGIN { exit !(v > m) }' && trip "io PSI full avg10 $iof > $lim"
         [ "$(vmstat oom_kill)" = "$oom0" ] || trip "host OOM kill ($(dmesg | grep -iE 'killed process|out of memory' | tail -n 1))"
-        if awk -v v="$l" -v c="$CORES" 'BEGIN { exit !(v > 2 * c) }'; then
+        # NO_LOAD_TRIP=1: a run that means to saturate the CPU (burst-test.sh) keeps every other limit.
+        if [ -z "${NO_LOAD_TRIP:-}" ] && awk -v v="$l" -v c="$CORES" 'BEGIN { exit !(v > 2 * c) }'; then
             [ -n "$over" ] || over=$t
             awk -v a="$over" -v b="$t" 'BEGIN { exit !(b - a >= 60) }' && trip "load average $l > $((2 * CORES)) for 60 s"
         else over=; fi
@@ -150,6 +153,32 @@ destroy() {  # 404: already gone
     r=$(API_SECS=180 api DELETE "/agents/$1?purge=true&force=true")
     case $r in 200\ *|404\ *) ;; *) echo "destroy $1: $r"; return 1 ;; esac
 }
+
+# --- the gateway and the build ----------------------------------------------------------------
+gw_image() { tr '\0' '\n' < "/proc/$(pgrep -x ac-gateway | head -n 1)/environ" | sed -n 's/^AC_IMAGE=//p'; }
+# Restart and wait until it answers: it reports active before it listens.
+gw_restart() {
+    local i=0 ph
+    ph=$(cat "$OUT/phase"); echo "restart 0" > "$OUT/phase"
+    systemctl restart ac-gateway || return 1
+    until [ "$(API_SECS=3 api GET /whoami | cut -d' ' -f1)" = 200 ]; do
+        i=$((i + 1)); [ "$i" -lt 60 ] || { echo "ac-gateway not answering 60 s after restart"; return 1; }
+        sleep 1
+    done
+    echo "$ph" > "$OUT/phase"
+    echo "  ac-gateway restarted, answering after ${i} s; AC_IMAGE=$(gw_image)"
+    echo "  capacity: $(api GET /capacity)"
+}
+# HEAD of $REPO plus vendored dependencies in $SRC (/var/tmp/$EXEC_TAG-src.*), made as the sudo user
+# (their cargo cache, offline).
+bundle() {
+    SRC=$(runuser -u "$SUDO_USER" -- mktemp -d "/var/tmp/$EXEC_TAG-src.XXXXXX") || return 1
+    runuser -u "$SUDO_USER" -- sh -c 'git -C "$1" archive HEAD | tar -x -C "$2" && cd "$2" &&
+        cargo vendor --offline --locked vendor > config.toml 2> vendor.log && mkdir .cargo && mv config.toml .cargo/' \
+        sh "$REPO" "$SRC" || { echo "source bundle: $(tail -n 3 "$SRC/vendor.log" 2>/dev/null)"; return 1; }
+    echo "sources: $(du -sm "$SRC" | cut -f1) MiB, $(ls "$SRC/vendor" | wc -l) vendored crates"
+}
+drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches; }
 
 # Settle: wait (10 to 120 s) until the last host sample shows cpu busy < 25% and io PSI some < 5.
 settle() {

@@ -79,6 +79,13 @@ curl: (7) Failed to connect to 1.1.1.1 port 443 after 0 ms: Could not connect to
 (`journalctl -u ac-egress`: `deny 10.89.0.34 example.com:443: not on allowlist`); to allow a host, add it to
 `/etc/agent-cloud/egress-allow.txt`, which is re-read automatically.
 
+Per-agent hosts (ADR-016): the gateway boots every VM with its own `HTTPS_PROXY`, `HTTP_PROXY` and lowercase
+forms, `http://<id>:<secret>@10.89.0.1:3128`, overriding the image's. The secret is new on every create and
+resume. With it the proxy adds the profiles attached to that agent (`PUT /api/v1/agents/<id>/egress`); a wrong
+one gets 407. Without it (the image's own URL, or an agent booted by `ac-ctl`) only the base list applies. Claude
+Code (`claude -p`), curl and cargo (`cargo fetch`) were checked with it on 2026-10-25; pip and npm read the
+same variables but are untested. Do not print `$HTTPS_PROXY` in shared output: it is the agent's credential until its next resume.
+
 Plain `ctr run` containers have no network, and `ctr run --cni` does not work with Kata: it attaches the
 network after the VM has booted, so the guest never gets an interface. With `--network`, `ac-ctl` instead
 creates a network namespace (`ip netns add ac-<id>`), attaches it with the CNI `bridge` plugin, then starts the

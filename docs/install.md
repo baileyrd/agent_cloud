@@ -260,6 +260,49 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ac-egress
 journalctl -u ac-egress -f                # one line per decision: allow|deny <agent ip> host:port [reason]
 ```
 
+**Egress profiles** (ADR-016): extra hosts for some agents only, on top of the base list. A profile is
+`/etc/agent-cloud/egress/profiles/<name>.txt` (root, 0600, the allowlist's format). Each agent boots with its own
+proxy credential in `HTTPS_PROXY` (new on every create and resume). The gateway keeps which profiles each agent
+has, and the digest of its credential, in `/etc/agent-cloud/egress/agents`, and the proxy re-reads both on
+every connection. Attaching needs a token with `egress:write`, and only installed profiles can be attached.
+
+```bash
+sudo install -d -m 0700 /etc/agent-cloud/egress /etc/agent-cloud/egress/profiles
+sudo install -m 0600 deploy/egress/profiles/*.txt /etc/agent-cloud/egress/profiles/
+TOKEN=$(sudo cat /etc/agent-cloud/owner.token)
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/egress/profiles
+# {"profiles":[{"name":"node","hosts":1},{"name":"python","hosts":2},{"name":"rust","hosts":3}]}
+curl -sS -H "Authorization: Bearer $TOKEN" -X PUT --data-binary '{"profiles":["rust"]}' \
+    http://127.0.0.1:8780/api/v1/agents/a1/egress
+# {"id":"a1","profiles":["rust"],"effective_hosts":8}       (PUT '{"profiles":[]}' detaches all)
+sudo ctr -n agents task exec --exec-id eg1 a1 sh -c \
+    'curl -s -m 8 -o /dev/null -w "%{http_connect}\n" https://index.crates.io/config.json'
+# 200 with rust attached, 403 without; the change applies to the next request, no restart.
+journalctl -u ac-egress -f      # allow|deny <agent ip> agent=<id> host:port [reason]
+```
+
+The log's `agent=` field is the agent the credential named. It is `-` without a credential (base list only) and
+`<id>?` for a refused one, which got 407. An agent booted before this change, or by `ac-ctl`, has no credential
+and gets the base list: pause and resume it through the gateway. `ac-ctl doctor` checks the agents file's mode
+and that every attached profile is installed.
+
+*Upgrading (install order):* install the proxy first, then the profiles, then the gateway. Either order is safe.
+A new proxy with an old gateway finds no agents file and gives everyone the base list. A new gateway with an old
+proxy hands out credentials the old proxy ignores, so attachments do nothing until the proxy is upgraded.
+
+```bash
+cargo build --release --locked -p ac-egress -p ac-gateway -p ac-ctl
+sudo install -m 0755 target/release/ac-egress /usr/local/bin/ && sudo systemctl restart ac-egress
+# profiles as above, then:
+sudo install -m 0755 target/release/ac-gateway target/release/ac-ctl /usr/local/bin/
+sudo systemctl restart ac-gateway
+```
+
+*Rollback:* reinstall the old `ac-gateway` and restart it. Then `sudo rm /etc/agent-cloud/egress/agents`, since
+an old gateway never clears digests and running agents would keep their profiles until it is gone. Then
+reinstall the old `ac-egress` if wanted. Agents keep their credential in their environment until their next
+resume; the old proxy ignores it.
+
 Hosts set up before ADR-007 keep the old `cni-agents.json` (NAT on) and `resolv.conf` (public resolvers) under
 `/var/lib/agent-cloud`, since both are written only once. With every agent paused, set `"ipMasq": false` and
 replace `resolv.conf` with a single comment line, then resume. Pausing first matters: a CNI DEL under the new
@@ -314,8 +357,8 @@ sudo systemctl daemon-reload && sudo systemctl restart ac-gateway
 
 **API tokens** (ADR-011): every caller gets its own token, with scopes and agents. Scopes: `agents:read`
 (status, list), `agents:write` (create, pause, resume, destroy, purge), `jobs:read`, `jobs:write` (submit,
-cancel), `viewer:read` (watch, history), `viewer:control` (take over, type), `admin` (everything). The route
-table is in [ADR-011](decisions.md#adr-011-scoped-api-tokens). Tokens live in `/etc/agent-cloud/tokens` (root,
+cancel), `viewer:read` (watch, history), `viewer:control` (take over, type), `egress:write`
+(attach egress profiles, ADR-016), `admin` (everything). The route table is in [ADR-011](decisions.md#adr-011-scoped-api-tokens). Tokens live in `/etc/agent-cloud/tokens` (root,
 0600) as digests; the commands below edit only that file, so they work while the gateway runs, which picks
 the change up within a second (or at once with `sudo systemctl reload ac-gateway`).
 

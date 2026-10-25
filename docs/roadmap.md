@@ -39,6 +39,9 @@
 ## M4: Safe to leave running
 - [x] Egress allowlist proxy and nftables rules (`ac-egress`, `deploy/agentfw.nft`; ADR-007), verified from an agent
   2026-10-19
+- [x] Per-agent egress profiles (`rust`, `python`, `node`) keyed by a per-boot proxy credential, attached with an
+  `egress:write` token, no restart (ADR-016; verified on BaileyServ 2026-10-25, a reboot still to test)
+- [ ] Verify the `python` and `node` profiles with a real `pip install` and `npm install` (only `curl -I` so far)
 - [x] `tini` as the agent image's PID 1, so killed jobs leave no zombies; no Claude Code self-update
   (`DISABLE_AUTOUPDATER=1`) (verified on BaileyServ 2026-10-22)
 - [ ] Per-agent CPU, memory and disk limits

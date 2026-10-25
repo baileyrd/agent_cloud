@@ -153,34 +153,32 @@ impl<U: Upstream> Proxy<U> {
         self.policy.write().unwrap_or_else(|e| e.into_inner()).base = list;
     }
 
-    /// Re-read the egress files if they changed (always with `force`). A bad version is logged
-    /// once and the current profiles and agents stay.
+    /// Re-read the egress files if they changed (always with `force`). A refused file is logged
+    /// once per change and keeps its last good version.
     pub fn refresh(&self, force: bool) {
         let Some(files) = &self.files else {
             return;
         };
         let mut files = files.lock().unwrap_or_else(|e| e.into_inner());
-        match files.reload(force) {
-            Ok(Some(loaded)) => {
-                for w in &loaded.warnings {
-                    eprintln!("ac-egress: warning: {w}");
-                }
-                eprintln!(
-                    "ac-egress: egress files read: {} profile(s) from {}, {} agent(s) from {}",
-                    loaded.profiles.len(),
-                    files.profiles_path().display(),
-                    loaded.agents.len(),
-                    files.agents_path().display()
-                );
-                let mut policy = self.policy.write().unwrap_or_else(|e| e.into_inner());
-                policy.profiles = loaded.profiles;
-                policy.agents = loaded.agents;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("ac-egress: egress files not reloaded, keeping the previous ones: {e}")
-            }
+        let Some(loaded) = files.reload(force) else {
+            return;
+        };
+        for e in &loaded.errors {
+            eprintln!("ac-egress: egress file refused, keeping its last good version: {e}");
         }
+        for w in &loaded.warnings {
+            eprintln!("ac-egress: warning: {w}");
+        }
+        eprintln!(
+            "ac-egress: egress files read: {} profile(s) from {}, {} agent(s) from {}",
+            loaded.profiles.len(),
+            files.profiles_path().display(),
+            loaded.agents.len(),
+            files.agents_path().display()
+        );
+        let mut policy = self.policy.write().unwrap_or_else(|e| e.into_inner());
+        policy.profiles = loaded.profiles;
+        policy.agents = loaded.agents;
     }
 
     /// Serve `listener` forever, one thread per connection.

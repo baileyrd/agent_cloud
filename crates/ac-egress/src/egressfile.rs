@@ -3,8 +3,10 @@
 //! connection, so a change applies to the next request without a signal.
 //!
 //! Every file must be a regular file owned by the proxy's user and not group or world
-//! accessible; the directory must not be writable by anyone else. Any bad file refuses the
-//! whole version: the caller keeps the policy it has (never falling open to a half-read one).
+//! accessible; the directory must not be writable by anyone else. Each file fails on its own: a
+//! bad agents file keeps the last good agents, a bad profile keeps its last good version (or adds
+//! nothing if it never had one), and every other change still applies, so one operator typo can
+//! never freeze a detach. Nothing bad is ever half-read.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -32,24 +34,34 @@ enum Stamp {
     },
 }
 
-/// The agents file and profiles, as read.
+/// What was looked at: the agents file, and each profile file (or why the directory is unusable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Seen {
+    agents: Result<Stamp, String>,
+    profiles: Result<Vec<(PathBuf, Stamp)>, String>,
+}
+
+/// The policy's per-agent part as it now stands.
 #[derive(Debug, Clone, Default)]
 pub struct Loaded {
     /// Profiles by name.
     pub profiles: BTreeMap<ProfileName, Allowlist>,
     /// One line per agent.
     pub agents: Vec<Attachment>,
-    /// Attachments that name a profile with no file: each adds nothing.
+    /// Attachments that name a profile with no usable file: each adds nothing.
     pub warnings: Vec<String>,
+    /// Files refused this time; each kept its last good version.
+    pub errors: Vec<String>,
 }
 
-/// The two paths, remembering which version was last read.
+/// The two paths, remembering which version was last read and the last good contents.
 #[derive(Debug)]
 pub struct EgressFiles {
     agents: PathBuf,
     profiles: PathBuf,
     owner: u32,
-    seen: Option<Vec<(PathBuf, Stamp)>>,
+    seen: Option<Seen>,
+    good: Loaded,
 }
 
 impl EgressFiles {
@@ -60,6 +72,7 @@ impl EgressFiles {
             profiles: profiles.into(),
             owner,
             seen: None,
+            good: Loaded::default(),
         }
     }
 
@@ -73,52 +86,84 @@ impl EgressFiles {
         &self.profiles
     }
 
-    /// Read everything if anything changed since the last attempt, or always when `force`.
-    /// `Ok(None)`: unchanged. A missing file or directory is empty. `Err`: a bad file; the same
-    /// version is not retried until something changes again or `force`.
-    pub fn reload(&mut self, force: bool) -> Result<Option<Loaded>, String> {
-        let stamps = self.stamps()?;
-        if !force && self.seen.as_ref() == Some(&stamps) {
-            return Ok(None);
+    /// Re-read everything if anything changed since the last look, or always when `force`, and
+    /// return the result: what parsed, plus the last good version of anything refused (named in
+    /// `errors`, reported once per change). `None`: unchanged. A missing file or directory is
+    /// empty.
+    pub fn reload(&mut self, force: bool) -> Option<Loaded> {
+        let seen = Seen {
+            agents: stamp(&self.agents),
+            profiles: self.profile_stamps(),
+        };
+        if !force && self.seen.as_ref() == Some(&seen) {
+            return None;
         }
-        self.seen = Some(stamps.clone());
-        let mut loaded = Loaded::default();
-        if let Some(text) = self.read(&self.agents)? {
-            loaded.agents = parse_agents(&text).map_err(|e| format!("{}: {e}", self.shown()))?;
+        let mut errors = Vec::new();
+        match self.read(&self.agents).and_then(|t| {
+            parse_agents(&t.unwrap_or_default())
+                .map_err(|e| format!("{}: {e}", self.agents.display()))
+        }) {
+            Ok(agents) => self.good.agents = agents,
+            Err(e) => errors.push(e),
         }
-        for (path, _) in stamps.iter().filter(|(p, _)| p != &self.agents) {
-            let name = profile_name(path)?;
-            let text = self.read(path)?.unwrap_or_default();
-            let list =
-                Allowlist::parse_file(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-            loaded.profiles.insert(name, list);
+        match &seen.profiles {
+            Err(e) => errors.push(e.clone()),
+            Ok(files) => {
+                let mut next = BTreeMap::new();
+                for (path, _) in files {
+                    let name = match profile_name(path) {
+                        Ok(name) => name,
+                        Err(e) => {
+                            errors.push(e);
+                            continue;
+                        }
+                    };
+                    let parsed = self.read(path).and_then(|t| {
+                        Allowlist::parse_file(&t.unwrap_or_default())
+                            .map_err(|e| format!("{}: {e}", path.display()))
+                    });
+                    match (parsed, self.good.profiles.remove(&name)) {
+                        (Ok(list), _) => {
+                            next.insert(name, list);
+                        }
+                        (Err(e), last) => {
+                            errors.push(e);
+                            if let Some(last) = last {
+                                next.insert(name, last);
+                            }
+                        }
+                    }
+                }
+                self.good.profiles = next;
+            }
         }
-        for a in &loaded.agents {
+        self.seen = Some(seen);
+        let mut warnings = Vec::new();
+        for a in &self.good.agents {
             for p in a
                 .profiles
                 .iter()
-                .filter(|p| !loaded.profiles.contains_key(*p))
+                .filter(|p| !self.good.profiles.contains_key(*p))
             {
-                loaded.warnings.push(format!(
-                    "agent {}: profile {p} has no file in {} (adds nothing)",
+                warnings.push(format!(
+                    "agent {}: profile {p} has no usable file in {} (adds nothing)",
                     a.agent,
                     self.profiles.display()
                 ));
             }
         }
-        Ok(Some(loaded))
+        Some(Loaded {
+            warnings,
+            errors,
+            ..self.good.clone()
+        })
     }
 
-    fn shown(&self) -> String {
-        self.agents.display().to_string()
-    }
-
-    /// The agents file's stamp, then each `*.txt` in the profiles directory, sorted.
-    fn stamps(&self) -> Result<Vec<(PathBuf, Stamp)>, String> {
-        let mut out = vec![(self.agents.clone(), stamp(&self.agents)?)];
+    /// Each `*.txt` in the profiles directory, sorted; empty if there is no directory.
+    fn profile_stamps(&self) -> Result<Vec<(PathBuf, Stamp)>, String> {
         let dir = &self.profiles;
         let entries = match std::fs::read_dir(dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("{}: {e}", dir.display())),
             Ok(entries) => entries,
         };
@@ -137,6 +182,7 @@ impl EgressFiles {
             ));
         }
         files.sort();
+        let mut out = Vec::new();
         for path in files {
             let s = stamp(&path)?;
             out.push((path, s));
@@ -249,10 +295,7 @@ mod tests {
     }
 
     fn loaded(f: &mut EgressFiles) -> Loaded {
-        match f.reload(false) {
-            Ok(Some(l)) => l,
-            other => panic!("{other:?}"),
-        }
+        f.reload(false).unwrap_or_else(|| panic!("unchanged"))
     }
 
     #[test]
@@ -260,7 +303,8 @@ mod tests {
         let dir = tmp();
         let _ = std::fs::remove_dir_all(dir.join("profiles"));
         let l = loaded(&mut files(&dir));
-        assert!(l.agents.is_empty() && l.profiles.is_empty() && l.warnings.is_empty());
+        assert!(l.agents.is_empty() && l.profiles.is_empty());
+        assert!(l.warnings.is_empty() && l.errors.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -284,10 +328,11 @@ mod tests {
         let names: Vec<&str> = l.profiles.keys().map(ProfileName::as_str).collect();
         assert_eq!(names, ["rust"]);
         assert!(l.profiles.values().all(|p| p.len() == 2));
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
         assert_eq!(l.warnings.len(), 1, "{:?}", l.warnings);
-        assert!(l.warnings[0].starts_with("agent a1: profile go has no file"));
-        assert!(matches!(f.reload(false), Ok(None)), "unchanged");
-        assert!(matches!(f.reload(true), Ok(Some(_))), "forced");
+        assert!(l.warnings[0].starts_with("agent a1: profile go has no usable file"));
+        assert!(f.reload(false).is_none(), "unchanged");
+        assert!(f.reload(true).is_some(), "forced");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -316,9 +361,56 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_file_refuses_the_version_once() {
+    fn a_bad_file_keeps_its_last_good_version_and_the_rest_still_applies() {
+        let dir = tmp();
+        write(&dir.join("agents"), "a1 - rust\n", 0o600);
+        write(&dir.join("profiles/rust.txt"), "a.example\n", 0o600);
+        write(&dir.join("profiles/node.txt"), "n.example\n", 0o600);
+        let mut f = files(&dir);
+        assert_eq!(loaded(&mut f).profiles.len(), 2);
+        // rust goes bad: its last good version stays, and a detach in the agents file applies.
+        write(
+            &dir.join("profiles/rust.txt"),
+            "a.example\nhttp://bad\n",
+            0o600,
+        );
+        write(&dir.join("agents"), "a1 - -\n", 0o600);
+        let l = loaded(&mut f);
+        assert!(l.agents[0].profiles.is_empty(), "the detach applied");
+        assert!(l.profiles.values().all(|p| p.len() == 1), "rust as it was");
+        assert_eq!(l.errors.len(), 1);
+        assert!(
+            l.errors[0].contains("invalid allowlist entry"),
+            "{:?}",
+            l.errors
+        );
+        // The agents file goes bad: the last good agents stay, profile edits still apply.
+        write(&dir.join("agents"), "a1 - -\na1 - -\n", 0o600);
+        write(
+            &dir.join("profiles/node.txt"),
+            "n.example\nm.example\n",
+            0o600,
+        );
+        let l = loaded(&mut f);
+        assert_eq!(l.agents.len(), 1);
+        assert_eq!(
+            l.profiles
+                .get(&ProfileName::parse("node").unwrap_or_else(|e| panic!("{e}")))
+                .map(Allowlist::len),
+            Some(2)
+        );
+        assert!(
+            l.errors.iter().any(|e| e.contains("listed twice")),
+            "{:?}",
+            l.errors
+        );
+        assert!(f.reload(false).is_none(), "reported once per change");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bad_files_that_never_were_good_add_nothing() {
         for (path, text, mode, want) in [
-            ("agents", "a1 - -\na1 - -\n", 0o600, "listed twice"),
             ("agents", "a1 - -\n", 0o640, "group/world"),
             (
                 "profiles/rust.txt",
@@ -332,14 +424,13 @@ mod tests {
         ] {
             let dir = tmp();
             write(&dir.join(path), text, mode);
-            let mut f = files(&dir);
-            let err = f.reload(false).err().unwrap_or_default();
-            assert!(err.contains(want), "{path} {text:?}: {err}");
+            let l = loaded(&mut files(&dir));
+            assert!(l.agents.is_empty() && l.profiles.is_empty(), "{path}");
             assert!(
-                matches!(f.reload(false), Ok(None)),
-                "not retried until it changes"
+                l.errors.iter().any(|e| e.contains(want)),
+                "{path}: {:?}",
+                l.errors
             );
-            assert!(f.reload(true).is_err());
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -349,16 +440,32 @@ mod tests {
         let dir = tmp();
         write(&dir.join("real"), "a1 - -\n", 0o600);
         let _ = std::os::unix::fs::symlink(dir.join("real"), dir.join("agents"));
-        let err = files(&dir).reload(false).err().unwrap_or_default();
-        assert!(err.contains("not a regular file"), "{err}");
+        let errors = loaded(&mut files(&dir)).errors;
+        assert!(
+            errors.iter().any(|e| e.contains("not a regular file")),
+            "{errors:?}"
+        );
         let _ = std::fs::remove_file(dir.join("agents"));
         let mut other = EgressFiles::new(dir.join("real"), dir.join("none"), me().wrapping_add(1));
-        let err = other.reload(false).err().unwrap_or_default();
-        assert!(err.contains("owned by uid"), "{err}");
+        let errors = loaded(&mut other).errors;
+        assert!(
+            errors.iter().any(|e| e.contains("owned by uid")),
+            "{errors:?}"
+        );
+        write(&dir.join("profiles/rust.txt"), "a.example\n", 0o600);
+        let mut f = files(&dir);
+        assert_eq!(loaded(&mut f).profiles.len(), 1);
         let _ =
             std::fs::set_permissions(dir.join("profiles"), std::fs::Permissions::from_mode(0o777));
-        let err = files(&dir).reload(false).err().unwrap_or_default();
-        assert!(err.contains("not group/world writable"), "{err}");
+        let l = loaded(&mut f);
+        assert!(
+            l.errors
+                .iter()
+                .any(|e| e.contains("not group/world writable")),
+            "{:?}",
+            l.errors
+        );
+        assert_eq!(l.profiles.len(), 1, "the last good profiles stay");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

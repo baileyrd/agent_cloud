@@ -4,6 +4,9 @@
 //! Networking: Kata decides a VM's interfaces at boot, so `ctr run --cni` (which attaches the
 //! network after the task starts) gives the guest nothing. Instead the adapter creates a network
 //! namespace, attaches it with the CNI bridge plugin, then starts the container in it.
+//!
+//! A boot's environment (the proxy credential, ADR-016) goes to `ctr run --env-file`: a 0600 file
+//! in a 0700 directory, removed once `ctr run` returns, so it is never in a command line.
 
 pub mod capacity;
 pub mod exec;
@@ -12,12 +15,14 @@ pub mod host;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ac_domain::AgentId;
-use ac_ports::{PortError, Runtime};
+use ac_ports::{Boot, PortError, Runtime};
 use platform::process::{Command, EnvSpec, ExitStatus, Spawner, Stdio};
 
 pub use exec::{Closed, Exec};
@@ -106,6 +111,8 @@ pub struct CtrConfig {
     pub image: String,
     /// Parent directory of per-agent workspace volumes.
     pub workspace_root: PathBuf,
+    /// Directory (made 0700) for each boot's `--env-file`, which lives only while `ctr run` runs.
+    pub env_dir: PathBuf,
     /// Owner (uid, gid) given to each new workspace so the unprivileged agent user can write.
     /// `None` leaves the directory owned by whoever runs the adapter.
     pub workspace_owner: Option<(u32, u32)>,
@@ -501,7 +508,13 @@ impl<S: Spawner> CtrRuntime<S> {
 
     /// Boot the agent's VM on its existing workspace: clear stale state, attach the network,
     /// start the container. A failed start undoes itself.
-    fn boot(&self, op: &'static str, id: &AgentId, dir: &Path) -> Result<(), PortError> {
+    fn boot(
+        &self,
+        op: &'static str,
+        id: &AgentId,
+        dir: &Path,
+        boot: &Boot,
+    ) -> Result<(), PortError> {
         // Removing the container fails while a task still runs in it, so the kill below never
         // reaches a live VM; it only clears what a shim that died uncleanly left behind.
         self.remove_stale(op, id)?;
@@ -513,7 +526,7 @@ impl<S: Spawner> CtrRuntime<S> {
             self.network_down(op, net, id)?;
             self.network_up(op, net, id)?;
         }
-        self.start_container(op, id, dir, net)
+        self.start_container(op, id, dir, net, boot)
             .map_err(|e| with_cleanup(e, self.undo_start(op, id, net)))
     }
 
@@ -527,6 +540,58 @@ impl<S: Spawner> CtrRuntime<S> {
             Some(net) => self.network_down(op, net, id),
             None => Ok(()),
         }
+    }
+}
+
+/// A boot's environment for `ctr run --env-file`: written 0600 (`O_EXCL`) in a 0700 directory and
+/// removed when dropped, which is as soon as `ctr run` has created the container or failed to.
+/// `ctr` reads it in its client, so nothing needs it afterwards.
+struct EnvFile(PathBuf);
+
+impl EnvFile {
+    /// `None` for an empty environment.
+    fn write(dir: &Path, id: &AgentId, boot: &Boot) -> Result<Option<Self>, String> {
+        if boot.env().is_empty() {
+            return Ok(None);
+        }
+        let mut text = String::new();
+        for (name, value) in boot.env() {
+            if name.is_empty() || name.contains(['=', '\n', '\0']) || value.contains(['\n', '\0']) {
+                return Err(format!(
+                    "environment variable {name:?}: name or value refused"
+                ));
+            }
+            text.push_str(&format!("{name}={value}\n"));
+        }
+        let shown = dir.display();
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {shown}: {e}"))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod {shown}: {e}"))?;
+        let path = dir.join(format!("{id}.env"));
+        // One left by a crash; the directory is root's alone, so nothing else put it there.
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("rm {}: {e}", path.display()))
+            }
+            _ => {}
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let written = Self(path);
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("{}: {e}", written.0.display()))?;
+        Ok(Some(written))
+    }
+}
+
+impl Drop for EnvFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -615,7 +680,7 @@ fn os(args: &[&str]) -> Vec<OsString> {
 }
 
 impl<S: Spawner> Runtime for CtrRuntime<S> {
-    fn create(&self, id: &AgentId) -> Result<(), PortError> {
+    fn create(&self, id: &AgentId, boot: &Boot) -> Result<(), PortError> {
         let dir = self.workspace(id);
         std::fs::create_dir_all(&dir).map_err(|e| PortError {
             op: "create",
@@ -627,7 +692,7 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
                 cause: format!("chown {}: {e}", dir.display()),
             })?;
         }
-        self.boot("create", id, &dir)
+        self.boot("create", id, &dir, boot)
     }
 
     // Pause stops the VM rather than freezing it (`ctr task pause`): a frozen Kata VM keeps its
@@ -636,7 +701,7 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
         self.stop("pause", id)
     }
 
-    fn resume(&self, id: &AgentId) -> Result<(), PortError> {
+    fn resume(&self, id: &AgentId, boot: &Boot) -> Result<(), PortError> {
         let dir = self.workspace(id);
         if !dir.is_dir() {
             return Err(PortError {
@@ -644,7 +709,7 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
                 cause: format!("workspace {} is missing", dir.display()),
             });
         }
-        self.boot("resume", id, &dir)
+        self.boot("resume", id, &dir, boot)
     }
 
     fn destroy(&self, id: &AgentId, purge: bool) -> Result<(), PortError> {
@@ -669,7 +734,10 @@ impl<S: Spawner> CtrRuntime<S> {
         id: &AgentId,
         dir: &Path,
         net: Option<&Network>,
+        boot: &Boot,
     ) -> Result<(), PortError> {
+        let env_file =
+            EnvFile::write(&self.cfg.env_dir, id, boot).map_err(|cause| PortError { op, cause })?;
         let workspace = format!(
             "type=bind,src={},dst={WORKSPACE_MOUNT},options=rbind:rw",
             dir.display()
@@ -695,8 +763,12 @@ impl<S: Spawner> CtrRuntime<S> {
                 ),
             ]);
         }
+        if let Some(file) = &env_file {
+            args.extend(["--env-file".to_owned(), file.0.display().to_string()]);
+        }
         args.extend([self.cfg.image.clone(), id.to_string()]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        // `env_file` is removed when this returns, whatever `ctr` did.
         self.ctr(op, &os(&args))
     }
 }
@@ -738,6 +810,7 @@ mod tests {
             namespace: "agents".into(),
             image: "agent:latest".into(),
             workspace_root: root.to_path_buf(),
+            env_dir: root.join("boot"),
             workspace_owner: None,
             network: None,
             vc_root: root.join("vc"),
@@ -814,18 +887,22 @@ mod tests {
         }
     }
 
-    /// A networked runtime whose `ctr run` exits with `run` (also when wrapped in `timeout`) and
-    /// whose cleanup `pkill` exits with `pkill`, with a netns and Kata state dirs left behind as
-    /// a real failed start leaves them.
-    fn rt_run_fails(run: ExitStatus, pkill: ExitStatus) -> (CtrRuntime<RunFails>, Log, PathBuf) {
-        let root = tmp();
-        let spawner = RunFails {
+    fn run_fails(run: ExitStatus, pkill: ExitStatus) -> RunFails {
+        RunFails {
             ok: mock(ExitStatus::Code(0), ExitStatus::Code(0)),
             run: MockSpawner::new().script("ctr", run).script("timeout", run),
             after: mock(ExitStatus::Code(0), ExitStatus::Code(0)).script("pkill", pkill),
             ran: Default::default(),
             log: Log::default(),
-        };
+        }
+    }
+
+    /// A networked runtime whose `ctr run` exits with `run` (also when wrapped in `timeout`) and
+    /// whose cleanup `pkill` exits with `pkill`, with a netns and Kata state dirs left behind as
+    /// a real failed start leaves them.
+    fn rt_run_fails(run: ExitStatus, pkill: ExitStatus) -> (CtrRuntime<RunFails>, Log, PathBuf) {
+        let root = tmp();
+        let spawner = run_fails(run, pkill);
         let log = Arc::clone(&spawner.log);
         let mut cfg = cfg(&root);
         with_network(&mut cfg, &root);
@@ -918,7 +995,7 @@ mod tests {
     #[test]
     fn create_runs_kata_with_workspace_mount() {
         let (rt, log, root) = rt(ExitStatus::Code(0));
-        assert!(rt.create(&id()).is_ok());
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
         let calls = argv(&log);
         assert_eq!(
             &calls[5][..6],
@@ -935,7 +1012,7 @@ mod tests {
     #[test]
     fn create_removes_a_stale_container_and_snapshot_first() {
         let (rt, log, root) = rt(ExitStatus::Code(0));
-        assert!(rt.create(&id()).is_ok());
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
         let calls = argv(&log);
         assert_eq!(calls[0][2..], ["container", "delete", "a1"]);
         assert_eq!(calls[1][2..], ["snapshots", "rm", "a1"]);
@@ -946,7 +1023,10 @@ mod tests {
     #[test]
     fn stale_removal_failure_stops_create() {
         let (rt, log, root) = rt_net(ExitStatus::Code(1), ExitStatus::Code(0));
-        assert_eq!(rt.create(&id()).err().map(|e| e.op), Some("create"));
+        assert_eq!(
+            rt.create(&id(), &Boot::default()).err().map(|e| e.op),
+            Some("create")
+        );
         assert_eq!(programs(&log), ["ctr"]);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -958,14 +1038,14 @@ mod tests {
         let _ = std::fs::create_dir_all(&root);
         let meta = std::fs::metadata(&root).unwrap_or_else(|e| panic!("{e}"));
         rt.cfg.workspace_owner = Some((meta.uid(), meta.gid()));
-        assert!(rt.create(&id()).is_ok());
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn network_create_makes_namespace_attaches_cni_then_starts_in_it() {
         let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
-        assert!(rt.create(&id()).is_ok());
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
         // A DEL first releases any lease a reboot left behind; no namespace, so no `ip netns del`.
         assert_eq!(
             programs(&log),
@@ -1001,7 +1081,7 @@ mod tests {
     #[test]
     fn cni_failure_never_starts_the_container() {
         let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(1));
-        let err = rt.create(&id()).err();
+        let err = rt.create(&id(), &Boot::default()).err();
         assert_eq!(err.map(|e| e.op), Some("create"));
         // The plugin fails on the first call, the DEL that clears stale leases.
         assert_eq!(
@@ -1014,7 +1094,10 @@ mod tests {
     #[test]
     fn start_failure_kills_kata_leftovers_and_undoes_everything() {
         let (rt, log, root) = rt_run_fails(ExitStatus::Code(1), ExitStatus::Code(1));
-        assert_eq!(rt.create(&id()).err().map(|e| e.op), Some("create"));
+        assert_eq!(
+            rt.create(&id(), &Boot::default()).err().map(|e| e.op),
+            Some("create")
+        );
         assert_eq!(
             programs(&log),
             [
@@ -1054,7 +1137,11 @@ mod tests {
     fn start_timeout_is_reported_and_cleaned_up() {
         let (mut rt, log, root) = rt_run_fails(ExitStatus::Code(124), ExitStatus::Code(1));
         rt.cfg.command_timeout = Some(Duration::from_secs(30));
-        let err = rt.create(&id()).err().map(|e| e.cause).unwrap_or_default();
+        let err = rt
+            .create(&id(), &Boot::default())
+            .err()
+            .map(|e| e.cause)
+            .unwrap_or_default();
         assert!(
             err.contains("timed out") && !err.contains("cleanup"),
             "{err}"
@@ -1068,7 +1155,11 @@ mod tests {
     #[test]
     fn failed_cleanup_is_reported_and_the_network_still_comes_down() {
         let (rt, log, root) = rt_run_fails(ExitStatus::Code(1), ExitStatus::Code(2));
-        let err = rt.create(&id()).err().map(|e| e.cause).unwrap_or_default();
+        let err = rt
+            .create(&id(), &Boot::default())
+            .err()
+            .map(|e| e.cause)
+            .unwrap_or_default();
         assert!(err.contains("cleanup also failed"), "{err}");
         assert_eq!(programs(&log)[10..], ["pkill", "ctr", "ctr", "sh", "ip"]);
         let _ = std::fs::remove_dir_all(root);
@@ -1123,11 +1214,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    const URL: &str =
+        "http://a1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@10.89.0.1:3128";
+
+    /// Records every command and, while `ctr run` runs, the `--env-file` it names: its mode,
+    /// its text and its directory's mode.
+    struct Peek<S> {
+        inner: S,
+        seen: Arc<Mutex<Option<(u32, String, u32)>>>,
+    }
+
+    impl<S: Spawner> Spawner for Peek<S> {
+        fn spawn(&self, cmd: &Command) -> platform::error::Result<Box<dyn Child>> {
+            let at = cmd.argv.iter().position(|a| a == "--env-file");
+            if let Some(path) = at.and_then(|i| cmd.argv.get(i + 1)).map(PathBuf::from) {
+                let mode =
+                    |p: &Path| std::fs::metadata(p).map_or(0, |m| m.permissions().mode() & 0o7777);
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let dir = path.parent().map_or(0, mode);
+                *self.seen.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((mode(&path), text, dir));
+            }
+            self.inner.spawn(cmd)
+        }
+
+        fn resolve(&self, program: &OsStr) -> platform::error::Result<OsString> {
+            self.inner.resolve(program)
+        }
+
+        fn adopt(&self, pid: u32) -> platform::error::Result<Box<dyn GroupHandle>> {
+            self.inner.adopt(pid)
+        }
+
+        fn is_alive(&self, pid: u32) -> platform::error::Result<bool> {
+            self.inner.is_alive(pid)
+        }
+
+        fn is_zombie(&self, pid: u32) -> platform::error::Result<bool> {
+            self.inner.is_zombie(pid)
+        }
+    }
+
+    fn credential() -> Boot {
+        ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+            .into_iter()
+            .fold(Boot::default(), |b, k| b.with_env(k, URL.to_owned()))
+    }
+
+    /// The secret goes to `ctr run --env-file` in a 0600 file under a 0700 directory, removed
+    /// once `ctr run` returns, and appears in no command's argv or environment.
+    #[test]
+    fn the_boot_environment_never_reaches_an_argv() {
+        for (status, resume) in [(0, false), (0, true), (1, false)] {
+            let root = tmp();
+            let _ = std::fs::create_dir_all(root.join("a1"));
+            let seen = Arc::default();
+            let mut cfg = cfg(&root);
+            with_network(&mut cfg, &root);
+            let boot = |rt: &dyn Runtime| match resume {
+                true => rt.resume(&id(), &credential()),
+                false => rt.create(&id(), &credential()),
+            };
+            // `ctr run` itself fails in the last case (the cleanup after it succeeds).
+            let (done, log) = if status == 0 {
+                let inner = mock(ExitStatus::Code(0), ExitStatus::Code(0));
+                let log = Arc::clone(&inner.spawned);
+                (
+                    boot(&CtrRuntime::new(
+                        Peek {
+                            inner,
+                            seen: Arc::clone(&seen),
+                        },
+                        cfg,
+                    )),
+                    log,
+                )
+            } else {
+                let inner = run_fails(ExitStatus::Code(1), ExitStatus::Code(0));
+                let log = Arc::clone(&inner.log);
+                (
+                    boot(&CtrRuntime::new(
+                        Peek {
+                            inner,
+                            seen: Arc::clone(&seen),
+                        },
+                        cfg,
+                    )),
+                    log,
+                )
+            };
+            assert_eq!(done.is_ok(), status == 0, "{done:?}");
+            let records = log.lock().unwrap_or_else(|e| e.into_inner());
+            let secret = &URL[10..74];
+            for r in records.iter() {
+                assert!(
+                    r.argv.iter().all(|a| !a.to_string_lossy().contains(secret)),
+                    "{:?}",
+                    r.argv
+                );
+                if let EnvSpec::Explicit(env) = &r.env {
+                    assert!(env.values().all(|v| !v.to_string_lossy().contains(secret)));
+                }
+            }
+            let run = records
+                .iter()
+                .find(|r| r.argv.iter().any(|a| a == "run"))
+                .map(|r| r.argv.clone())
+                .unwrap_or_default();
+            let path = root.join("boot/a1.env");
+            assert!(run
+                .windows(2)
+                .any(|w| w[0] == "--env-file" && w[1] == path.as_os_str()));
+            let want = format!(
+                "HTTPS_PROXY={URL}\nhttps_proxy={URL}\nHTTP_PROXY={URL}\nhttp_proxy={URL}\n"
+            );
+            let peeked = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            assert_eq!(peeked, Some((0o600, want, 0o700)));
+            assert!(!path.exists(), "removed after ctr run");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn an_empty_boot_has_no_env_file_and_a_bad_value_is_refused() {
+        let (rt, log, root) = rt(ExitStatus::Code(0));
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
+        assert!(argv(&log)
+            .iter()
+            .all(|a| !a.iter().any(|x| x == "--env-file")));
+        assert!(!root.join("boot").exists());
+        let bad = Boot::default().with_env("X", "a\nY=b".into());
+        let err = rt
+            .create(&id(), &bad)
+            .err()
+            .map(|e| e.cause)
+            .unwrap_or_default();
+        assert!(err.contains("refused"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn resume_boots_a_fresh_vm_on_the_kept_workspace() {
         let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
         let _ = std::fs::create_dir_all(root.join("a1"));
-        assert!(rt.resume(&id()).is_ok());
+        assert!(rt.resume(&id(), &Boot::default()).is_ok());
         assert_eq!(
             programs(&log),
             ["ctr", "ctr", "pkill", "pkill", "pkill", "sh", "ip", "sh", "ctr"]
@@ -1142,7 +1372,7 @@ mod tests {
     #[test]
     fn resume_without_a_workspace_is_refused_before_any_command() {
         let (rt, log, root) = rt(ExitStatus::Code(0));
-        let err = rt.resume(&id()).err();
+        let err = rt.resume(&id(), &Boot::default()).err();
         assert_eq!(err.map(|e| e.op), Some("resume"));
         assert!(programs(&log).is_empty());
         let _ = std::fs::remove_dir_all(root);

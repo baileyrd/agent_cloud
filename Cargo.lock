@@ -41,6 +41,9 @@ dependencies = [
  "ac-domain",
  "platform",
  "platform-linux",
+ "rusty_base64",
+ "rusty_crypto_key",
+ "rusty_sha2",
 ]
 
 [[package]]

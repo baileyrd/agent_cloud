@@ -4,7 +4,7 @@
 //! facts file may also be a whole `doctor --json` output: its `facts` are used.
 
 use ac_domain::tune::facts::{
-    Disk, Env, Fact, Firewall, HostFacts, Kata, Kvm, Mode, Shm, Virt, NFT_CHAINS,
+    Disk, EgressProfiles, Env, Fact, Firewall, HostFacts, Kata, Kvm, Mode, Shm, Virt, NFT_CHAINS,
 };
 use rusty_json::{Map, Value};
 
@@ -42,6 +42,18 @@ fn mode(m: &Mode) -> Value {
         ("uid".to_owned(), Value::from(m.uid)),
         ("gid".to_owned(), Value::from(m.gid)),
         ("mode".to_owned(), Value::from(format!("{:04o}", m.perm))),
+    ])
+}
+
+fn strings(v: &[String]) -> Value {
+    Value::Array(v.iter().map(|s| Value::from(s.as_str())).collect())
+}
+
+fn egress_profiles(p: &EgressProfiles) -> Value {
+    object([
+        ("attached".to_owned(), strings(&p.attached)),
+        ("missing".to_owned(), strings(&p.missing)),
+        ("refused".to_owned(), strings(&p.refused)),
     ])
 }
 
@@ -121,6 +133,14 @@ pub fn to_json(f: &HostFacts) -> Value {
         ("firewall".to_owned(), fact(&f.firewall, firewall)),
         ("tokens_mode".to_owned(), fact(&f.tokens_mode, mode)),
         ("allowlist_mode".to_owned(), fact(&f.allowlist_mode, mode)),
+        (
+            "egress_agents_mode".to_owned(),
+            fact(&f.egress_agents_mode, mode),
+        ),
+        (
+            "egress_profiles".to_owned(),
+            fact(&f.egress_profiles, egress_profiles),
+        ),
     ])
 }
 
@@ -166,6 +186,21 @@ fn mode_of(v: &Value) -> Option<Mode> {
         uid: u32::try_from(v.get("uid")?.as_u64()?).ok()?,
         gid: u32::try_from(v.get("gid")?.as_u64()?).ok()?,
         perm: u32::from_str_radix(v.get("mode")?.as_str()?, 8).ok()?,
+    })
+}
+
+fn strings_of(v: Option<&Value>) -> Option<Vec<String>> {
+    v?.as_array()?
+        .iter()
+        .map(|s| s.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn egress_profiles_of(v: &Value) -> Option<EgressProfiles> {
+    Some(EgressProfiles {
+        attached: strings_of(v.get("attached"))?,
+        missing: strings_of(v.get("missing"))?,
+        refused: strings_of(v.get("refused"))?,
     })
 }
 
@@ -257,6 +292,8 @@ pub fn from_json(text: &str) -> Result<HostFacts, String> {
         firewall: read(json, "firewall", firewall_of)?,
         tokens_mode: read(json, "tokens_mode", mode_of)?,
         allowlist_mode: read(json, "allowlist_mode", mode_of)?,
+        egress_agents_mode: read(json, "egress_agents_mode", mode_of)?,
+        egress_profiles: read(json, "egress_profiles", egress_profiles_of)?,
     })
 }
 
@@ -293,6 +330,12 @@ mod tests {
                 perm: 0o600,
             }),
             allowlist_mode: Fact::Skipped("root-only".into()),
+            egress_agents_mode: Fact::Absent,
+            egress_profiles: Fact::Known(EgressProfiles {
+                attached: vec!["node".into(), "rust".into()],
+                missing: vec!["node".into()],
+                refused: vec!["rust: mode 0644".into()],
+            }),
             ..HostFacts::bare(23909, 4, "x")
         }
     }

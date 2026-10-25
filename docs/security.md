@@ -10,6 +10,9 @@ may execute untrusted code or be steered by prompt injection from web content.
 | Agent escapes to host | Kata microVM (own guest kernel, KVM); no sudo; no containerd socket |
 | Agent reads other agents' data | Separate microVMs and workspace volumes; no network path between agents |
 | Agent exfiltrates data | Egress allowlist proxy (`ac-egress`), firewall makes it the only route; limits destinations, not content (ADR-007) |
+| An agent claims another agent's wider egress | Profiles follow a per-boot proxy credential, not the source IP; only its SHA-256 is stored, a wrong or unknown one gets 407 (never the base list), and it changes on every create and resume (ADR-016) |
+| An agent's proxy credential leaks | It grants only that agent's profiles, from any agent VM, until its next pause or resume; it is never on a host command line, only in the VM's environment and containerd's root-only record (ADR-016) |
+| A token widens egress | `egress:write` attaches profiles root installed on the host; no API call defines hosts. Every change is audited (ADR-016) |
 | Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
 | Agent attacks the viewer's browser | Only sanitised text and SGR colours reach the page; strict CSP; see [Viewer](#viewer) |
@@ -88,6 +91,7 @@ What a stolen token gives its holder (on the private bind, until revoked):
 | `jobs:read,jobs:write` for `a1` | Run prompts in a1, which with the default tool list means running code as a1's agent user inside a1's VM (see [Task API](#task-api)); read a1's job output; cancel a1's jobs | Pause, resume, destroy or purge any agent; watch or type into any terminal; read terminal history; see that other agents exist (404 for every other id, the list shows only a1) |
 | `viewer:read` | Watch the listed agents' terminals live (any of their tmux windows) and read their history, which shows whatever the agents printed, secrets included | Type, take over, run jobs or change any agent's state; picking a window changes only its own view |
 | `viewer:control` (with `viewer:read`) | Take over the listed agents' shells: everything their agent users can do, including their logins | Change agent state or run jobs through the API (its shell access makes this moot inside those agents) |
+| `egress:write` (with `agents:read`) | Attach any installed profile to the listed agents, so those agents can reach its hosts (for `rust`, fetch and build any published crate) | Define hosts, change the base list, or reach anything itself; every change is audited |
 | `admin` (or the legacy `AC_TOKEN_FILE` token) | Everything on every agent: create, destroy and purge workspaces, run jobs, take over shells | Reach the host beyond what the agents' VMs and the egress allowlist allow |
 
 Revoke with `sudo ac-gateway token revoke <name>`; the gateway stops honouring it within a second. Audit lines
@@ -195,5 +199,7 @@ the agent user, by capped execs. Prompts are never in an argv; history records o
 - Egress control limits destinations, not content: an agent can still send data to an allowed
   host (a GitHub gist, a model API request). TLS is not inspected, so domain fronting on shared
   CDN addresses is possible. See ADR-007.
+- Egress profiles widen an agent's reach to whole package registries, which deliver code. Attach them to the
+  agents that build, not by default (ADR-016).
 - Screen streaming exposes whatever the agent's browser shows, including anything a logged-in
   session reveals. Treat viewer access as equivalent to agent access.

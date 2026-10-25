@@ -19,6 +19,12 @@
 //! this, 40), `AC_JOB_START_SPACING` (least seconds between starts, 15).
 //! Settings (ADR-014): `AC_PROFILE` (`idle`, `build` or `heavy`, default build); at startup the
 //! gateway logs one line if its settings differ from what `ac-ctl doctor` recommends.
+//! Egress profiles (ADR-016, with `AC_NETWORK=1`): `AC_EGRESS_AGENTS` (the agents file it writes,
+//! default /etc/agent-cloud/egress/agents), `AC_EGRESS_PROFILES` (default
+//! /etc/agent-cloud/egress/profiles), `AC_EGRESS_ALLOW` (the base list, for host counts; default
+//! /etc/agent-cloud/egress-allow.txt), `AC_EGRESS_PROXY` (what credentials name, default
+//! 10.89.0.1:3128). Every create and resume boots with a new credential; a malformed agents file
+//! refuses the start.
 //! Admission (ADR-012): `AC_SHM_MARGIN_MIB` (MiB of `/dev/shm` kept free, default 512),
 //! `AC_VM_MEMORY_MIB` (guest size, instead of `default_memory` in `AC_KATA_CONFIG`, default
 //! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
@@ -60,6 +66,7 @@ use ac_domain::tune::rules::drift;
 use ac_domain::tune::{recommend, Fact, Profile};
 use ac_domain::{GuestMemory, State};
 use ac_fleet::Fleet;
+use ac_gateway::egress::EgressStore;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::notify::{self, Notify};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
@@ -272,6 +279,29 @@ fn watch(
     });
 }
 
+/// The agents file and profiles (ADR-016), read once now: a malformed agents file refuses the
+/// start, since rewriting it would lose the attachments it holds.
+fn egress_store() -> Result<EgressStore, String> {
+    let store = EgressStore::new(
+        env("AC_EGRESS_AGENTS", "/etc/agent-cloud/egress/agents"),
+        env("AC_EGRESS_PROFILES", "/etc/agent-cloud/egress/profiles"),
+        env("AC_EGRESS_ALLOW", "/etc/agent-cloud/egress-allow.txt"),
+        &env("AC_EGRESS_PROXY", "10.89.0.1:3128"),
+        euid()?,
+    );
+    let agents = store.load()?;
+    let attached = agents.iter().filter(|a| !a.profiles.is_empty()).count();
+    let profiles = ac_gateway::egress::Profiles::list(&store).unwrap_or_default();
+    eprintln!(
+        "ac-gateway: egress: {} agent line(s) in {} ({attached} with profiles), {} profile(s); \
+         every boot gets a new proxy credential",
+        agents.len(),
+        store.agents_path().display(),
+        profiles.len()
+    );
+    Ok(store)
+}
+
 /// One log line when this gateway's settings (its environment, Kata's configuration, `/dev/shm`)
 /// differ from what `ac-ctl doctor` recommends for this host and `AC_PROFILE` (ADR-014). It
 /// only warns; it never changes anything.
@@ -324,7 +354,8 @@ fn run() -> Result<(), String> {
     let uid: u32 = env("AC_UID", "1000")
         .parse()
         .map_err(|e| format!("AC_UID: {e}"))?;
-    let network = if env("AC_NETWORK", "") == "1" {
+    let networked = env("AC_NETWORK", "") == "1";
+    let network = if networked {
         Some(Network::defaults(&data).map_err(|e| e.to_string())?)
     } else {
         None
@@ -334,6 +365,7 @@ fn run() -> Result<(), String> {
         namespace: env("AC_NAMESPACE", "agents"),
         image,
         workspace_root: data.join("workspaces"),
+        env_dir: data.join("boot"),
         workspace_owner: Some((uid, uid)),
         network,
         vc_root: "/run/vc".into(),
@@ -362,8 +394,15 @@ fn run() -> Result<(), String> {
     );
     let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
-    let fleet =
+    let mut fleet =
         Fleet::new(runtime, Arc::clone(&store)).with_admission(Box::new(host_capacity()?), margin);
+    let egress = match networked {
+        true => Some(Arc::new(egress_store()?)),
+        false => None,
+    };
+    if let Some(e) = &egress {
+        fleet = fleet.with_egress(e.clone());
+    }
     let reconciled = match fleet.reconcile() {
         Ok(changed) => {
             for id in changed {
@@ -414,9 +453,12 @@ fn run() -> Result<(), String> {
     );
     jobs.reconcile();
     let unhealthy = Unhealthy::default();
-    let api = Api::new(fleet)
+    let mut api = Api::new(fleet)
         .with_unhealthy(Arc::clone(&unhealthy))
         .with_jobs(jobs.clone());
+    if let Some(e) = egress {
+        api = api.with_egress(e);
+    }
     for id in api.running() {
         let term = hub.terminal();
         let cleared = term
@@ -488,7 +530,8 @@ fn run() -> Result<(), String> {
 const USAGE: &str = "usage: ac-gateway token create <name> --scopes <s,...> [--agents <id,...>|*]
        ac-gateway token list
        ac-gateway token revoke <name>
-scopes: agents:read agents:write jobs:read jobs:write viewer:read viewer:control admin";
+scopes: agents:read agents:write jobs:read jobs:write viewer:read viewer:control egress:write admin
+  egress:write attaches egress profiles to agents (widens what they may reach); admin implies it";
 
 /// `ac-gateway token ...`: edits the tokens file only (never the registry), so it works while the
 /// gateway runs; the gateway picks the change up within a second.

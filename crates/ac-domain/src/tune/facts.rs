@@ -89,6 +89,17 @@ pub struct Mode {
     pub perm: u32,
 }
 
+/// The profiles the egress agents file attaches (ADR-016), as the proxy would read them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfiles {
+    /// Distinct profiles attached to some agent, sorted.
+    pub attached: Vec<String>,
+    /// Of those, the ones with no file.
+    pub missing: Vec<String>,
+    /// Of those, the ones whose file the proxy refuses: `name: why`.
+    pub refused: Vec<String>,
+}
+
 /// The agent firewall as `scripts/post-reboot-check.sh` checks it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Firewall {
@@ -146,6 +157,10 @@ pub struct HostFacts {
     pub tokens_mode: Fact<Mode>,
     /// The egress allowlist.
     pub allowlist_mode: Fact<Mode>,
+    /// The egress agents file (ADR-016).
+    pub egress_agents_mode: Fact<Mode>,
+    /// The profiles it attaches.
+    pub egress_profiles: Fact<EgressProfiles>,
 }
 
 impl HostFacts {
@@ -171,6 +186,8 @@ impl HostFacts {
             firewall: s(why),
             tokens_mode: s(why),
             allowlist_mode: s(why),
+            egress_agents_mode: s(why),
+            egress_profiles: s(why),
         }
     }
 }

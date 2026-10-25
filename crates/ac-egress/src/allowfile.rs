@@ -12,12 +12,9 @@ const MAX_BYTES: u64 = 64 * 1024;
 
 /// Parse the file format. Returns the list and how many entries it has.
 pub fn parse(text: &str) -> Result<(Allowlist, usize), AllowlistError> {
-    let entries: Vec<&str> = text
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    Ok((Allowlist::new(entries.iter().copied())?, entries.len()))
+    let list = Allowlist::parse_file(text)?;
+    let n = list.len();
+    Ok((list, n))
 }
 
 /// What identifies one version of the file: a rewrite in place changes the mtime or length, a

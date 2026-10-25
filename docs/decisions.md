@@ -147,8 +147,8 @@ proxy, and nothing is forwarded to or from the bridge.
   but nothing here enforces it;
 - broad wildcards: `*.githubusercontent.com` admits any public repo's raw files.
 DNS tunnelling is closed: agents have no resolver, and the proxy resolves only allowlisted names.
-**Revisit when:** agents need different allowlists, or the gaps above matter enough for SNI
-checks or TLS interception.
+**Revisit when:** the gaps above matter enough for SNI checks or TLS interception. Per-agent lists:
+ADR-016 (profiles on top of this base list).
 
 ## ADR-008: Reuse rusty_mill crates via a pinned git dependency
 **Status:** accepted.
@@ -267,7 +267,8 @@ Handing a script or another agent a token to submit jobs also let it destroy age
 **Decision:** Many named tokens, each with scopes and a set of agents, checked by the gateway before any handler.
 - *File:* `/etc/agent-cloud/tokens` (`AC_TOKENS`), owned by the gateway's user (root), mode 0600, one token per
   line: `name scopes agents sha256 [created]`; `#` comments. `scopes` is a comma list of `agents:read`,
-  `agents:write`, `jobs:read`, `jobs:write`, `viewer:read`, `viewer:control`, `admin` (implies all); `agents` is
+  `agents:write`, `jobs:read`, `jobs:write`, `viewer:read`, `viewer:control`, `egress:write` (ADR-016), `admin`
+  (implies all); `agents` is
   `*` or a comma list of agent ids; `sha256` is the hex digest of the token; `created` is Unix seconds (a fifth,
   optional field, added for `token list`). Only digests are stored: a token is 32 bytes from `/dev/urandom` as
   hex, printed once by `ac-gateway token create <name> --scopes ... [--agents ...]`. `token list` shows names,
@@ -302,6 +303,8 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
   | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
+  | `GET /api/v1/egress/profiles`, `GET .../{id}/egress` (ADR-016) | `agents:read` |
+  | `PUT .../{id}/egress` (set its profiles; also `egress_profiles` on create) | `egress:write` |
 
 - *Agents:* a token restricted to some agents gets 404 for any other agent id, existing or not, before its scope
   is looked at, so it cannot probe for ids. (A wrong method is still 405; that depends on the path's shape only.)
@@ -313,7 +316,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   refused for that. rusty_serve does not give handlers the peer address, so the count is per gateway, not per
   source address; the limiter keys by source (bounded to 1024) and gets the address once rusty_serve passes it.
 - *Audit:* every state-changing call that passed the checks (create, pause, resume, destroy, job submit and
-  cancel, take-over, release) writes `audit token=<name> action=<action> [force=true] [purge=true] [job=<id>]
+  cancel, take-over, release, egress) writes `audit token=<name> action=<action> [force=true] [purge=true] [job=<id>]
   status=<code>` to the agent's `ac-history` log (shown by `GET .../history`) and the same line with
   `agent=<id>` to the gateway's journal. Viewer input is not audited per call: it comes from the viewer whose
   take-over was. No prompt, body or terminal content.
@@ -323,7 +326,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
 those VMs) but cannot pause, destroy, watch or type into them, nor see other agents. `admin` remains as
 powerful as the old token. Tokens do not expire; revoke them. There is still no TLS of the gateway's own.
 **Not now:** expiry and per-token rate limits; per-address failure limits (needs the peer address from
-rusty_serve); scopes narrower than these seven.
+rusty_serve); scopes narrower than these.
 
 ## ADR-012: Admission against /dev/shm; a watchdog that tells slow from wedged
 **Status:** accepted (2026-10-22).
@@ -616,3 +619,82 @@ and an abstract name).
 **Not now:** `WatchdogSec` (the gateway has its own agent watchdog; a systemd watchdog would need a heartbeat
 from a thread that proves the server is healthy); `Type=notify-reload` (SIGHUP's `ExecReload` stays);
 `ac-egress` and `ac-agentfw`, whose readiness means something else.
+
+## ADR-016: Per-agent egress profiles, keyed by a proxy credential
+**Status:** accepted (2026-10-25; verified on BaileyServ, a reboot still to test).
+**Context:** ADR-007 gives every agent the same allowlist. A Rust agent needs crates.io, which the others should
+not reach. Adding it to the base list would open a code-delivery channel to every agent.
+
+**Decision.**
+- *Profiles:* named host lists in `/etc/agent-cloud/egress/profiles/<name>.txt` (root, 0600, the allowlist's
+  format; the directory 0700). Names follow the agent-id rule, so `-` can never be one. Shipped:
+  `deploy/egress/profiles/` `rust`, `python`, `node`. The API can only attach profiles that exist on the host. It
+  never defines hosts, so a token cannot widen egress beyond what root installed.
+- *Identity is a credential, not the source IP.* The bridge carries no MAC or IP binding, and another agent's
+  address is easy to claim. Every create and resume makes a new secret: 32 bytes of `/dev/urandom` as hex. The
+  VM gets `HTTPS_PROXY`, `HTTP_PROXY` and the lowercase forms set to `http://<id>:<secret>@10.89.0.1:3128`
+  through `ctr run --env-file`, a 0600 file in a 0700 directory (`<data>/boot`). The file is created with
+  `O_EXCL` and removed when `ctr` returns. The secret is never in a host argv: an `ac-ctr` test checks every
+  argv and env of create, resume and a failed run. These override the image's credential-less variables.
+- *Agents file:* `/etc/agent-cloud/egress/agents` (root, 0600), one line per agent:
+  `<agent> <sha256(secret)|-> <profile,...|->`. The gateway writes it atomically (`rusty_atomic_file`, under a
+  lock, only on change). Only the digest is stored. It writes the digest before `ctr run`. It clears the digest
+  before a pause or destroy stops the VM, and again when a start fails, so a credential never outlives its VM.
+  The startup reconcile clears the digests of agents with no VM, and purge drops the line. A destroy without
+  purge keeps the profiles, so a re-created agent gets them back.
+- *Proxy:* `ac-egress` never opens the registry. Before every decision it re-stats the agents file and
+  each profile, and re-reads any that changed. A file that is not a regular file, not root-owned,
+  group/world-accessible, over 64 KiB or malformed keeps its last good version. A profile that never parsed
+  adds nothing. This is per file, so one bad profile cannot freeze a detach. More than 256 profiles is an
+  error. The rules:
+  - no `Proxy-Authorization`: the base list;
+  - exactly one well-formed `Basic` credential whose digest matches that agent's line (SHA-256,
+    `constant_time_eq`): the base list plus the agent's profiles;
+  - anything else gets `407` with `Proxy-Authenticate: Basic realm="agent-cloud"`, never the base list. That
+    covers an unknown agent, no digest, a wrong secret, two headers, another scheme, bad base64 or a value over
+    256 bytes.
+  The header is never forwarded. Log lines carry `agent=<id>`, or `agent=-` without a credential and `agent=<id>?`
+  for a refused one. A deny names a profile that would allow it (`(profile rust would allow it)`).
+- *API:* a new scope `egress:write` (not implied by `agents:write`; `admin` has it).
+  - `GET /api/v1/egress/profiles` (`agents:read`): names and host counts.
+  - `GET /api/v1/agents/{id}/egress` (`agents:read`): `{"id","profiles","effective_hosts"}`, plus `missing` for
+    an attached profile that is no longer installed.
+  - `PUT /api/v1/agents/{id}/egress` (`egress:write`) sets the list: 400 for an unknown or unusable name, 404
+    for an unknown agent, 409 for a destroyed one.
+  - `egress_profiles` on create also needs `egress:write` (403 without).
+  Every PUT and create is audited with `profiles=<names|->`. A change applies to the agent's next request, with
+  no restart.
+- *ac-ctl:* `create` and `resume` boot without a credential (base list only), and `pause` and `purge` leave the
+  agents file alone. The gateway's next startup sweep clears what they left. `doctor` checks the agents file's
+  mode and owner (`prereq.egress_agents_mode`, absent is fine) and that every attached profile is installed and
+  readable (`prereq.egress_profiles`).
+- New first-party dependency: `rusty_base64` (strict canonical decode, ADR-008).
+
+**Evidence (2026-10-25, BaileyServ, a1 and a2).**
+- a1 without profiles: `index.crates.io` CONNECT 403, `api.anthropic.com` 200, and `claude -p "say ok"`
+  answered `ok` with the proxy logging `allow ... agent=a1 api.anthropic.com:443`.
+- With `rust` attached through a throwaway `egress:write` token, a1 got 200 within 0.5 s of the PUT while a2
+  got 403. Detached, a1 got 403 again.
+- With a toolchain image, `cargo fetch` (8 crates) worked with `rust` and failed with CONNECT 403 without it.
+- Two resumes of a1 each rotated the digest, and the pre-resume URL then got 407. A wrong secret and a2's name
+  with a1's secret got 407 with the realm header.
+- A root scan of every host `/proc/*/cmdline` (469 passes) during two pause/resume cycles found no `a1:`. A
+  positive control was caught.
+
+**Consequences:**
+- A stolen credential works from any agent VM on the bridge until that agent's next pause or resume. It is
+  readable inside its own VM (environment, `/proc`), and on the host by root: containerd's container record
+  holds the env. An agent that leaks its credential leaks only its own profiles.
+- A profile is a code-delivery channel: `rust` lets the agent fetch and build any published crate.
+- Agents booted before this ADR, or by `ac-ctl`, have no credential and get the base list. Pause and resume
+  them to give them their profiles.
+- *Install order:* either order is safe; install the proxy first. A new proxy with an old gateway sees no agents
+  file, so everyone gets the base list. A new gateway with an old proxy hands out credentials the old proxy
+  drops with the other `Proxy-*` headers, so everyone gets the base list and attachments do nothing until the
+  proxy is upgraded.
+- *Rollback:* reinstall the old gateway, then remove `/etc/agent-cloud/egress/agents`, then reinstall the old
+  proxy if wanted. An old gateway never clears digests, so until the file is gone, running agents keep their
+  profiles.
+
+**Not now:** per-profile ports (443 and 80 as the base list); per-agent base lists; binding a credential to a VM's
+MAC or IP; profiles editable through the API.

@@ -57,6 +57,11 @@ fn this_host() -> HostFacts {
         }),
         tokens_mode: Fact::Known(ROOT_600),
         allowlist_mode: Fact::Known(ROOT_600),
+        egress_agents_mode: Fact::Known(ROOT_600),
+        egress_profiles: Fact::Known(EgressProfiles {
+            attached: vec!["rust".into()],
+            ..EgressProfiles::default()
+        }),
     }
 }
 
@@ -523,6 +528,65 @@ fn hypothetical_host_with_only_size() {
     assert_eq!(rec("gateway.cpu_psi_max"), (I, "40".into(), X));
     assert_eq!(rec("gateway.max_running_jobs"), (I, "8".into(), X));
     assert_eq!(forecast(&f, Profile::Build, 512).max_agents, 11);
+}
+
+#[test]
+fn egress_files() {
+    let fs = recommend(&this_host(), Profile::Build);
+    let p = get(&fs, "prereq.egress_profiles");
+    assert_eq!((p.status, p.current.as_str()), (K, "attached rust"));
+    assert_eq!(get(&fs, "prereq.egress_agents_mode").status, K);
+    // No agents file yet: fine. A malformed one, or a bad mode: an error.
+    let fresh = HostFacts {
+        egress_agents_mode: Fact::Absent,
+        egress_profiles: Fact::Absent,
+        ..this_host()
+    };
+    let fs = recommend(&fresh, Profile::Build);
+    for rule in ["prereq.egress_agents_mode", "prereq.egress_profiles"] {
+        assert_eq!(get(&fs, rule).status, K, "{rule}");
+    }
+    let bad = HostFacts {
+        egress_agents_mode: Fact::Known(Mode {
+            perm: 0o644,
+            ..ROOT_600
+        }),
+        egress_profiles: Fact::Known(EgressProfiles {
+            attached: vec!["go".into(), "node".into(), "rust".into()],
+            missing: vec!["go".into()],
+            refused: vec!["node: mode 0644".into()],
+        }),
+        ..this_host()
+    };
+    let fs = recommend(&bad, Profile::Build);
+    assert_eq!(get(&fs, "prereq.egress_agents_mode").status, E);
+    let p = get(&fs, "prereq.egress_profiles");
+    assert_eq!(p.status, E);
+    assert_eq!(p.reason, "go: no file; node: mode 0644; each adds nothing");
+    let invalid = HostFacts {
+        egress_profiles: Fact::Invalid("line 2: agent a1 listed twice".into()),
+        ..this_host()
+    };
+    assert_eq!(
+        get(
+            &recommend(&invalid, Profile::Build),
+            "prereq.egress_profiles"
+        )
+        .status,
+        E
+    );
+    let skipped = HostFacts {
+        egress_profiles: Fact::Skipped("root-only".into()),
+        ..this_host()
+    };
+    assert_eq!(
+        get(
+            &recommend(&skipped, Profile::Build),
+            "prereq.egress_profiles"
+        )
+        .status,
+        I
+    );
 }
 
 #[test]

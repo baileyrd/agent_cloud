@@ -4,6 +4,8 @@
 use std::fmt;
 use std::io::{self, BufRead, Read};
 
+use crate::auth::Secret;
+
 /// Bounds on what a client may send before the proxy decides.
 #[derive(Debug, Clone)]
 pub struct HeadLimits {
@@ -48,6 +50,8 @@ pub struct Head {
     pub kind: Kind,
     /// Header lines to forward with a plain request: everything but `Host` and `Proxy-*`.
     pub headers: Vec<String>,
+    /// Every `Proxy-Authorization` value, for [`crate::auth::parse`]; never forwarded or logged.
+    pub proxy_authorization: Vec<Secret>,
 }
 
 impl Head {
@@ -125,6 +129,7 @@ pub fn read_head(r: &mut impl BufRead, limits: &HeadLimits) -> Result<Head, Head
     let mut total = line.len();
     let (host, port, kind) = request_line(&line)?;
     let mut headers = Vec::new();
+    let mut proxy_authorization = Vec::new();
     loop {
         let line = read_line(r, limits.max_line)?
             .ok_or(HeadError::Malformed("connection closed in head"))?;
@@ -138,14 +143,16 @@ pub fn read_head(r: &mut impl BufRead, limits: &HeadLimits) -> Result<Head, Head
         if headers.len() == limits.max_headers {
             return Err(HeadError::TooLarge);
         }
-        let Some((name, _)) = line.split_once(':') else {
+        let Some((name, value)) = line.split_once(':') else {
             return Err(HeadError::Malformed("header without a colon"));
         };
         if name.is_empty() || name.contains([' ', '\t']) {
             return Err(HeadError::Malformed("header name"));
         }
         let name = name.to_ascii_lowercase();
-        if name != "host" && !name.starts_with("proxy-") {
+        if name == "proxy-authorization" {
+            proxy_authorization.push(Secret::new(value.to_owned()));
+        } else if name != "host" && !name.starts_with("proxy-") {
             headers.push(line);
         }
     }
@@ -154,6 +161,7 @@ pub fn read_head(r: &mut impl BufRead, limits: &HeadLimits) -> Result<Head, Head
         port,
         kind,
         headers,
+        proxy_authorization,
     })
 }
 
@@ -293,6 +301,23 @@ mod tests {
             h.upstream().as_deref(),
             Some("HEAD /?q HTTP/1.0\r\nHost: x.com:443\r\n\r\n")
         );
+    }
+
+    #[test]
+    fn proxy_authorization_is_kept_aside_never_forwarded() {
+        let raw = "GET http://a.com/ HTTP/1.1\r\nPROXY-AUTHORIZATION: Basic eDp5\r\n\
+                   proxy-authorization:Basic eg==\r\nAccept: */*\r\n\r\n";
+        let h = parse(raw).unwrap_or_else(|e| panic!("{e}"));
+        let values: Vec<&str> = h.proxy_authorization.iter().map(Secret::expose).collect();
+        assert_eq!(values, [" Basic eDp5", "Basic eg=="]);
+        assert!(!h
+            .upstream()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("proxy"));
+        assert!(!format!("{h:?}").contains("eDp5"));
+        let h = parse("CONNECT a.com:443 HTTP/1.1\r\n\r\n").unwrap_or_else(|e| panic!("{e}"));
+        assert!(h.proxy_authorization.is_empty());
     }
 
     #[test]

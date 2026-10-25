@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use ac_ctr::Exec;
 use ac_domain::{AgentId, State};
 use ac_fleet::Fleet;
+use ac_gateway::egress::EgressStore;
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::{Hub, Terminal, ViewClient, ViewCommand, Writer};
 use ac_gateway::web::App;
@@ -389,13 +390,13 @@ impl SessionStore for Store {
 
 struct Rt;
 impl Runtime for Rt {
-    fn create(&self, _: &AgentId) -> Result<(), PortError> {
+    fn create(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
         Ok(())
     }
     fn pause(&self, _: &AgentId) -> Result<(), PortError> {
         Ok(())
     }
-    fn resume(&self, _: &AgentId) -> Result<(), PortError> {
+    fn resume(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
         Ok(())
     }
     fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {
@@ -420,6 +421,17 @@ fn serve_with(
     keys: Keys,
 ) -> SocketAddr {
     let api = Api::new(Fleet::new(Rt, Store::default()));
+    serve_api(fake, history, per_agent, total, keys, api)
+}
+
+fn serve_api(
+    fake: &Fake,
+    history: &std::path::Path,
+    per_agent: usize,
+    total: usize,
+    keys: Keys,
+    api: Api<Rt, Store>,
+) -> SocketAddr {
     let hub = Hub::with_caps(fake.clone(), history.to_path_buf(), per_agent, total);
     let server = Server::bind_shared(
         "127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")),
@@ -1068,5 +1080,119 @@ fn a_viewer_picks_a_window_without_moving_the_agent_and_falls_back_when_it_close
         .all(|l| l.starts_with("send-keys -t ") && !l.contains("select")));
     assert_eq!(fake.world().captures, ["@3", "main", "@4"]);
     drop((a, b));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The egress routes over HTTP with the real agents file: `egress:write` attaches (for its own
+/// agents only), `agents:write` alone cannot, not even through a create, and every change is
+/// audited with the profiles it named.
+#[test]
+fn egress_routes_need_egress_write_and_are_audited() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (fake, dir) = (Fake::new(), tmp("egress"));
+    let _ = std::fs::create_dir_all(dir.join("profiles"));
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    for (name, text) in [
+        ("profiles/rust.txt", "index.crates.io\nstatic.crates.io\n"),
+        ("allow.txt", "api.anthropic.com\n"),
+    ] {
+        let _ = std::fs::write(dir.join(name), text);
+        let _ = std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o600));
+    }
+    let store = Arc::new(EgressStore::new(
+        dir.join("egress/agents"),
+        dir.join("profiles"),
+        dir.join("allow.txt"),
+        "10.89.0.1:3128",
+        me,
+    ));
+    let file = TokenFile::new(dir.join("tokens"), me);
+    let make = |name: &str, scopes: &str, agents: &str| {
+        let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
+        let agents = Agents::parse(agents).unwrap_or_else(|e| panic!("{e}"));
+        file.create(name, scopes, agents, 1)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let life = make("life", "agents:read,agents:write", "*");
+    let attach = make("attach", "agents:read,egress:write", "a1");
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let fleet = Fleet::new(Rt, Store::default()).with_egress(store.clone());
+    let api = Api::new(fleet).with_egress(store.clone());
+    let addr = serve_api(&fake, &dir, 4, 16, Keys::new(t), api);
+    let agents_file = || std::fs::read_to_string(dir.join("egress/agents")).unwrap_or_default();
+
+    let rust = r#"{"egress_profiles":["rust"]}"#;
+    let (status, body) = request_as(addr, &life, "POST", "/api/v1/agents/a2", &[], rust);
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(
+        request_as(addr, &life, "POST", "/api/v1/agents/a1", &[], "").0,
+        201
+    );
+    assert!(
+        agents_file().contains("a1 ") && agents_file().ends_with(" -\n"),
+        "{}",
+        agents_file()
+    );
+    assert_eq!(request(addr, "POST", "/api/v1/agents/a2", &[], rust).0, 201);
+    let put = r#"{"profiles":["rust"]}"#;
+    assert_eq!(
+        request_as(addr, &life, "PUT", "/api/v1/agents/a1/egress", &[], put).0,
+        403
+    );
+    assert_eq!(
+        request_as(addr, &attach, "PUT", "/api/v1/agents/a2/egress", &[], put).0,
+        404
+    );
+    assert_eq!(
+        request_as(addr, &attach, "PUT", "/api/v1/agents/a1/egress", &[], put),
+        (
+            200,
+            r#"{"id":"a1","profiles":["rust"],"effective_hosts":3}"#.into()
+        )
+    );
+    assert_eq!(
+        request_as(addr, &attach, "GET", "/api/v1/egress/profiles", &[], ""),
+        (200, r#"{"profiles":[{"name":"rust","hosts":2}]}"#.into())
+    );
+    assert_eq!(
+        request_as(
+            addr,
+            &attach,
+            "PUT",
+            "/api/v1/agents/a1/egress",
+            &[],
+            r#"{"profiles":["go"]}"#
+        )
+        .0,
+        400
+    );
+    let lines: Vec<String> = agents_file()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines
+        .iter()
+        .all(|l| l.ends_with(" rust") && l.split(' ').nth(1).is_some_and(|d| d.len() == 64)));
+    let (_, a1) = request(addr, "GET", "/api/v1/agents/a1/history", &[], "");
+    let (_, a2) = request(addr, "GET", "/api/v1/agents/a2/history", &[], "");
+    for (history, line) in [
+        (
+            &a2,
+            "audit token=legacy action=create profiles=rust status=201",
+        ),
+        (
+            &a1,
+            "audit token=attach action=egress profiles=rust status=200",
+        ),
+    ] {
+        assert!(history.contains(line), "{line} missing from {history}");
+    }
+    // A refused change (400) is in the gateway's log only, as for every route.
+    assert!(!a1.contains("status=400"), "{a1}");
+    let mode = std::fs::metadata(dir.join("egress/agents")).map(|m| (m.mode() & 0o777, m.uid()));
+    assert_eq!(mode.ok(), Some((0o600, me)));
     let _ = std::fs::remove_dir_all(dir);
 }

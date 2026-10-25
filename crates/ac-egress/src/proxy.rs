@@ -1,17 +1,21 @@
-//! The proxy: accept, read the head, decide, resolve and vet, connect, then splice bytes both
-//! ways until either side closes or the connection goes idle. One thread per direction.
+//! The proxy: accept, read the head, identify the caller and decide, resolve and vet, connect,
+//! then splice bytes both ways until either side closes or the connection goes idle. One thread
+//! per direction. Before each decision the egress files are re-checked (a stat each), so a
+//! changed attachment applies to the next request.
 
 use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ac_domain::Allowlist;
 
+use crate::auth;
+use crate::egressfile::EgressFiles;
 use crate::head::{read_head, Head, HeadLimits};
-use crate::policy::{decide, vet, Decision, Reason};
+use crate::policy::{judge, vet, would_allow, Decision, Policy, Reason, Verdict};
 
 /// Name resolution and connecting, injectable so tests can point names anywhere.
 pub trait Upstream: Send + Sync + 'static {
@@ -63,18 +67,43 @@ impl Default for Limits {
 
 /// The allowlist proxy.
 pub struct Proxy<U> {
-    allow: RwLock<Allowlist>,
+    policy: RwLock<Policy>,
+    files: Option<Mutex<EgressFiles>>,
     upstream: U,
     limits: Limits,
     active: Arc<AtomicUsize>,
 }
 
-/// One log line per decision: who asked, for what, and the outcome. Never headers or bodies.
-pub fn log_line(src: &str, host: &str, port: u16, outcome: &Result<(), Reason>) -> String {
+/// One log line per decision: the source address, the agent (`-` without a credential, `<id>?`
+/// for a refused one), the target and the outcome. Never headers, credentials or bodies.
+pub fn log_line(
+    src: &str,
+    who: &str,
+    host: &str,
+    port: u16,
+    outcome: &Result<(), String>,
+) -> String {
     let host = host.escape_debug();
     match outcome {
-        Ok(()) => format!("ac-egress: allow {src} {host}:{port}"),
-        Err(reason) => format!("ac-egress: deny {src} {host}:{port}: {reason}"),
+        Ok(()) => format!("ac-egress: allow {src} agent={who} {host}:{port}"),
+        Err(reason) => format!("ac-egress: deny {src} agent={who} {host}:{port}: {reason}"),
+    }
+}
+
+/// A refused request: the status, the client's text and the log's (which may say more).
+struct Denied {
+    status: u16,
+    client: String,
+    log: String,
+}
+
+impl Denied {
+    fn policy(reason: &Reason) -> Self {
+        Self {
+            status: 403,
+            client: format!("denied: {reason}"),
+            log: reason.to_string(),
+        }
     }
 }
 
@@ -99,19 +128,57 @@ impl Drop for Slot {
 }
 
 impl<U: Upstream> Proxy<U> {
-    /// A proxy enforcing `list`.
+    /// A proxy enforcing `list` for every agent.
     pub fn new(list: Allowlist, upstream: U, limits: Limits) -> Self {
         Self {
-            allow: RwLock::new(list),
+            policy: RwLock::new(Policy {
+                base: list,
+                ..Policy::default()
+            }),
+            files: None,
             upstream,
             limits,
             active: Arc::default(),
         }
     }
 
-    /// Replace the allowlist; connections already open keep running.
+    /// Also enforce per-agent profiles from `files` (ADR-016), re-checked before each decision.
+    pub fn with_files(mut self, files: EgressFiles) -> Self {
+        self.files = Some(Mutex::new(files));
+        self
+    }
+
+    /// Replace the base allowlist; connections already open keep running.
     pub fn set_allowlist(&self, list: Allowlist) {
-        *self.allow.write().unwrap_or_else(|e| e.into_inner()) = list;
+        self.policy.write().unwrap_or_else(|e| e.into_inner()).base = list;
+    }
+
+    /// Re-read the egress files if they changed (always with `force`). A refused file is logged
+    /// once per change and keeps its last good version.
+    pub fn refresh(&self, force: bool) {
+        let Some(files) = &self.files else {
+            return;
+        };
+        let mut files = files.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(loaded) = files.reload(force) else {
+            return;
+        };
+        for e in &loaded.errors {
+            eprintln!("ac-egress: egress file refused, keeping its last good version: {e}");
+        }
+        for w in &loaded.warnings {
+            eprintln!("ac-egress: warning: {w}");
+        }
+        eprintln!(
+            "ac-egress: egress files read: {} profile(s) from {}, {} agent(s) from {}",
+            loaded.profiles.len(),
+            files.profiles_path().display(),
+            loaded.agents.len(),
+            files.agents_path().display()
+        );
+        let mut policy = self.policy.write().unwrap_or_else(|e| e.into_inner());
+        policy.profiles = loaded.profiles;
+        policy.agents = loaded.agents;
     }
 
     /// Serve `listener` forever, one thread per connection.
@@ -164,24 +231,19 @@ impl<U: Upstream> Proxy<U> {
                 return;
             }
         };
-        let addrs = self.admit(&head);
-        eprintln!(
-            "{}",
-            log_line(
-                &src,
-                &head.host,
-                head.port,
-                &addrs.as_ref().map(|_| ()).map_err(Clone::clone)
-            )
-        );
+        self.refresh(false);
+        let (who, addrs) = self.admit(&head);
+        let outcome = addrs.as_ref().map(|_| ()).map_err(|d| d.log.clone());
+        eprintln!("{}", log_line(&src, &who, &head.host, head.port, &outcome));
         let addrs = match addrs {
             Ok(addrs) => addrs,
-            Err(reason) => return respond(&client, 403, &format!("denied: {reason}")),
+            Err(denied) => return respond(&client, denied.status, &denied.client),
         };
         let Some(mut upstream) = self.connect(&addrs) else {
             eprintln!(
-                "ac-egress: error {src} {}:{}: connect failed",
-                head.host, head.port
+                "ac-egress: error {src} agent={who} {}:{}: connect failed",
+                head.host.escape_debug(),
+                head.port
             );
             return respond(&client, 502, "upstream connect failed");
         };
@@ -197,18 +259,40 @@ impl<U: Upstream> Proxy<U> {
         splice(reader.into_inner(), client, upstream, self.limits.idle);
     }
 
-    /// Decide, resolve once and vet: the addresses this request may use.
-    fn admit(&self, head: &Head) -> Result<Vec<SocketAddr>, Reason> {
-        let list = self.allow.read().unwrap_or_else(|e| e.into_inner());
-        if let Decision::Deny(reason) = decide(&head.host, head.port, &list) {
-            return Err(reason);
-        }
-        drop(list);
+    /// Identify the caller and decide, then resolve once and vet: the caller's log label and the
+    /// addresses this request may use.
+    fn admit(&self, head: &Head) -> (String, Result<Vec<SocketAddr>, Denied>) {
+        let presented = auth::parse(&head.proxy_authorization);
+        let policy = self.policy.read().unwrap_or_else(|e| e.into_inner());
+        let caller = match judge(&policy, &presented, &head.host, head.port) {
+            Verdict::Refused(refused) => {
+                let denied = Denied {
+                    status: 407,
+                    client: "proxy credential refused".to_owned(),
+                    log: refused.to_string(),
+                };
+                return (refused.label(), Err(denied));
+            }
+            Verdict::Decided(caller, Decision::Deny(reason)) => {
+                let mut denied = Denied::policy(&reason);
+                let names: Vec<&str> = would_allow(&policy, &head.host)
+                    .into_iter()
+                    .map(|p| p.as_str())
+                    .collect();
+                if reason == Reason::NotAllowed && !names.is_empty() {
+                    denied.log = format!("{reason} (profile {} would allow it)", names.join(","));
+                }
+                return (caller.label(), Err(denied));
+            }
+            Verdict::Decided(caller, Decision::Allow) => caller,
+        };
+        drop(policy);
         let addrs = self
             .upstream
             .resolve(&head.host, head.port)
-            .map_err(|_| Reason::Lookup)?;
-        vet(addrs)
+            .map_err(|_| Reason::Lookup)
+            .and_then(vet);
+        (caller.label(), addrs.map_err(|r| Denied::policy(&r)))
     }
 
     fn connect(&self, addrs: &[SocketAddr]) -> Option<TcpStream> {
@@ -218,19 +302,25 @@ impl<U: Upstream> Proxy<U> {
     }
 }
 
-/// Answer and close: a short plain-text body naming the problem.
+/// Answer and close: a short plain-text body naming the problem. A 407 asks for the agent's
+/// credential (`Proxy-Authenticate`).
 fn respond(mut client: &TcpStream, status: u16, message: &str) {
     let text = match status {
         400 => "Bad Request",
         403 => "Forbidden",
+        407 => "Proxy Authentication Required",
         408 => "Request Timeout",
         431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
         _ => "Service Unavailable",
     };
     let body = format!("ac-egress: {message}\n");
+    let challenge = match status {
+        407 => "Proxy-Authenticate: Basic realm=\"agent-cloud\"\r\n",
+        _ => "",
+    };
     let reply = format!(
-        "HTTP/1.1 {status} {text}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+        "HTTP/1.1 {status} {text}\r\n{challenge}Content-Type: text/plain\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
     );
@@ -295,16 +385,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_line_names_source_target_and_outcome_only() {
+    fn log_line_names_source_agent_target_and_outcome_only() {
         assert_eq!(
-            log_line("10.89.0.21", "api.anthropic.com", 443, &Ok(())),
-            "ac-egress: allow 10.89.0.21 api.anthropic.com:443"
+            log_line("10.89.0.21", "a1", "api.anthropic.com", 443, &Ok(())),
+            "ac-egress: allow 10.89.0.21 agent=a1 api.anthropic.com:443"
         );
+        let why = Err(Reason::NotAllowed.to_string());
         assert_eq!(
-            log_line("10.89.0.21", "example.com", 443, &Err(Reason::NotAllowed)),
-            "ac-egress: deny 10.89.0.21 example.com:443: not on allowlist"
+            log_line("10.89.0.21", "-", "example.com", 443, &why),
+            "ac-egress: deny 10.89.0.21 agent=- example.com:443: not on allowlist"
         );
-        assert!(log_line("s", "a\u{1b}[2J", 80, &Ok(())).contains("\\u{1b}"));
+        assert!(log_line("s", "-", "a\u{1b}[2J", 80, &Ok(())).contains("\\u{1b}"));
     }
 
     #[test]

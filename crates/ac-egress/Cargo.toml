@@ -17,6 +17,9 @@ path = "src/main.rs"
 ac-domain = { path = "../ac-domain" }
 platform.workspace = true
 platform-linux.workspace = true
+rusty_base64.workspace = true
+rusty_crypto_key.workspace = true
+rusty_sha2.workspace = true
 
 [lints]
 workspace = true

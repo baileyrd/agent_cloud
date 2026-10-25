@@ -7,6 +7,7 @@
 //! The firewall, not this proxy's environment variables, is what makes it the only way out.
 
 pub mod allowfile;
+pub mod auth;
 pub mod head;
 pub mod policy;
 pub mod proxy;

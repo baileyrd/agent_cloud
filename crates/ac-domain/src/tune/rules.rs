@@ -4,7 +4,7 @@
 //! Pure: [`HostFacts`] in, [`Finding`]s out.
 
 use super::facts::{
-    Disk, Env, Fact, HostFacts, Kata, Kvm, Mode, Shm, Virt, AGENTS_ZONE, NFT_CHAINS,
+    Disk, EgressProfiles, Env, Fact, HostFacts, Kata, Kvm, Mode, Shm, Virt, AGENTS_ZONE, NFT_CHAINS,
 };
 
 /// The measured host (BaileyServ, i5-3550): every figure in docs/sizing.md comes from it.
@@ -305,6 +305,22 @@ pub const RULES: &[RuleDoc] = &[
         evidence: "install.md Egress proxy (ADR-007)",
         fix: "sudo chown root:root /etc/agent-cloud/egress-allow.txt && sudo chmod 0600 \
               /etc/agent-cloud/egress-allow.txt",
+    },
+    RuleDoc {
+        id: "prereq.egress_agents_mode",
+        rule: "/etc/agent-cloud/egress/agents is root:root 0600 (absent until the gateway first boots \
+               an agent)",
+        evidence: "ADR-016: the proxy refuses anything else and keeps the last good version",
+        fix: "sudo chown root:root /etc/agent-cloud/egress/agents && sudo chmod 0600 \
+              /etc/agent-cloud/egress/agents",
+    },
+    RuleDoc {
+        id: "prereq.egress_profiles",
+        rule: "every profile attached in the agents file has a root-owned, private file in \
+               /etc/agent-cloud/egress/profiles that parses",
+        evidence: "ADR-016: a missing or refused profile adds nothing, so its agents miss those hosts",
+        fix: "install the profile (install.md, Egress profiles) or detach it: PUT \
+              /api/v1/agents/<id>/egress",
     },
 ];
 
@@ -947,7 +963,57 @@ fn prerequisites(f: &HostFacts) -> Vec<Finding> {
         show_mode,
         mode_ok,
     ));
+    out.push(egress_agents(&f.egress_agents_mode));
+    out.push(egress_profiles(&f.egress_profiles));
     out
+}
+
+/// The agents file's mode; absent is fine (no agent has booted with a credential yet).
+fn egress_agents(fact: &Fact<Mode>) -> Finding {
+    let rule = "prereq.egress_agents_mode";
+    match fact {
+        Fact::Absent => finding(
+            rule,
+            "egress agents mode",
+            "absent".into(),
+            "0:0 0600".into(),
+        )
+        .reason("no agent has booted with a proxy credential yet"),
+        other => prereq(
+            rule,
+            "egress agents mode",
+            other,
+            "0:0 0600",
+            show_mode,
+            mode_ok,
+        ),
+    }
+}
+
+/// Every attached profile has a file the proxy accepts. No agents file: nothing attached.
+fn egress_profiles(fact: &Fact<EgressProfiles>) -> Finding {
+    let rule = "prereq.egress_profiles";
+    let show = |p: &EgressProfiles| match p.attached.is_empty() {
+        true => "none attached".to_owned(),
+        false => format!("attached {}", p.attached.join(",")),
+    };
+    let check = |p: &EgressProfiles| {
+        let mut bad: Vec<String> = p.missing.iter().map(|m| format!("{m}: no file")).collect();
+        bad.extend(p.refused.iter().cloned());
+        match bad.is_empty() {
+            true => Ok(()),
+            false => Err(format!("{}; each adds nothing", bad.join("; "))),
+        }
+    };
+    match fact {
+        Fact::Absent => finding(
+            rule,
+            "egress profiles",
+            "none attached".into(),
+            "usable".into(),
+        ),
+        other => prereq(rule, "egress profiles", other, "usable", show, check),
+    }
 }
 
 /// What the recommended settings allow on this host, with admission's `margin_mib`.

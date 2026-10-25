@@ -7,7 +7,11 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use ac_domain::tune::facts::{self, Disk, Fact, Firewall, HostFacts, Kvm, Mode, NFT_CHAINS};
+use ac_domain::egress::parse_agents;
+use ac_domain::tune::facts::{
+    self, Disk, EgressProfiles, Fact, Firewall, HostFacts, Kvm, Mode, NFT_CHAINS,
+};
+use ac_domain::Allowlist;
 use platform::process::{Command, Spawner, Stdio};
 
 use crate::read_all;
@@ -71,6 +75,10 @@ pub struct Paths {
     pub tokens: PathBuf,
     /// The egress allowlist.
     pub allowlist: PathBuf,
+    /// The egress agents file (ADR-016).
+    pub egress_agents: PathBuf,
+    /// The egress profiles directory.
+    pub egress_profiles: PathBuf,
 }
 
 impl Paths {
@@ -87,6 +95,8 @@ impl Paths {
             data: "/var/lib/agent-cloud".into(),
             tokens: "/etc/agent-cloud/tokens".into(),
             allowlist: "/etc/agent-cloud/egress-allow.txt".into(),
+            egress_agents: "/etc/agent-cloud/egress/agents".into(),
+            egress_profiles: "/etc/agent-cloud/egress/profiles".into(),
         }
     }
 
@@ -195,7 +205,49 @@ pub fn collect(h: &dyn HostRead, p: &Paths, scope: Scope) -> Result<HostFacts, S
     };
     f.tokens_mode = mode(&p.tokens);
     f.allowlist_mode = mode(&p.allowlist);
+    f.egress_agents_mode = mode(&p.egress_agents);
+    f.egress_profiles = parsed(read(&p.egress_agents), |t| {
+        egress_profiles(h, &p.egress_profiles, t).map(Some)
+    });
     Ok(f)
+}
+
+/// The profiles `agents` attaches, each checked as the proxy reads it: a file owned by root, not
+/// group or world accessible, that parses.
+fn egress_profiles(h: &dyn HostRead, dir: &Path, agents: &str) -> Result<EgressProfiles, String> {
+    let all = parse_agents(agents)?;
+    let mut attached: Vec<String> = all
+        .iter()
+        .flat_map(|a| a.profiles.iter().map(ToString::to_string))
+        .collect();
+    attached.sort();
+    attached.dedup();
+    let mut out = EgressProfiles {
+        attached,
+        ..EgressProfiles::default()
+    };
+    for name in &out.attached {
+        let path = dir.join(format!("{name}.txt"));
+        let why = match h.stat(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                out.missing.push(name.clone());
+                continue;
+            }
+            Err(e) => Some(e.to_string()),
+            Ok(s) if s.uid != 0 || s.perm & 0o077 != 0 => Some(format!(
+                "{}:{} {:04o}, want root and no group/world access",
+                s.uid, s.gid, s.perm
+            )),
+            Ok(_) => match h.read(&path) {
+                Err(e) => Some(e.to_string()),
+                Ok(text) => Allowlist::parse_file(&text).err().map(|e| e.to_string()),
+            },
+        };
+        if let Some(why) = why {
+            out.refused.push(format!("{name}: {why}"));
+        }
+    }
+    Ok(out)
 }
 
 trait MapFact<T> {
@@ -667,6 +719,10 @@ mod tests {
         .stat(INITRD, file_stat(0, 0o644))
         .stat("/etc/agent-cloud/tokens", file_stat(0, 0o600))
         .stat("/etc/agent-cloud/egress-allow.txt", file_stat(0, 0o600))
+        .stat("/etc/agent-cloud/egress/agents", file_stat(0, 0o600))
+        .file("/etc/agent-cloud/egress/agents", "a1 - rust\na2 - -\n")
+        .stat("/etc/agent-cloud/egress/profiles/rust.txt", file_stat(0, 0o600))
+        .file("/etc/agent-cloud/egress/profiles/rust.txt", "index.crates.io\n")
     }
 
     fn paths() -> Paths {
@@ -728,7 +784,15 @@ mod tests {
         });
         assert_eq!(
             (f.tokens_mode.clone(), f.allowlist_mode.clone()),
-            (root600.clone(), root600)
+            (root600.clone(), root600.clone())
+        );
+        assert_eq!(f.egress_agents_mode, root600);
+        assert_eq!(
+            f.egress_profiles,
+            Fact::Known(EgressProfiles {
+                attached: vec!["rust".into()],
+                ..EgressProfiles::default()
+            })
         );
         let fs = ac_domain::tune::recommend(&f, ac_domain::tune::Profile::Build);
         assert!(
@@ -925,5 +989,46 @@ mod tests {
         assert_eq!(decompressor(&[0x1f, 0x8b, 8, 0, 0, 0]), Some(Some("gzip")));
         assert_eq!(decompressor(b"070701"), Some(None));
         assert_eq!(decompressor(b"PK\x03\x04"), None);
+    }
+
+    #[test]
+    fn egress_profiles_missing_refused_and_a_malformed_agents_file() {
+        let dir = "/etc/agent-cloud/egress/profiles";
+        let mut h = baileyserv()
+            .file(
+                "/etc/agent-cloud/egress/agents",
+                "a1 - go,node,rust,py\na2 - rust\n",
+            )
+            .stat(&format!("{dir}/node.txt"), file_stat(1000, 0o600))
+            .stat(&format!("{dir}/py.txt"), file_stat(0, 0o600))
+            .file(&format!("{dir}/py.txt"), "http://bad\n");
+        h.euid = 0;
+        let f = collected(&h, Scope::Full);
+        let p = f.egress_profiles.known().cloned().unwrap_or_default();
+        assert_eq!(p.attached, ["go", "node", "py", "rust"]);
+        assert_eq!(p.missing, ["go"]);
+        assert_eq!(p.refused.len(), 2, "{:?}", p.refused);
+        assert!(
+            p.refused[0].starts_with("node: 1000:1000 0600, want root"),
+            "{:?}",
+            p.refused
+        );
+        assert!(
+            p.refused[1].starts_with("py: invalid allowlist entry"),
+            "{:?}",
+            p.refused
+        );
+        let h = h.file("/etc/agent-cloud/egress/agents", "a1 - -\na1 - -\n");
+        let f = collected(&h, Scope::Full);
+        assert!(matches!(&f.egress_profiles, Fact::Invalid(e) if e.contains("listed twice")));
+        // No agents file: nothing attached, and the mode is absent.
+        let mut h = baileyserv();
+        h.files.remove(Path::new("/etc/agent-cloud/egress/agents"));
+        h.stats.remove(Path::new("/etc/agent-cloud/egress/agents"));
+        let f = collected(&h, Scope::Full);
+        assert_eq!(
+            (f.egress_agents_mode, f.egress_profiles),
+            (Fact::Absent, Fact::Absent)
+        );
     }
 }

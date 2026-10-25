@@ -4,12 +4,17 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use ac_domain::Allowlist;
+use ac_egress::egressfile::EgressFiles;
 use ac_egress::{Limits, Proxy, Upstream};
+use rusty_sha2::{Hash, Sha256};
 
 const PUBLIC: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1));
 
@@ -48,8 +53,13 @@ fn echo_server() -> SocketAddr {
 }
 
 fn start(limits: Limits) -> SocketAddr {
+    start_with(limits, None)
+}
+
+fn start_with(limits: Limits, files: Option<EgressFiles>) -> SocketAddr {
     let names = HashMap::from([
         ("allowed.test", PUBLIC),
+        ("crates.test", PUBLIC),
         ("lan.test", IpAddr::from([192, 168, 50, 1])),
         ("meta.test", IpAddr::from([169, 254, 169, 254])),
     ]);
@@ -61,7 +71,11 @@ fn start(limits: Limits) -> SocketAddr {
     };
     let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
     let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
-    let proxy = Arc::new(Proxy::new(list, fake, limits));
+    let proxy = Proxy::new(list, fake, limits);
+    let proxy = Arc::new(match files {
+        Some(files) => proxy.with_files(files),
+        None => proxy,
+    });
     thread::spawn(move || proxy.serve(listener));
     addr
 }
@@ -112,8 +126,9 @@ fn connect_tunnels_bytes_both_ways() {
 #[test]
 fn plain_http_is_forwarded_in_origin_form_with_our_host_header() {
     let mut s = connect(start(Limits::default()));
+    // A credential is checked and stripped too: see the_credential_is_never_forwarded_upstream.
     let request = "GET http://allowed.test/x?y=1 HTTP/1.1\r\nHost: evil.test\r\n\
-                   Proxy-Authorization: Basic c2VjcmV0\r\nAccept: */*\r\n\r\n";
+                   Proxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
     let _ = s.write_all(request.as_bytes());
     // The echo server sends back exactly what reached upstream.
     let (_, echoed) = response(&mut s);
@@ -189,4 +204,153 @@ fn connections_beyond_the_cap_get_503() {
     thread::sleep(Duration::from_millis(100));
     let mut third = connect(proxy);
     assert_eq!(response(&mut third).0, 503);
+}
+
+// --- per-agent profiles (ADR-016) -------------------------------------------------------------
+
+const S1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const S2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+fn digest_hex(secret: &str) -> String {
+    Sha256::digest(secret.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A directory with the agents file (a1 secret S1, a2 secret S2, a3 paused) and a `rust`
+/// profile allowing crates.test. a1's profiles are `a1_profiles`.
+fn egress_dir(a1_profiles: &str) -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ac-egress-loop-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(dir.join("profiles"));
+    let _ = std::fs::set_permissions(dir.join("profiles"), std::fs::Permissions::from_mode(0o700));
+    write_private(&dir.join("profiles/rust.txt"), "crates.test\n");
+    write_agents(&dir, a1_profiles);
+    dir
+}
+
+/// Replace the agents file by rename, as the gateway does.
+fn write_agents(dir: &Path, a1_profiles: &str) {
+    let text = format!(
+        "a1 {} {a1_profiles}\na2 {} -\na3 - rust\n",
+        digest_hex(S1),
+        digest_hex(S2)
+    );
+    let next = dir.join("agents.next");
+    write_private(&next, &text);
+    let _ = std::fs::rename(next, dir.join("agents"));
+}
+
+fn write_private(path: &Path, text: &str) {
+    let _ = std::fs::write(path, text);
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+fn files(dir: &Path) -> EgressFiles {
+    let me = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .unwrap_or(0);
+    EgressFiles::new(dir.join("agents"), dir.join("profiles"), me)
+}
+
+fn creds(user_pass: &str) -> String {
+    format!(
+        "Proxy-Authorization: Basic {}\r\n",
+        rusty_base64::encode_standard(user_pass.as_bytes())
+    )
+}
+
+/// CONNECT to `target` with extra header lines; the status and the response head.
+fn ask(proxy: SocketAddr, target: &str, headers: &str) -> (u16, String) {
+    let mut s = connect(proxy);
+    let _ = s.write_all(format!("CONNECT {target} HTTP/1.1\r\n{headers}\r\n").as_bytes());
+    response(&mut s)
+}
+
+#[test]
+fn no_credential_gets_the_base_list_only() {
+    let dir = egress_dir("rust");
+    let proxy = start_with(Limits::default(), Some(files(&dir)));
+    assert_eq!(ask(proxy, "allowed.test:443", "").0, 200);
+    assert_eq!(ask(proxy, "crates.test:443", "").0, 403);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_valid_credential_gets_its_profiles_and_others_do_not() {
+    let dir = egress_dir("rust");
+    let proxy = start_with(Limits::default(), Some(files(&dir)));
+    let a1 = creds(&format!("a1:{S1}"));
+    assert_eq!(ask(proxy, "crates.test:443", &a1).0, 200);
+    assert_eq!(ask(proxy, "allowed.test:443", &a1).0, 200);
+    // a2 is identified but has no profiles; port and address checks still apply to a1.
+    assert_eq!(
+        ask(proxy, "crates.test:443", &creds(&format!("a2:{S2}"))).0,
+        403
+    );
+    assert_eq!(ask(proxy, "crates.test:22", &a1).0, 403);
+    assert_eq!(ask(proxy, "lan.test:443", &a1).0, 403);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_bad_credential_gets_407_never_the_base_list() {
+    let dir = egress_dir("rust");
+    let proxy = start_with(Limits::default(), Some(files(&dir)));
+    let a1 = creds(&format!("a1:{S1}"));
+    for headers in [
+        creds(&format!("a1:{S2}")),
+        creds(&format!("a9:{S1}")),
+        creds(&format!("a3:{S1}")),
+        creds("a1:short"),
+        "Proxy-Authorization: Basic !!!\r\n".to_owned(),
+        "Proxy-Authorization: Bearer x\r\n".to_owned(),
+        format!("{a1}{a1}"),
+    ] {
+        // allowed.test is on the base list: a refused credential must not fall back to it.
+        let (status, head) = ask(proxy, "allowed.test:443", &headers);
+        assert_eq!(status, 407, "{headers:?}");
+        assert!(
+            head.contains("Proxy-Authenticate: Basic realm=\"agent-cloud\"\r\n"),
+            "{head}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn attaching_and_detaching_applies_to_the_next_request() {
+    let dir = egress_dir("-");
+    let proxy = start_with(Limits::default(), Some(files(&dir)));
+    let a1 = creds(&format!("a1:{S1}"));
+    assert_eq!(ask(proxy, "crates.test:443", &a1).0, 403);
+    write_agents(&dir, "rust");
+    assert_eq!(ask(proxy, "crates.test:443", &a1).0, 200);
+    // A bad version keeps the last good one (never falls open, never drops to nothing).
+    write_private(&dir.join("agents"), "a1 - -\na1 - -\n");
+    assert_eq!(ask(proxy, "crates.test:443", &a1).0, 200);
+    write_agents(&dir, "-");
+    assert_eq!(ask(proxy, "crates.test:443", &a1).0, 403);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_credential_is_never_forwarded_upstream() {
+    let dir = egress_dir("rust");
+    let proxy = start_with(Limits::default(), Some(files(&dir)));
+    let mut s = connect(proxy);
+    let request = format!(
+        "GET http://crates.test/x HTTP/1.1\r\n{}Accept: */*\r\n\r\n",
+        creds(&format!("a1:{S1}"))
+    );
+    let _ = s.write_all(request.as_bytes());
+    let (_, echoed) = response(&mut s);
+    assert_eq!(
+        echoed,
+        "GET /x HTTP/1.1\r\nHost: crates.test\r\nAccept: */*\r\n\r\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

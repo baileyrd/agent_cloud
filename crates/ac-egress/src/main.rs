@@ -5,14 +5,22 @@
 //! 0600). The allowlist is re-read on SIGHUP and whenever the file changes (checked each second);
 //! a bad new version is logged and the previous list stays in force.
 //!
+//! Per-agent profiles (ADR-016): `AC_EGRESS_AGENTS` (default /etc/agent-cloud/egress/agents,
+//! written by the gateway) and `AC_EGRESS_PROFILES` (default /etc/agent-cloud/egress/profiles,
+//! `<name>.txt` each), owned by the proxy's user, mode 0600. They are re-checked before every
+//! decision and forced on SIGHUP; a bad version is logged once and the previous one stays. A
+//! request without `Proxy-Authorization` gets the base list; a bad credential gets 407.
+//!
 //! The bridge address exists only once the first agent's CNI ADD creates `acbr0`, so binding is
 //! retried every two seconds until it does.
 
 use std::net::{SocketAddr, TcpListener};
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ac_egress::allowfile::AllowFile;
+use ac_egress::egressfile::EgressFiles;
 use ac_egress::{is_public, Limits, Proxy, System};
 use platform::events::{SignalEvent, SignalSource};
 use platform_linux::LinuxSignalSource;
@@ -56,7 +64,16 @@ fn run() -> Result<(), String> {
         "ac-egress: allowlist {}: {n} entries",
         file.path().display()
     );
-    let proxy = Arc::new(Proxy::new(list, System, Limits::default()));
+    let owner = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .map_err(|e| format!("/proc/self: {e}"))?;
+    let files = EgressFiles::new(
+        env("AC_EGRESS_AGENTS", "/etc/agent-cloud/egress/agents"),
+        env("AC_EGRESS_PROFILES", "/etc/agent-cloud/egress/profiles"),
+        owner,
+    );
+    let proxy = Arc::new(Proxy::new(list, System, Limits::default()).with_files(files));
+    proxy.refresh(true);
 
     let signals = LinuxSignalSource;
     signals
@@ -66,6 +83,9 @@ fn run() -> Result<(), String> {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let force = signals.take() == Some(SignalEvent::Hangup);
+        if force {
+            reloading.refresh(true);
+        }
         match file.reload(force) {
             Ok(Some((list, n))) => {
                 reloading.set_allowlist(list);

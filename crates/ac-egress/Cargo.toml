@@ -1,6 +1,6 @@
 [package]
 name = "ac-egress"
-description = "Allowlist forward proxy: the agents' only route to the internet (ADR-007)."
+description = "Allowlist forward proxy: the agents' only route to the internet (ADR-007), with per-agent profiles (ADR-016)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,10 @@ platform.workspace = true
 platform-linux.workspace = true
 rusty_base64.workspace = true
 rusty_crypto_key.workspace = true
+rusty_sha2.workspace = true
+
+[dev-dependencies]
+rusty_base64.workspace = true
 rusty_sha2.workspace = true
 
 [lints]

@@ -2,6 +2,7 @@
 
 pub mod allowlist;
 pub mod capacity;
+pub mod egress;
 pub mod health;
 pub mod id;
 pub mod job;
@@ -11,6 +12,7 @@ pub mod tune;
 
 pub use allowlist::{Allowlist, AllowlistError};
 pub use capacity::{GuestMemory, Shortfall};
+pub use egress::{Attachment, ProfileName};
 pub use id::{AgentId, IdError};
 pub use job::{Job, JobEvent, JobId, JobInputError, JobState, JobTransitionError};
 pub use lifecycle::{Command, State, TransitionError};

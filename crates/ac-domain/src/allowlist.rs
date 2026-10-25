@@ -39,6 +39,31 @@ impl Allowlist {
         Ok(list)
     }
 
+    /// Parse the file format: one entry per line, `#` starts a comment, blank lines skipped.
+    pub fn parse_file(text: &str) -> Result<Self, AllowlistError> {
+        Self::new(
+            text.lines()
+                .map(|l| l.split('#').next().unwrap_or("").trim())
+                .filter(|l| !l.is_empty()),
+        )
+    }
+
+    /// How many entries, exact and wildcard.
+    pub fn len(&self) -> usize {
+        self.exact.len() + self.suffixes.len()
+    }
+
+    /// Whether there are no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Add every entry of `other`.
+    pub fn merge(&mut self, other: &Allowlist) {
+        self.exact.extend(other.exact.iter().cloned());
+        self.suffixes.extend(other.suffixes.iter().cloned());
+    }
+
     /// Whether `host` may be reached. Empty list denies everything.
     pub fn permits(&self, host: &str) -> bool {
         let h = host.trim_end_matches('.').to_ascii_lowercase();
@@ -93,6 +118,21 @@ mod tests {
     #[test]
     fn empty_denies_all() {
         assert!(!Allowlist::default().permits("example.com"));
+    }
+
+    #[test]
+    fn file_format_and_merge() {
+        let mut l = Allowlist::parse_file("# base\n\napi.anthropic.com  # model\n  *.github.com\n")
+            .unwrap_or_default();
+        assert_eq!(l.len(), 2);
+        assert!(Allowlist::parse_file("ok.com\nhttp://bad\n").is_err());
+        assert!(Allowlist::parse_file("# nothing\n").is_ok_and(|l| l.is_empty()));
+        let extra = Allowlist::new(["index.crates.io", "*.pythonhosted.org"]).unwrap_or_default();
+        assert!(!l.permits("index.crates.io"));
+        l.merge(&extra);
+        assert_eq!(l.len(), 4);
+        assert!(l.permits("index.crates.io") && l.permits("files.pythonhosted.org"));
+        assert!(l.permits("api.anthropic.com") && !l.permits("pythonhosted.org"));
     }
 
     #[test]

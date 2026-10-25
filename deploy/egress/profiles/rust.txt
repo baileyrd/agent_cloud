@@ -1,0 +1,6 @@
+# /etc/agent-cloud/egress/profiles/rust.txt (root, 0600): crates.io for cargo (ADR-016).
+# Attach with PUT /api/v1/agents/<id>/egress {"profiles":["rust"]}; every agent always has the base list.
+# A registry is a code-delivery channel: an agent with this profile can fetch and build any published crate.
+index.crates.io
+static.crates.io
+crates.io

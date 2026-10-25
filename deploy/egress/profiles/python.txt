@@ -1,0 +1,5 @@
+# /etc/agent-cloud/egress/profiles/python.txt (root, 0600): PyPI for pip (ADR-016).
+# Attach with PUT /api/v1/agents/<id>/egress {"profiles":["python"]}; every agent always has the base list.
+# A registry is a code-delivery channel: an agent with this profile can install any published package.
+pypi.org
+files.pythonhosted.org

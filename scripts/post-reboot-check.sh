@@ -3,10 +3,13 @@
 # resumes through the gateway with a working login and egress (ADR-007), runs a job through the
 # task API (ADR-010) with a throwaway jobs-only token that cannot pause it (ADR-011), and leaves
 # no zombies (tini is PID 1); committed guest memory fits /dev/shm (ADR-012); `ac-ctl doctor`
-# finds no errors in the host's settings (ADR-014). Run as root:
+# finds no errors in the host's settings (ADR-014); a1's egress widens with the `rust` profile
+# and narrows again with no restart, and a request without its credential gets the base list
+# (ADR-016). Run as root:
 #   sudo scripts/post-reboot-check.sh
 # Leaves the system as found: if it resumed a1, it pauses it again (KEEP_A1=1 leaves it running);
-# the throwaway token is revoked on every way out.
+# a1's egress profiles are put back as they were and the throwaway token is revoked on every way
+# out.
 set -u
 fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -155,7 +158,15 @@ release() {
     [ -z "$HOLDER" ] || kill "$HOLDER" 2>/dev/null; [ -z "$HOLD" ] || rm -f "$HOLD"
     [ -z "$TNAME" ] || ac-gateway token revoke "$TNAME" >/dev/null 2>&1; TNAME=
 }
-trap 'restore; release; exit "$fail"' EXIT
+# a1's egress profiles as found (a JSON array), put back on every way out.
+EG_SAVED= EG_PREV=
+restore_egress() {
+    [ -n "$EG_SAVED" ] || return 0
+    r=$(api PUT "/$AGENT/egress" "{\"profiles\":$EG_PREV}")
+    case $r in *'"profiles":'"$EG_PREV"*) pass "$AGENT egress profiles restored: $EG_PREV" ;; *) bad "restore $AGENT egress: $r" ;; esac
+    EG_SAVED=
+}
+trap 'restore_egress; restore; release; exit "$fail"' EXIT
 trap 'fail=1; exit' INT TERM
 
 case $was in
@@ -217,6 +228,52 @@ case $out in
     *REACHED*) bad "$LAN_HOST reachable: $(echo "$out" | tr '\n' ' ')" ;;
     *) pass "$LAN_HOST unreachable, direct and via the proxy" ;;
 esac
+
+# --- per-agent egress (ADR-016): attach and detach `rust` on a1, no restart ------------------
+# The proxy's CONNECT status for index.crates.io through a1's own (credentialed) proxy settings.
+crates() { gx "crates-$1" 'curl -s -m 8 -o /dev/null -w "connect=%{http_connect}" https://index.crates.io/config.json'; }
+# The same without the credential: the image's proxy URL, as an agent booted before ADR-016 has it.
+# $1 names the exec (containerd exec ids allow no `/`), $2 is the URL without https://.
+anon() { gx "anon-$1" "HTTPS_PROXY=http://10.89.0.1:3128 https_proxy=http://10.89.0.1:3128 curl -s -m 8 -o /dev/null -w 'connect=%{http_connect}' https://$2"; }
+attach() { api PUT "/$AGENT/egress" "{\"profiles\":$1}"; }
+out=$(gx cred 'case $HTTPS_PROXY in http://*:*@*) echo credential ;; *) echo none ;; esac')
+case $out in
+    credential) pass "$AGENT booted with a proxy credential (not shown)" ;;
+    *) bad "$AGENT has no proxy credential in HTTPS_PROXY (booted by an older gateway? pause and resume it)" ;;
+esac
+r=$(api GET "/$AGENT/egress")
+EG_PREV=$(printf '%s' "$r" | sed -n 's/.*"profiles":\(\[[^]]*\]\).*/\1/p')
+if [ -z "$EG_PREV" ]; then
+    bad "GET $AGENT egress: ${r:-no answer}"
+else
+    EG_SAVED=1
+    echo "info  $AGENT egress as found: $r"
+    case $(attach '[]') in *'"profiles":[]'*) ;; *) bad "detach all from $AGENT" ;; esac
+    out=$(crates none)
+    case $out in *connect=403*) pass "$AGENT without profiles: index.crates.io denied (403)" ;; *) bad "$AGENT without profiles: index.crates.io $out" ;; esac
+    since=$(date +%s)
+    r=$(attach '["rust"]')
+    case $r in
+        *'"profiles":["rust"]'*)
+            t0=$(date +%s%N); out=$(crates rust); t1=$(date +%s%N)
+            case $out in
+                *connect=200*) pass "attached rust: index.crates.io allowed (200), $(( (t1 - t0) / 1000000 )) ms after the PUT, no restart" ;;
+                *) bad "attached rust: index.crates.io $out" ;;
+            esac
+            if journalctl -u ac-egress --since "@$since" -o cat 2>/dev/null | grep -q "allow .* agent=$AGENT index.crates.io:443"; then
+                pass "ac-egress log: allow ... agent=$AGENT index.crates.io:443"
+            else bad "ac-egress log has no allow line with agent=$AGENT"; fi
+            out=$(anon crates index.crates.io/config.json)
+            case $out in *connect=403*) pass "no credential: base list only (index.crates.io 403 with rust attached)" ;; *) bad "no credential: index.crates.io $out" ;; esac
+            out=$(anon api api.anthropic.com)
+            case $out in *connect=200*) pass "no credential: the base list still works (api.anthropic.com 200)" ;; *) bad "no credential: api.anthropic.com $out" ;; esac ;;
+        *) bad "attach rust to $AGENT (is deploy/egress/profiles/rust.txt installed?): $r" ;;
+    esac
+    attach '[]' >/dev/null
+    out=$(crates detached)
+    case $out in *connect=403*) pass "detached: index.crates.io denied again (403)" ;; *) bad "detached: index.crates.io $out" ;; esac
+    restore_egress
+fi
 
 # --- task API: one job end to end, submitted with a throwaway jobs-only token -----------------
 # The token goes to curl on stdin. tok <method> <path> [body]: prints "<status> <body>".

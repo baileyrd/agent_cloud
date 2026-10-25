@@ -1,4 +1,6 @@
 # /etc/agent-cloud/egress/profiles/node.txt (root, 0600): the npm registry (ADR-016).
 # Attach with PUT /api/v1/agents/<id>/egress {"profiles":["node"]}; every agent always has the base list.
 # A registry is a code-delivery channel: an agent with this profile can install any published package.
+# Verified 2026-10-25 from a1 through its credentialed proxy with `curl -I` only (CONNECT 200,
+# registry answered 200); metadata and tarballs both come from this host. No real `npm install`.
 registry.npmjs.org

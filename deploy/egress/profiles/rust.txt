@@ -1,6 +1,10 @@
 # /etc/agent-cloud/egress/profiles/rust.txt (root, 0600): crates.io for cargo (ADR-016).
 # Attach with PUT /api/v1/agents/<id>/egress {"profiles":["rust"]}; every agent always has the base list.
 # A registry is a code-delivery channel: an agent with this profile can fetch and build any published crate.
+# Verified 2026-10-25 from a1 through its credentialed proxy: `cargo fetch` (cargo 1.99, serde +
+# anyhow, 8 crates) used index.crates.io (sparse index) and static.crates.io (downloads), and
+# failed with CONNECT 403 without this profile. crates.io is the web API (`cargo search`,
+# `cargo publish`): CONNECT 200 checked with `curl -I` only.
 index.crates.io
 static.crates.io
 crates.io

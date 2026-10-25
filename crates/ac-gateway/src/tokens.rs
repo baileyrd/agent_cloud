@@ -48,19 +48,22 @@ pub enum Scope {
     ViewerRead,
     /// Take over the terminal and type into it.
     ViewerControl,
+    /// Attach egress profiles to agents (ADR-016): widens what they may reach.
+    EgressWrite,
     /// Everything.
     Admin,
 }
 
 impl Scope {
     /// Every scope.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::AgentsRead,
         Self::AgentsWrite,
         Self::JobsRead,
         Self::JobsWrite,
         Self::ViewerRead,
         Self::ViewerControl,
+        Self::EgressWrite,
         Self::Admin,
     ];
 
@@ -73,6 +76,7 @@ impl Scope {
             Self::JobsWrite => "jobs:write",
             Self::ViewerRead => "viewer:read",
             Self::ViewerControl => "viewer:control",
+            Self::EgressWrite => "egress:write",
             Self::Admin => "admin",
         }
     }
@@ -542,7 +546,7 @@ impl TokenFile {
 }
 
 /// 32 bytes from the kernel's random source, as hex. No fallback: a token must be unguessable.
-fn random_hex() -> Result<String, String> {
+pub(crate) fn random_hex() -> Result<String, String> {
     let mut b = [0u8; 32];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut b))
@@ -667,6 +671,16 @@ mod tests {
         assert!(!Scopes::parse("viewer:read")
             .unwrap_or_default()
             .allows(Scope::ViewerControl));
+        // Widening egress is its own scope: agents:write does not imply it, admin does.
+        let egress = Scopes::parse("egress:write").unwrap_or_default();
+        assert!(egress.allows(Scope::EgressWrite) && !egress.allows(Scope::AgentsWrite));
+        assert!(!Scopes::parse("agents:write")
+            .unwrap_or_default()
+            .allows(Scope::EgressWrite));
+        assert_eq!(
+            Scopes::parse("admin,egress:write").map(|s| s.to_string()),
+            Ok("egress:write,admin".into())
+        );
         assert!(Scopes::parse("").is_err() && Scopes::parse("Admin").is_err());
     }
 

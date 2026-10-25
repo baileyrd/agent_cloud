@@ -14,7 +14,7 @@ use rusty_serve::{Request, Response, SharedHandler};
 
 use crate::access::{self, Failures, Rule, Verdict};
 use crate::jobs::{self, Jobs, Route};
-use crate::tokens::{Keys, Presented, Token};
+use crate::tokens::{Keys, Presented, Scope, Token};
 use crate::viewer::{Answer, Hub};
 use crate::{error, escape, Api, Reply};
 
@@ -88,6 +88,7 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
         let method = match r.method {
             Method::Get => "GET",
             Method::Post => "POST",
+            Method::Put => "PUT",
             Method::Delete => "DELETE",
             _ => "OTHER",
         };
@@ -121,7 +122,7 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
         }
         let response = self.dispatch(method, path, r, token);
         if let (Some(action), Some(agent)) = (rule.audit, agent) {
-            self.audit(token, rule, action, agent, r.target, &response);
+            self.audit(token, rule, action, agent, r, &response);
         }
         response
     }
@@ -168,24 +169,39 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
                 Some(route) => self.job(route, r),
                 None => {
                     let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
-                    json(api.handle(method, r.target, &token.agents))
+                    let may_attach = token.scopes.allows(Scope::EgressWrite);
+                    json(api.request(method, r.target, r.body, &token.agents, may_attach))
                 }
             },
         }
     }
 
     /// One line in the gateway log and an event in the agent's history: token name, action, its
-    /// flags, the job a submit created, the status. No prompt, body or terminal content.
+    /// flags, the job a submit created, the egress profiles a create or attach named (validated
+    /// names only), the status. No prompt, body or terminal content.
     fn audit(
         &self,
         token: &Token,
         rule: &Rule,
         action: &str,
         agent: &str,
-        target: &str,
+        r: &Request<'_>,
         response: &Response,
     ) {
+        let target = r.target;
         let mut line = format!("audit token={} action={action}", token.name);
+        let key = match action {
+            "create" => Some("egress_profiles"),
+            "egress" => Some("profiles"),
+            _ => None,
+        };
+        if let Some(Ok(Some(p))) = key.map(|k| crate::profiles_in(r.body, k)) {
+            let names = ac_domain::egress::names(&p);
+            line.push_str(&format!(
+                " profiles={}",
+                if names.is_empty() { "-" } else { &names }
+            ));
+        }
         let query = target.split_once('?').map_or("", |(_, q)| q);
         for flag in ["force=true", "purge=true"] {
             if query.split('&').any(|p| p == flag) {

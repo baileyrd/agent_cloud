@@ -12,9 +12,16 @@
 //! 507 and `{"error","rule","needed_mib","available_mib","more_agents"}`; `GET /api/v1/capacity`
 //! reports the figures, and with the task API also `running_jobs`, `queued_jobs` and
 //! `max_running_jobs` (ADR-013).
+//!
+//! Egress profiles (ADR-016): `GET /api/v1/egress/profiles` lists the operator's profiles and their
+//! host counts; `GET .../{id}/egress` an agent's profiles and how many hosts it may reach;
+//! `PUT .../{id}/egress` with `{"profiles":["rust"]}` replaces them (the proxy applies it to the
+//! next request). A create may carry `{"egress_profiles":[...]}`, which needs `egress:write` too.
+//! The API attaches only profiles that exist; it never defines hosts.
 
 pub mod access;
 pub mod bind;
+pub mod egress;
 pub mod jobs;
 pub mod notify;
 pub mod tokens;
@@ -25,14 +32,18 @@ pub mod web;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use ac_domain::{AgentId, Shortfall, State};
+use ac_domain::{AgentId, ProfileName, Shortfall, State};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::{Runtime, SessionStore};
+use egress::Profiles;
+use rusty_json::Value;
 use tokens::Agents;
 
 const PREFIX: &str = "/api/v1/agents/";
 /// What admission control sees.
 pub const CAPACITY: &str = "/api/v1/capacity";
+/// The operator's egress profiles.
+pub const PROFILES: &str = "/api/v1/egress/profiles";
 
 /// A rendered response: status code and JSON body.
 #[derive(Debug, PartialEq, Eq)]
@@ -88,6 +99,7 @@ pub struct Api<R, S> {
     fleet: Fleet<R, S>,
     unhealthy: Unhealthy,
     jobs: Arc<dyn Busy>,
+    egress: Option<Arc<dyn Profiles>>,
 }
 
 impl<R: Runtime, S: SessionStore> Api<R, S> {
@@ -97,7 +109,14 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             fleet,
             unhealthy: Unhealthy::default(),
             jobs: Arc::new(NoJobs),
+            egress: None,
         }
+    }
+
+    /// Serve the egress routes from `profiles` (the fleet issues the credentials).
+    pub fn with_egress(mut self, profiles: Arc<dyn Profiles>) -> Self {
+        self.egress = Some(profiles);
+        self
     }
 
     /// Ask `jobs` before pausing or destroying an agent.
@@ -130,11 +149,29 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             .unwrap_or_default()
     }
 
-    /// Handle one request from a token for `agents` (the list shows only those; the caller has
-    /// checked the rest). Of the query string, only `purge` on `DELETE` and `force` on pause and
-    /// `DELETE` are read.
+    /// Handle one request without a body from a token that may not attach profiles.
     pub fn handle(&self, method: &str, target: &str, agents: &Agents) -> Reply {
+        self.request(method, target, b"", agents, false)
+    }
+
+    /// Handle one request from a token for `agents` (the list shows only those; the caller has
+    /// checked the rest); `may_attach` is whether it has `egress:write`. Of the query string,
+    /// only `purge` on `DELETE` and `force` on pause and `DELETE` are read.
+    pub fn request(
+        &self,
+        method: &str,
+        target: &str,
+        body: &[u8],
+        agents: &Agents,
+        may_attach: bool,
+    ) -> Reply {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if path == PROFILES {
+            return match method {
+                "GET" => self.profiles(),
+                _ => error(405, "method not allowed"),
+            };
+        }
         if path == CAPACITY {
             return match method {
                 "GET" => self.capacity(),
@@ -160,7 +197,9 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         };
         match (method, action) {
             ("GET", None) => self.status(&id),
-            ("POST", None) => self.done(&id, self.fleet.create(&id), 201),
+            ("POST", None) => self.create(&id, body, may_attach),
+            ("GET", Some("egress")) => self.egress(&id),
+            ("PUT", Some("egress")) => self.attach(&id, body),
             ("POST", Some("pause")) => match flag(query, "force") {
                 Some(force) => self.vacate(&id, force, || self.fleet.pause(&id)),
                 None => error(400, "force must be true or false"),
@@ -177,9 +216,136 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
                 (None, _) => error(400, "purge must be true or false"),
                 (_, None) => error(400, "force must be true or false"),
             },
-            (_, None | Some("pause" | "resume")) => error(405, "method not allowed"),
+            (_, None | Some("pause" | "resume" | "egress")) => error(405, "method not allowed"),
             _ => error(404, "not found"),
         }
+    }
+
+    /// Create, attaching the body's `egress_profiles` (which needs `egress:write`) before boot.
+    fn create(&self, id: &AgentId, body: &[u8], may_attach: bool) -> Reply {
+        let profiles = match profiles_in(body, "egress_profiles") {
+            Ok(p) => p,
+            Err(reply) => return reply,
+        };
+        if let Some(p) = &profiles {
+            if !p.is_empty() && !may_attach {
+                return error(403, "attaching egress profiles needs scope egress:write");
+            }
+            if let Err(reply) = self.usable(p) {
+                return reply;
+            }
+        }
+        self.done(id, self.fleet.create_attached(id, profiles.as_deref()), 201)
+    }
+
+    fn profiles(&self) -> Reply {
+        let Some(egress) = &self.egress else {
+            return no_egress();
+        };
+        match egress.list() {
+            Ok(all) => {
+                let items: Vec<String> = all
+                    .iter()
+                    .map(|(name, hosts)| match hosts {
+                        Ok(n) => format!(r#"{{"name":"{name}","hosts":{n}}}"#),
+                        Err(e) => format!(r#"{{"name":"{name}","error":"{}"}}"#, escape(e)),
+                    })
+                    .collect();
+                Reply {
+                    status: 200,
+                    body: format!(r#"{{"profiles":[{}]}}"#, items.join(",")),
+                }
+            }
+            Err(e) => error(500, &e),
+        }
+    }
+
+    /// `{"id","profiles","effective_hosts"}`, plus `"missing"` for attached profiles with no
+    /// file (they add nothing).
+    fn egress(&self, id: &AgentId) -> Reply {
+        let Some(egress) = &self.egress else {
+            return no_egress();
+        };
+        match self.fleet.state(id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return error(404, &FleetError::NotFound(id.clone()).to_string()),
+            Err(e) => return map_error(&e),
+        }
+        let figures = egress.attached(id).and_then(|attached| {
+            let listed = egress.list()?;
+            let mut hosts = egress.base_hosts()?;
+            let mut missing = Vec::new();
+            for p in &attached {
+                match listed.iter().find(|(n, _)| n == p) {
+                    Some((_, Ok(n))) => hosts += n,
+                    _ => missing.push(format!(r#""{p}""#)),
+                }
+            }
+            Ok((attached, hosts, missing))
+        });
+        let (attached, hosts, missing) = match figures {
+            Ok(f) => f,
+            Err(e) => return error(500, &e),
+        };
+        let names: Vec<String> = attached.iter().map(|p| format!(r#""{p}""#)).collect();
+        let missing = match missing.is_empty() {
+            true => String::new(),
+            false => format!(r#","missing":[{}]"#, missing.join(",")),
+        };
+        Reply {
+            status: 200,
+            body: format!(
+                r#"{{"id":"{id}","profiles":[{}],"effective_hosts":{hosts}{missing}}}"#,
+                names.join(",")
+            ),
+        }
+    }
+
+    /// Replace the agent's profiles with the body's `profiles`; the proxy applies it to the next
+    /// request, with no restart.
+    fn attach(&self, id: &AgentId, body: &[u8]) -> Reply {
+        let Some(egress) = &self.egress else {
+            return no_egress();
+        };
+        let profiles = match profiles_in(body, "profiles") {
+            Ok(Some(p)) => p,
+            Ok(None) => return error(400, "body must be {\"profiles\":[...]}"),
+            Err(reply) => return reply,
+        };
+        match self.fleet.state(id) {
+            Ok(Some(State::Destroyed)) => return error(409, &format!("agent {id} is destroyed")),
+            Ok(Some(_)) => {}
+            Ok(None) => return error(404, &FleetError::NotFound(id.clone()).to_string()),
+            Err(e) => return map_error(&e),
+        }
+        if let Err(reply) = self.usable(&profiles) {
+            return reply;
+        }
+        match egress.attach(id, &profiles) {
+            Ok(()) => self.egress(id),
+            Err(e) => error(500, &e),
+        }
+    }
+
+    /// 400 unless every one of `profiles` has a file the proxy would accept.
+    fn usable(&self, profiles: &[ProfileName]) -> Result<(), Reply> {
+        let Some(egress) = &self.egress else {
+            return Err(no_egress());
+        };
+        let listed = egress.list().map_err(|e| error(500, &e))?;
+        for p in profiles {
+            match listed.iter().find(|(n, _)| n == p) {
+                None => return Err(error(400, &format!("unknown egress profile {p}"))),
+                Some((_, Err(e))) => {
+                    return Err(error(
+                        400,
+                        &format!("egress profile {p} cannot be used: {e}"),
+                    ))
+                }
+                Some((_, Ok(_))) => {}
+            }
+        }
+        Ok(())
     }
 
     fn capacity(&self) -> Reply {
@@ -259,6 +425,49 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             Err(e) => map_error(&e),
         }
     }
+}
+
+/// 404 when the gateway runs without agent networking, so without the proxy.
+fn no_egress() -> Reply {
+    error(404, "egress profiles are off (AC_NETWORK is not 1)")
+}
+
+/// `{"<key>": ["name", ...]}`, the body's only member, as validated profile names without
+/// duplicates. `None` for an empty body or one without `key`.
+pub fn profiles_in(body: &[u8], key: &str) -> Result<Option<Vec<ProfileName>>, Reply> {
+    let bad = |m: &str| error(400, m);
+    if body.trim_ascii().is_empty() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(body).map_err(|_| bad("body is not UTF-8"))?;
+    let value = Value::parse(text).map_err(|e| bad(&format!("bad JSON: {e}")))?;
+    let Some(obj) = value.as_object() else {
+        return Err(bad("body must be a JSON object"));
+    };
+    if let Some(k) = obj.keys().find(|k| k.as_str() != key) {
+        return Err(bad(&format!(
+            "unknown member {:?}",
+            k.chars().take(40).collect::<String>()
+        )));
+    }
+    let Some(list) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(items) = list.as_array() else {
+        return Err(bad(&format!("{key} must be an array of profile names")));
+    };
+    let mut names = Vec::new();
+    for item in items {
+        let Some(name) = item.as_str() else {
+            return Err(bad(&format!("{key} must be an array of profile names")));
+        };
+        let name = ProfileName::parse(name).map_err(|e| bad(&e.to_string()))?;
+        if names.contains(&name) {
+            return Err(bad(&format!("egress profile {name} listed twice")));
+        }
+        names.push(name);
+    }
+    Ok(Some(names))
 }
 
 /// A boolean query parameter (`purge`, `force`): absent or `false` is false. `None` if malformed.
@@ -475,7 +684,7 @@ mod tests {
     /// checked first.
     #[test]
     fn every_route_has_exactly_one_scope_entry() {
-        let a = api(false);
+        let (a, _) = egress_api();
         let mut words: Vec<&str> = access::ROUTES
             .iter()
             .flat_map(|r| r.path.split('/'))
@@ -487,6 +696,9 @@ mod tests {
         let mut paths = vec!["/api/v1/agents".to_owned()];
         for w in &words {
             paths.push(format!("/api/v1/{w}"));
+            for v in &words {
+                paths.push(format!("/api/v1/{w}/{v}"));
+            }
         }
         // Every tail of up to 3 words (the deepest routes), and each 3-word tail plus one more.
         let mut tails = vec![String::new()];
@@ -512,7 +724,7 @@ mod tests {
             };
             let viewer = ours(viewer::route(m, p).map(|r| r.map(drop)));
             let job = ours(jobs::route(m, p).map(|r| r.map(drop)));
-            let life = a.handle(m, p, &Agents::All);
+            let life = a.request(m, p, b"", &Agents::All, true);
             let life = life.status != 405
                 && life.body != error(404, "not found").body
                 && !(life.status == 400 && empty);
@@ -526,6 +738,230 @@ mod tests {
             }
         }
         assert!(checked > 50_000, "{checked}");
+    }
+
+    /// Profiles rust (2 hosts), node (refused by the proxy) and the base list (3 hosts); the
+    /// attachments in memory. The fleet's Egress and the API's Profiles, as `EgressStore` is.
+    #[derive(Default)]
+    struct FakeEgress(Mutex<HashMap<String, Vec<ProfileName>>>);
+
+    impl FakeEgress {
+        fn of(&self, id: &str) -> Vec<String> {
+            let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(id)
+                .map_or_else(Vec::new, |v| v.iter().map(ToString::to_string).collect())
+        }
+    }
+
+    impl ac_ports::Egress for FakeEgress {
+        fn issue(
+            &self,
+            id: &AgentId,
+            p: Option<&[ProfileName]>,
+        ) -> Result<ac_ports::Boot, PortError> {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let line = m.entry(id.to_string()).or_default();
+            if let Some(p) = p {
+                *line = p.to_vec();
+            }
+            Ok(ac_ports::Boot::default())
+        }
+        fn revoke(&self, _: &AgentId) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn forget(&self, id: &AgentId) -> Result<(), PortError> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id.as_str());
+            Ok(())
+        }
+        fn sweep(&self, _: &[AgentId]) -> Result<Vec<AgentId>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl Profiles for FakeEgress {
+        fn list(&self) -> Result<egress::Listed, String> {
+            let p = |s| ProfileName::parse(s).map_err(|e| e.to_string());
+            Ok(vec![
+                (p("node")?, Err("mode 644".into())),
+                (p("rust")?, Ok(2)),
+            ])
+        }
+        fn base_hosts(&self) -> Result<usize, String> {
+            Ok(3)
+        }
+        fn attached(&self, id: &AgentId) -> Result<Vec<ProfileName>, String> {
+            let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(m.get(id.as_str()).cloned().unwrap_or_default())
+        }
+        fn attach(&self, id: &AgentId, p: &[ProfileName]) -> Result<(), String> {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            m.insert(id.to_string(), p.to_vec());
+            Ok(())
+        }
+    }
+
+    fn egress_api() -> (Api<Rt, Store>, Arc<FakeEgress>) {
+        let e = Arc::new(FakeEgress::default());
+        let fleet = Fleet::new(Rt { fail: false }, Store::default()).with_egress(e.clone());
+        (Api::new(fleet).with_egress(e.clone()), e)
+    }
+
+    fn send(a: &Api<Rt, Store>, m: &str, t: &str, body: &str, may_attach: bool) -> (u16, String) {
+        let r = a.request(m, t, body.as_bytes(), &Agents::All, may_attach);
+        (r.status, r.body)
+    }
+
+    #[test]
+    fn egress_profiles_are_listed_with_host_counts() {
+        let (a, _) = egress_api();
+        assert_eq!(
+            call(&a, "GET", PROFILES),
+            (
+                200,
+                r#"{"profiles":[{"name":"node","error":"mode 644"},{"name":"rust","hosts":2}]}"#
+                    .into()
+            )
+        );
+        assert_eq!(call(&a, "POST", PROFILES).0, 405);
+        assert_eq!(
+            call(&api(false), "GET", PROFILES).0,
+            404,
+            "no egress without AC_NETWORK"
+        );
+    }
+
+    #[test]
+    fn attach_and_detach_an_agents_profiles() {
+        let (a, e) = egress_api();
+        let path = "/api/v1/agents/a1/egress";
+        assert_eq!(call(&a, "GET", path).0, 404, "unknown agent");
+        assert_eq!(
+            send(&a, "PUT", path, r#"{"profiles":["rust"]}"#, true).0,
+            404
+        );
+        let _ = call(&a, "POST", "/api/v1/agents/a1");
+        assert_eq!(
+            call(&a, "GET", path),
+            (
+                200,
+                r#"{"id":"a1","profiles":[],"effective_hosts":3}"#.into()
+            )
+        );
+        assert_eq!(
+            send(&a, "PUT", path, r#"{"profiles":["rust"]}"#, true),
+            (
+                200,
+                r#"{"id":"a1","profiles":["rust"],"effective_hosts":5}"#.into()
+            )
+        );
+        assert_eq!(e.of("a1"), ["rust"]);
+        assert_eq!(
+            send(&a, "PUT", path, r#"{"profiles":[]}"#, true).1,
+            r#"{"id":"a1","profiles":[],"effective_hosts":3}"#
+        );
+        assert!(e.of("a1").is_empty());
+        // A profile whose file went away is reported, and adds nothing.
+        let gone = ProfileName::parse("gone").unwrap_or_else(|e| panic!("{e}"));
+        let _ = e.attach(
+            &AgentId::parse("a1").unwrap_or_else(|e| panic!("{e}")),
+            &[gone],
+        );
+        assert_eq!(
+            call(&a, "GET", path).1,
+            r#"{"id":"a1","profiles":["gone"],"effective_hosts":3,"missing":["gone"]}"#
+        );
+        let _ = call(&a, "DELETE", "/api/v1/agents/a1");
+        assert_eq!(send(&a, "PUT", path, r#"{"profiles":[]}"#, true).0, 409);
+        assert_eq!(call(&a, "POST", path).0, 405);
+    }
+
+    #[test]
+    fn bad_attach_bodies_are_400_and_change_nothing() {
+        let (a, e) = egress_api();
+        let _ = call(&a, "POST", "/api/v1/agents/a1");
+        let path = "/api/v1/agents/a1/egress";
+        for (body, want) in [
+            ("", "body must be"),
+            ("{}", "body must be"),
+            ("[]", "JSON object"),
+            ("{\"profiles\":\"rust\"}", "array of profile names"),
+            ("{\"profiles\":[1]}", "array of profile names"),
+            ("{\"profiles\":[\"Rust\"]}", "profile name"),
+            ("{\"profiles\":[\"-\"]}", "profile name"),
+            ("{\"profiles\":[\"rust\",\"rust\"]}", "listed twice"),
+            ("{\"profiles\":[\"go\"]}", "unknown egress profile go"),
+            (
+                "{\"profiles\":[\"node\"]}",
+                "egress profile node cannot be used: mode 644",
+            ),
+            (
+                "{\"profiles\":[],\"hosts\":[\"evil.example\"]}",
+                "unknown member \\\"hosts\\\"",
+            ),
+            ("{\"profiles\":[", "bad JSON"),
+            ("\u{ff}", "bad JSON"),
+        ] {
+            let (status, reply) = send(&a, "PUT", path, body, true);
+            assert_eq!(status, 400, "{body:?}: {reply}");
+            assert!(reply.contains(want), "{body:?}: {reply}");
+        }
+        assert!(e.of("a1").is_empty());
+    }
+
+    #[test]
+    fn create_can_attach_but_only_with_egress_write() {
+        let (a, e) = egress_api();
+        let body = r#"{"egress_profiles":["rust"]}"#;
+        let (status, reply) = send(&a, "POST", "/api/v1/agents/a1", body, false);
+        assert_eq!(
+            (status, reply.contains("needs scope egress:write")),
+            (403, true),
+            "{reply}"
+        );
+        assert_eq!(
+            call(&a, "GET", "/api/v1/agents/a1").0,
+            404,
+            "nothing created"
+        );
+        assert_eq!(send(&a, "POST", "/api/v1/agents/a1", body, true).0, 201);
+        assert_eq!(e.of("a1"), ["rust"]);
+        // No profiles needs nothing more; an unknown one is refused before anything is created.
+        assert_eq!(
+            send(
+                &a,
+                "POST",
+                "/api/v1/agents/a2",
+                r#"{"egress_profiles":[]}"#,
+                false
+            )
+            .0,
+            201
+        );
+        let (status, _) = send(
+            &a,
+            "POST",
+            "/api/v1/agents/a3",
+            r#"{"egress_profiles":["go"]}"#,
+            true,
+        );
+        assert_eq!(status, 400);
+        assert_eq!(call(&a, "GET", "/api/v1/agents/a3").0, 404);
+        assert_eq!(
+            send(&a, "POST", "/api/v1/agents/a4", r#"{"x":1}"#, true).0,
+            400
+        );
+        // Without egress, a create naming profiles is refused, and one without works as before.
+        assert_eq!(
+            send(&api(false), "POST", "/api/v1/agents/a1", body, true).0,
+            404
+        );
+        assert_eq!(
+            send(&api(false), "POST", "/api/v1/agents/a1", "", false).0,
+            201
+        );
     }
 
     #[test]

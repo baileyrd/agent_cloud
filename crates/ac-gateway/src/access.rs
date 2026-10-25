@@ -50,13 +50,15 @@ const fn rule(
 }
 
 use Need::Scope as S;
-use Scope::{AgentsRead, AgentsWrite, JobsRead, JobsWrite, ViewerControl, ViewerRead};
+use Scope::{AgentsRead, AgentsWrite, EgressWrite, JobsRead, JobsWrite, ViewerControl, ViewerRead};
 
 const A: &str = "/api/v1/agents/{id}";
 
 /// Every route under `/api/`. Viewer input (keys, text, paste, resize) is not audited per call:
 /// it comes from the viewer whose take-over was, and a viewer id works only with the token that
 /// opened it. Picking a window changes only what that viewer sees, so it needs `viewer:read`.
+/// Attaching egress profiles widens what an agent may reach, so it has its own scope (ADR-016);
+/// a create that attaches some needs it too, which the handler checks.
 pub const ROUTES: &[Rule] = &[
     rule("GET", "/api/v1/whoami", Need::Token, None),
     rule("GET", "/api/v1/agents", S(AgentsRead), None),
@@ -75,6 +77,14 @@ pub const ROUTES: &[Rule] = &[
         "/api/v1/agents/{id}/resume",
         S(AgentsWrite),
         Some("resume"),
+    ),
+    rule("GET", "/api/v1/egress/profiles", S(AgentsRead), None),
+    rule("GET", "/api/v1/agents/{id}/egress", S(AgentsRead), None),
+    rule(
+        "PUT",
+        "/api/v1/agents/{id}/egress",
+        S(EgressWrite),
+        Some("egress"),
     ),
     rule("GET", "/api/v1/agents/{id}/jobs", S(JobsRead), None),
     rule(
@@ -283,6 +293,9 @@ mod tests {
             ("DELETE", "/api/v1/agents/a1", S(AgentsWrite)),
             ("POST", "/api/v1/agents/a1/pause", S(AgentsWrite)),
             ("POST", "/api/v1/agents/a1/resume", S(AgentsWrite)),
+            ("GET", "/api/v1/egress/profiles", S(AgentsRead)),
+            ("GET", "/api/v1/agents/a1/egress", S(AgentsRead)),
+            ("PUT", "/api/v1/agents/a1/egress", S(EgressWrite)),
             ("GET", "/api/v1/agents/a1/jobs", S(JobsRead)),
             ("POST", "/api/v1/agents/a1/jobs", S(JobsWrite)),
             ("GET", job, S(JobsRead)),
@@ -302,7 +315,7 @@ mod tests {
         }
         assert_eq!(
             ROUTES.len(),
-            22,
+            25,
             "a new route needs a row above and in ADR-011"
         );
     }
@@ -318,6 +331,9 @@ mod tests {
             ("GET", "/api/v2/agents", 404),
             ("GET", "/api/v1/agents/a1/pause", 405),
             ("PUT", "/api/v1/agents/a1", 405),
+            ("POST", "/api/v1/agents/a1/egress", 405),
+            ("PUT", "/api/v1/egress/profiles", 405),
+            ("GET", "/api/v1/egress", 404),
             ("POST", "/api/v1/agents", 405),
             ("GET", "/api/v1/agents/a1/term/v1/keys", 405),
         ] {
@@ -345,6 +361,20 @@ mod tests {
         );
         assert_eq!(
             check(&t, pause, Some("a2")).err().map(|r| r.status),
+            Some(404)
+        );
+        let (egress, _) =
+            find("PUT", "/api/v1/agents/a1/egress").unwrap_or_else(|r| panic!("{r:?}"));
+        let writer = token("agents:read,agents:write", "*");
+        assert_eq!(
+            check(&writer, egress, Some("a1")).err().map(|r| r.status),
+            Some(403)
+        );
+        assert!(check(&token("egress:write", "a1"), egress, Some("a1")).is_ok());
+        assert_eq!(
+            check(&token("egress:write", "a1"), egress, Some("a2"))
+                .err()
+                .map(|r| r.status),
             Some(404)
         );
         let (jobs, _) = find("POST", "/api/v1/agents/a2/jobs").unwrap_or_else(|r| panic!("{r:?}"));

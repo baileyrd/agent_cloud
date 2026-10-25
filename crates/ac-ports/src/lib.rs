@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ac_domain::health::{ExecClient, Pressure};
-use ac_domain::{AgentId, Job, JobId, State};
+use ac_domain::{AgentId, Job, JobId, ProfileName, State};
 
 /// Adapter failure with context; adapters map their own errors into this.
 #[derive(Debug)]
@@ -25,19 +25,62 @@ impl fmt::Display for PortError {
 
 impl std::error::Error for PortError {}
 
+/// What one boot of an agent's VM gets besides its image: the environment that carries its proxy
+/// credential (ADR-016), overriding the image's credential-less proxy variables. `Debug` shows
+/// the names only, never a value.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Boot {
+    env: Vec<(String, String)>,
+}
+
+impl Boot {
+    /// Add `name=value` to the environment.
+    pub fn with_env(mut self, name: &str, value: String) -> Self {
+        self.env.push((name.to_owned(), value));
+        self
+    }
+
+    /// The environment, in order.
+    pub fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+}
+
+impl fmt::Debug for Boot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
+        write!(f, "Boot {{ env: {names:?} }}")
+    }
+}
+
 /// Starts and stops per-agent microVMs (Kata via containerd).
 pub trait Runtime {
-    /// Provision the VM and workspace volume for a new agent.
-    fn create(&self, id: &AgentId) -> Result<(), PortError>;
+    /// Provision the VM and workspace volume for a new agent and boot it with `boot`.
+    fn create(&self, id: &AgentId, boot: &Boot) -> Result<(), PortError>;
     /// Stop the VM, keeping its volume.
     fn pause(&self, id: &AgentId) -> Result<(), PortError>;
-    /// Start a paused VM.
-    fn resume(&self, id: &AgentId) -> Result<(), PortError>;
+    /// Start a paused VM with `boot`.
+    fn resume(&self, id: &AgentId, boot: &Boot) -> Result<(), PortError>;
     /// Remove the VM, keeping its volume; `purge` removes the volume too. Must succeed when the
     /// VM is already gone, so a destroyed agent's volume can be purged later.
     fn destroy(&self, id: &AgentId, purge: bool) -> Result<(), PortError>;
     /// Agents whose VM is up: the runtime has a task for them that has not stopped.
     fn running(&self) -> Result<Vec<AgentId>, PortError>;
+}
+
+/// The agents' proxy credentials and profile attachments (ADR-016), kept in the agents file the
+/// egress proxy reads. Every boot gets a new credential; only its digest is stored.
+pub trait Egress {
+    /// A new credential for `id`'s next boot, its digest stored (and `profiles` attached in the
+    /// same write, when given) before the VM starts. Returns what to boot with.
+    fn issue(&self, id: &AgentId, profiles: Option<&[ProfileName]>) -> Result<Boot, PortError>;
+    /// `id`'s VM is going or gone: its credential stops working. Its profiles stay.
+    fn revoke(&self, id: &AgentId) -> Result<(), PortError>;
+    /// `id`'s workspace was purged: forget it, profiles too.
+    fn forget(&self, id: &AgentId) -> Result<(), PortError>;
+    /// Only the agents in `live` have a VM: revoke every other credential. Returns those it
+    /// revoked.
+    fn sweep(&self, live: &[AgentId]) -> Result<Vec<AgentId>, PortError>;
 }
 
 /// `/dev/shm`, where every guest's RAM lives (Kata's `memory-backend-file`), in MiB.
@@ -127,5 +170,18 @@ impl<T: JobStore + ?Sized> JobStore for Arc<T> {
     }
     fn remove_job(&self, agent: &AgentId, id: &JobId) -> Result<(), PortError> {
         (**self).remove_job(agent, id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_debug_shows_names_not_values() {
+        let boot =
+            Boot::default().with_env("HTTPS_PROXY", "http://a1:s3cr3t@10.89.0.1:3128".into());
+        assert_eq!(format!("{boot:?}"), r#"Boot { env: ["HTTPS_PROXY"] }"#);
+        assert_eq!(boot.env()[0].1, "http://a1:s3cr3t@10.89.0.1:3128");
     }
 }

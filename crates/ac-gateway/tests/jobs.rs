@@ -654,13 +654,13 @@ fn long_poll_returns_on_change_and_is_bounded() {
 
 struct Rt;
 impl Runtime for Rt {
-    fn create(&self, _: &AgentId) -> Result<(), PortError> {
+    fn create(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
         Ok(())
     }
     fn pause(&self, _: &AgentId) -> Result<(), PortError> {
         Ok(())
     }
-    fn resume(&self, _: &AgentId) -> Result<(), PortError> {
+    fn resume(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
         Ok(())
     }
     fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {
@@ -1032,6 +1032,7 @@ fn ctr(
         namespace: "agents".into(),
         image: "agent:latest".into(),
         workspace_root: root.join("workspaces"),
+        env_dir: root.join("boot"),
         workspace_owner: None,
         network: None,
         vc_root: root.join("vc"),

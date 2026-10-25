@@ -389,13 +389,13 @@ impl SessionStore for Store {
 
 struct Rt;
 impl Runtime for Rt {
-    fn create(&self, _: &AgentId) -> Result<(), PortError> {
+    fn create(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
         Ok(())
     }
     fn pause(&self, _: &AgentId) -> Result<(), PortError> {
         Ok(())
     }
-    fn resume(&self, _: &AgentId) -> Result<(), PortError> {
+    fn resume(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
         Ok(())
     }
     fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {

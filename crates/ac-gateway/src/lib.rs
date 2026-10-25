@@ -382,13 +382,13 @@ mod tests {
         }
     }
     impl Runtime for Rt {
-        fn create(&self, _: &AgentId) -> Result<(), PortError> {
+        fn create(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
             self.go()
         }
         fn pause(&self, _: &AgentId) -> Result<(), PortError> {
             self.go()
         }
-        fn resume(&self, _: &AgentId) -> Result<(), PortError> {
+        fn resume(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
             self.go()
         }
         fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {
@@ -640,7 +640,7 @@ mod tests {
     /// A runtime whose create takes a while, so two creates overlap unless serialized.
     struct Slow(Mutex<Vec<String>>);
     impl Runtime for Slow {
-        fn create(&self, id: &AgentId) -> Result<(), PortError> {
+        fn create(&self, id: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
             std::thread::sleep(std::time::Duration::from_millis(50));
             self.0
                 .lock()
@@ -653,7 +653,7 @@ mod tests {
         fn pause(&self, _: &AgentId) -> Result<(), PortError> {
             Ok(())
         }
-        fn resume(&self, _: &AgentId) -> Result<(), PortError> {
+        fn resume(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
             Ok(())
         }
         fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {

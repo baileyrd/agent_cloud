@@ -334,6 +334,7 @@ fn run() -> Result<(), String> {
         namespace: env("AC_NAMESPACE", "agents"),
         image,
         workspace_root: data.join("workspaces"),
+        env_dir: data.join("boot"),
         workspace_owner: Some((uid, uid)),
         network,
         vc_root: "/run/vc".into(),

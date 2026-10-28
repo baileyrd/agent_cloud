@@ -1,7 +1,8 @@
 //! The whole HTTP surface, in order: the Origin check (every request), the viewer page and its
 //! script and style (no data in them, so no token: a browser cannot send a header when it
 //! navigates), then under `/api/`: the token, the route's scope and agents ([`access`]), and the
-//! viewer, job or lifecycle handler. State-changing calls are audited: one line in the gateway's
+//! viewer, job, lifecycle or MCP handler; an MCP tool call goes through the same checks as the
+//! route it names ([`mcp`]). State-changing calls are audited: one line in the gateway's
 //! log and one event in the agent's history, with the token's name, never the token.
 
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,7 @@ use rusty_serve::{Request, Response, SharedHandler};
 
 use crate::access::{self, Failures, Rule, Verdict};
 use crate::jobs::{self, Jobs, Route};
+use crate::mcp::{self, Message};
 use crate::tokens::{Keys, Presented, Scope, Token};
 use crate::viewer::{Answer, Hub};
 use crate::{error, escape, Api, Reply};
@@ -107,24 +109,10 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
                 return self.refuse(method, path, &format!("unknown token sha256:{prefix}"))
             }
         };
-        let (rule, agent) = match access::find(method, path) {
-            Ok(found) => found,
-            Err(reply) => return json(reply),
-        };
-        if let Err(reply) = access::check(token, rule, agent) {
-            eprintln!(
-                "ac-gateway: auth: token {} refused ({}) for {method} {}",
-                token.name,
-                reply.status,
-                shown(path)
-            );
-            return json(reply);
+        if path == mcp::PATH && !mcp_version_ok(r.headers) {
+            return json(error(400, "unsupported MCP-Protocol-Version"));
         }
-        let response = self.dispatch(method, path, r, token);
-        if let (Some(action), Some(agent)) = (rule.audit, agent) {
-            self.audit(token, rule, action, agent, r, &response);
-        }
-        response
+        self.serve(method, r.target, r.body, token)
     }
 }
 
@@ -150,11 +138,82 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
         }
     }
 
-    fn dispatch(&self, method: &str, path: &str, r: &Request<'_>, token: &Token) -> Response {
+    /// An authenticated request, from HTTP or an MCP tool call: the route's scope and agents,
+    /// then its handler, then the audit.
+    fn serve(&self, method: &str, target: &str, body: &[u8], token: &Token) -> Response {
+        let path = target.split('?').next().unwrap_or_default();
+        let (rule, agent) = match access::find(method, path) {
+            Ok(found) => found,
+            Err(reply) => return json(reply),
+        };
+        if let Err(reply) = access::check(token, rule, agent) {
+            eprintln!(
+                "ac-gateway: auth: token {} refused ({}) for {method} {}",
+                token.name,
+                reply.status,
+                shown(path)
+            );
+            return json(reply);
+        }
+        let response = self.dispatch(method, path, target, body, token);
+        if let Some(agent) = agent {
+            self.audit(token, rule, agent, target, body, &response);
+        }
+        response
+    }
+
+    /// One MCP message (ADR-017). A tool call is served as its REST request, by [`Self::serve`].
+    fn mcp(&self, body: &[u8], token: &Token) -> Response {
+        let answer = match mcp::parse(body) {
+            Message::Accepted => return Response::json(StatusCode::from_u16(202), Vec::new()),
+            Message::Initialize(id, asked) => {
+                mcp::initialized(id, mcp::negotiate(asked.as_deref()))
+            }
+            Message::Ping(id) => mcp::empty(id),
+            Message::List(id) => mcp::list(id, |t| {
+                access::find(t.method, t.path)
+                    .is_ok_and(|(rule, _)| access::check(token, rule, None).is_ok())
+            }),
+            Message::Call(id, name, args) => {
+                let Some(tool) = mcp::tool(&name) else {
+                    return rpc(mcp::unknown_tool(id, &name));
+                };
+                match mcp::build(tool, &args) {
+                    Ok(call) => {
+                        let r = self.serve(call.method, &call.target, &call.body, token);
+                        let text = match &r.body {
+                            rusty_serve::Body::Json(b) => String::from_utf8_lossy(b).into_owned(),
+                            _ => "a stream: not available over MCP".to_owned(),
+                        };
+                        mcp::called(id, r.status.as_u16(), &text)
+                    }
+                    Err(e) => mcp::called(id, 400, &error(400, &e).body),
+                }
+            }
+            Message::Error(id, code, message) => {
+                let status = if id.is_null() { 400 } else { 200 };
+                let body = mcp::failed(id, code, &message).into_bytes();
+                return Response::json(StatusCode::from_u16(status), body);
+            }
+        };
+        rpc(answer)
+    }
+
+    fn dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        target: &str,
+        body: &[u8],
+        token: &Token,
+    ) -> Response {
         if path == WHOAMI {
             return json(whoami(token));
         }
-        match self.hub.handle(method, r.target, r.body, &token.name) {
+        if path == mcp::PATH {
+            return self.mcp(body, token);
+        }
+        match self.hub.handle(method, target, body, &token.name) {
             Some(Answer::Json(reply)) => json(reply),
             Some(Answer::Stream(stream)) => Response::stream(
                 "application/x-ndjson",
@@ -166,11 +225,11 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             ),
             Some(Answer::Text(text)) => untrusted(text.into_bytes()),
             None => match jobs::route(method, path) {
-                Some(route) => self.job(route, r),
+                Some(route) => self.job(route, target, body),
                 None => {
                     let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
                     let may_attach = token.scopes.allows(Scope::EgressWrite);
-                    json(api.request(method, r.target, r.body, &token.agents, may_attach))
+                    json(api.request(method, target, body, &token.agents, may_attach))
                 }
             },
         }
@@ -184,21 +243,23 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
         &self,
         token: &Token,
         rule: &Rule,
-        action: &str,
         agent: &str,
-        r: &Request<'_>,
+        target: &str,
+        body: &[u8],
         response: &Response,
     ) {
-        let target = r.target;
+        let Some(action) = rule.audit else {
+            return;
+        };
         let mut line = format!("audit token={} action={action}", token.name);
         let key = match action {
             "create" => Some("egress_profiles"),
             "egress" => Some("profiles"),
             _ => None,
         };
-        let mut profiles = key.map(|k| crate::profiles_in(r.body, k));
+        let mut profiles = key.map(|k| crate::profiles_in(body, k));
         if action == "fork" {
-            if let Ok(f) = crate::Fork::parse(r.body) {
+            if let Ok(f) = crate::Fork::parse(body) {
                 line.push_str(&format!(" to={}", f.to));
                 if let Some(cp) = &f.checkpoint {
                     line.push_str(&format!(" checkpoint={cp}"));
@@ -240,7 +301,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
 
     /// A job route. A submit takes the lifecycle lock around the agent's state check and the
     /// queueing, so a pause cannot slip between them; the others never take it.
-    fn job(&self, route: Result<Route, Reply>, r: &Request<'_>) -> Response {
+    fn job(&self, route: Result<Route, Reply>, target: &str, body: &[u8]) -> Response {
         let Some(jobs) = &self.jobs else {
             return json(error(404, "not found"));
         };
@@ -251,11 +312,11 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
         if let Route::Submit(id) = &route {
             let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
             return json(match api.state(id) {
-                Ok(state) => jobs.submit(id, state, r.body),
+                Ok(state) => jobs.submit(id, state, body),
                 Err(e) => error(500, &e.to_string()),
             });
         }
-        let query = r.target.split_once('?').map_or("", |(_, q)| q);
+        let query = target.split_once('?').map_or("", |(_, q)| q);
         match jobs.handle(route, query) {
             jobs::Answer::Json(reply) => json(reply),
             jobs::Answer::Output(bytes) => untrusted(bytes),
@@ -374,6 +435,18 @@ fn asset(method: &str, path: &str) -> Option<Response> {
             ("X-Content-Type-Options", "nosniff"),
         ],
     ))
+}
+
+/// `MCP-Protocol-Version`, when sent, must be one this gateway serves.
+fn mcp_version_ok(headers: &HeaderMap) -> bool {
+    headers
+        .get("mcp-protocol-version")
+        .is_none_or(|v| mcp::VERSIONS.contains(&v))
+}
+
+/// A JSON-RPC answer.
+fn rpc(body: String) -> Response {
+    Response::json(StatusCode::OK, body.into_bytes())
 }
 
 fn json(reply: Reply) -> Response {

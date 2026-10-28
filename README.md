@@ -18,7 +18,7 @@ calls the agents themselves make.
 - A virtual desktop (Xorg dummy display, Xfce, policy-locked Chromium) the agent can drive.
 - An MCP endpoint (`POST /api/v1/mcp`) whose tools follow the caller's token scopes (ADR-017).
 - A single authenticated WebSocket for watching and taking over the desktop.
-- Persistent workspace volumes, an embedded agent registry and append-only per-agent event history (no database server).
+- Persistent workspace volumes with checkpoints, restore and forks on btrfs, an embedded agent registry and append-only per-agent event history (no database server).
 - Allowlisted egress: agents reach model APIs and Git hosts only, through `ac-egress` (ADR-007).
 
 ## What this is not
@@ -60,7 +60,9 @@ Details: [docs/architecture.md](docs/architecture.md).
    kernel-differs isolation test (runbook Phases 0-3).
 7. Gateway: `ac-gateway` serves `GET /api/v1/agents` (every agent and its state),
    `GET|POST|DELETE /api/v1/agents/{id}` and `POST .../pause|resume`
-   with a scoped bearer token (`ac-gateway token create|list|revoke`, ADR-011). `DELETE` keeps the workspace;
+   with a scoped bearer token (`ac-gateway token create|list|revoke`, ADR-011). On a btrfs data disk,
+   `.../checkpoints`, `.../restore` and `.../fork` checkpoint, restore and fork workspaces (ADR-018;
+   [install.md](docs/install.md#host-services)). `DELETE` keeps the workspace;
    `DELETE ...?purge=true` removes it. Env: `AC_TOKENS` (default `/etc/agent-cloud/tokens`, 0600), `AC_IMAGE`, `AC_BIND` (private addresses
    only; default `127.0.0.1:8780`), `AC_DATA`. The terminal viewer is at `/ui/<agent-id>` (ADR-006; how to open it:
    [docs/install.md, Terminal viewer](docs/install.md#host-services)). Not yet: the agent API (AG-UI) and desktop viewer.

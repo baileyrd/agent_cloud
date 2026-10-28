@@ -12,6 +12,7 @@ pub mod capacity;
 pub mod exec;
 pub mod facts;
 pub mod host;
+pub mod snap;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -109,8 +110,13 @@ pub struct CtrConfig {
     pub namespace: String,
     /// Image every agent boots from.
     pub image: String,
-    /// Parent directory of per-agent workspace volumes.
+    /// Parent directory of per-agent workspace volumes. On btrfs each new one is a subvolume
+    /// (ADR-018).
     pub workspace_root: PathBuf,
+    /// Parent directory of per-agent checkpoint directories (ADR-018), made 0700.
+    pub checkpoint_root: PathBuf,
+    /// Path or name of the `btrfs` binary (btrfs-progs).
+    pub btrfs_bin: String,
     /// Directory (made 0700) for each boot's `--env-file`, which lives only while `ctr run` runs.
     pub env_dir: PathBuf,
     /// Owner (uid, gid) given to each new workspace so the unprivileged agent user can write.
@@ -134,12 +140,17 @@ pub struct CtrConfig {
 pub struct CtrRuntime<S> {
     spawner: S,
     cfg: CtrConfig,
+    disk: snap::Disk,
 }
 
 impl<S: Spawner> CtrRuntime<S> {
     /// Build from a process spawner and configuration.
     pub fn new(spawner: S, cfg: CtrConfig) -> Self {
-        Self { spawner, cfg }
+        Self {
+            spawner,
+            cfg,
+            disk: snap::Disk::LINUX,
+        }
     }
 
     /// The configuration it was built with.
@@ -682,10 +693,7 @@ fn os(args: &[&str]) -> Vec<OsString> {
 impl<S: Spawner> Runtime for CtrRuntime<S> {
     fn create(&self, id: &AgentId, boot: &Boot) -> Result<(), PortError> {
         let dir = self.workspace(id);
-        std::fs::create_dir_all(&dir).map_err(|e| PortError {
-            op: "create",
-            cause: format!("mkdir {}: {e}", dir.display()),
-        })?;
+        self.make_volume("create", &dir)?;
         if let Some((uid, gid)) = self.cfg.workspace_owner {
             std::os::unix::fs::chown(&dir, Some(uid), Some(gid)).map_err(|e| PortError {
                 op: "create",
@@ -716,7 +724,7 @@ impl<S: Spawner> Runtime for CtrRuntime<S> {
         // Already gone counts as done, so destroy can be retried after a crash or reboot.
         self.stop("destroy", id)?;
         if purge {
-            remove_dir_if_present("destroy", &self.workspace(id))?;
+            self.remove_volume("destroy", &self.workspace(id))?;
         }
         Ok(())
     }
@@ -810,6 +818,8 @@ mod tests {
             namespace: "agents".into(),
             image: "agent:latest".into(),
             workspace_root: root.to_path_buf(),
+            checkpoint_root: root.join("checkpoints"),
+            btrfs_bin: "btrfs".into(),
             env_dir: root.join("boot"),
             workspace_owner: None,
             network: None,

@@ -97,6 +97,8 @@
   with a1 running and with a1's VM killed). A reboot is still to test.
 - [x] MCP interface on the gateway (`POST /api/v1/mcp`), one tool per route, listed by the token's scopes
   (ADR-017); to try with a real MCP client on BaileyServ
+- [ ] Workspace checkpoints, restore and forks on btrfs subvolumes, through the gateway and `ac-ctl` (ADR-018;
+  tested on a loopback btrfs 2026-10-28; still to run on BaileyServ with live VMs)
 
 ## Later
 - Local model option for an offline posture

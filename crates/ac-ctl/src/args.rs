@@ -3,18 +3,30 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use ac_domain::checkpoint::LabelError;
 use ac_domain::tune::Profile;
-use ac_domain::{AgentId, IdError};
+use ac_domain::{AgentId, CheckpointId, IdError, Label};
 
 /// Usage text.
 pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces DIR] [--ctr PATH] \
 [--namespace NS] [--uid N] [--network] [--purge] <create|pause|resume|destroy|status> <agent-id>
        ac-ctl --image IMAGE [...] [--network] reconcile
+       ac-ctl --image IMAGE [...] checkpoints <agent-id>
+       ac-ctl --image IMAGE [...] [--label TEXT] checkpoint <agent-id>
+       ac-ctl --image IMAGE [...] delete-checkpoint <agent-id> <checkpoint>
+       ac-ctl --image IMAGE [...] restore <agent-id> <checkpoint>
+       ac-ctl --image IMAGE [...] [--network] [--from CHECKPOINT] fork <agent-id> <new-agent-id>
+       ac-ctl --image IMAGE [...] workspace migrate <agent-id>
        ac-ctl doctor [--profile idle|build|heavy] [--json] [--facts-file F] [--root DIR] [--explain]
        ac-ctl tune [--profile idle|build|heavy] [--facts-file F] [--root DIR] [--apply [--force] \
 [--restart-gateway]]
   destroy keeps the agent's workspace; destroy --purge removes it (also after a plain destroy).
   reconcile marks agents recorded running but with no VM (after a reboot) paused, for resume.
+  Checkpoints (ADR-018; workspaces must be btrfs subvolumes): checkpoint snapshots a running or
+    paused agent's workspace read-only (AC_CHECKPOINT_MAX, default 8, per agent); restore (paused
+    agents only) puts one back and keeps the workspace it replaces as a new checkpoint; fork
+    creates and boots a new agent on a copy of the workspace, or of checkpoint --from. workspace
+    migrate turns a paused agent's plain-directory workspace into a subvolume.
   doctor compares this host's settings with what its facts recommend for the profile (ADR-014):
     read-only; exit 0 all ok, 1 warnings, 4 errors. --facts-file plans a host from a JSON file of
     facts (deploy/hosts/) instead of this one; --explain lists every rule and its evidence.
@@ -91,6 +103,32 @@ pub enum Job {
     Agent(Action, AgentId),
     /// Bring the registry in line with containerd.
     Reconcile,
+    /// A workspace checkpoint, restore, fork or migration (ADR-018).
+    Snap(Snap),
+}
+
+/// A workspace operation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Snap {
+    /// List the agent's checkpoints.
+    List(AgentId),
+    /// Make a checkpoint.
+    Take(AgentId, Option<Label>),
+    /// Delete a checkpoint.
+    Delete(AgentId, CheckpointId),
+    /// Put a checkpoint back.
+    Restore(AgentId, CheckpointId),
+    /// Create agent `to` on a copy of `from`'s workspace, or of its checkpoint.
+    Fork {
+        /// The source agent.
+        from: AgentId,
+        /// The new agent.
+        to: AgentId,
+        /// The checkpoint to copy; `None`: the workspace now.
+        checkpoint: Option<CheckpointId>,
+    },
+    /// Turn a plain-directory workspace into a subvolume.
+    Migrate(AgentId),
 }
 
 /// Parsed command line.
@@ -139,6 +177,10 @@ pub enum ArgError {
     Needs(&'static str, &'static str),
     /// Two flags that exclude each other.
     Conflict(&'static str, &'static str),
+    /// A flag given with an action it does not apply to.
+    OnlyWith(&'static str, &'static str),
+    /// Checkpoint label rejected.
+    BadLabel(LabelError),
 }
 
 impl fmt::Display for ArgError {
@@ -155,6 +197,8 @@ impl fmt::Display for ArgError {
             Self::BadProfile(p) => write!(f, "--profile must be idle, build or heavy, not {p}"),
             Self::Needs(a, b) => write!(f, "{a} needs {b}"),
             Self::Conflict(a, b) => write!(f, "{a} and {b} exclude each other"),
+            Self::OnlyWith(flag, action) => write!(f, "{flag} only applies to {action}"),
+            Self::BadLabel(e) => e.fmt(f),
         }
     }
 }
@@ -262,6 +306,7 @@ fn fleet(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
     let (mut data, mut workspaces) = (PathBuf::from("/var/lib/agent-cloud"), None::<PathBuf>);
     let (mut ctr, mut namespace, mut image) = ("ctr".to_owned(), "agents".to_owned(), None);
     let (mut uid, mut network, mut purge) = (1000u32, false, false);
+    let (mut label, mut from) = (None::<String>, None::<String>);
     let mut positional = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -282,6 +327,8 @@ fn fleet(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
             }
             "--network" => network = true,
             "--purge" => purge = true,
+            "--label" => label = Some(value()?),
+            "--from" => from = Some(value()?),
             _ => return Err(ArgError::UnknownFlag(arg)),
         }
     }
@@ -289,6 +336,8 @@ fn fleet(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
     let word = pos.next().ok_or(ArgError::Missing("action"))?;
     let job = if word == "reconcile" {
         Job::Reconcile
+    } else if let Some(op) = snap(&word, &mut pos, &mut label, &mut from)? {
+        Job::Snap(op)
     } else {
         let action = match action(&word)? {
             Action::Destroy { .. } => Action::Destroy { purge },
@@ -300,6 +349,12 @@ fn fleet(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
     };
     if purge && !matches!(job, Job::Agent(Action::Destroy { .. }, _)) {
         return Err(ArgError::PurgeWithout(word));
+    }
+    if label.is_some() {
+        return Err(ArgError::OnlyWith("--label", "checkpoint"));
+    }
+    if from.is_some() {
+        return Err(ArgError::OnlyWith("--from", "fork"));
     }
     if let Some(extra) = pos.next() {
         return Err(ArgError::Extra(extra));
@@ -314,6 +369,56 @@ fn fleet(args: impl IntoIterator<Item = String>) -> Result<Cli, ArgError> {
         network,
         job,
     })
+}
+
+fn agent_arg(
+    pos: &mut impl Iterator<Item = String>,
+    what: &'static str,
+) -> Result<AgentId, ArgError> {
+    AgentId::parse(&pos.next().ok_or(ArgError::Missing(what))?).map_err(ArgError::BadId)
+}
+
+fn checkpoint_arg(s: &str) -> Result<CheckpointId, ArgError> {
+    CheckpointId::parse(s).map_err(ArgError::BadId)
+}
+
+/// A workspace operation's words after `word`, taking `--label` and `--from` where they apply
+/// (what is left, the caller refuses). `None` if `word` names no such operation.
+fn snap(
+    word: &str,
+    pos: &mut impl Iterator<Item = String>,
+    label: &mut Option<String>,
+    from: &mut Option<String>,
+) -> Result<Option<Snap>, ArgError> {
+    Ok(Some(match word {
+        "checkpoints" => Snap::List(agent_arg(pos, "agent id")?),
+        "checkpoint" => {
+            let label = label.take().map(|l| Label::parse(&l)).transpose();
+            Snap::Take(
+                agent_arg(pos, "agent id")?,
+                label.map_err(ArgError::BadLabel)?,
+            )
+        }
+        "delete-checkpoint" | "restore" => {
+            let id = agent_arg(pos, "agent id")?;
+            let cp = checkpoint_arg(&pos.next().ok_or(ArgError::Missing("checkpoint"))?)?;
+            match word {
+                "restore" => Snap::Restore(id, cp),
+                _ => Snap::Delete(id, cp),
+            }
+        }
+        "fork" => Snap::Fork {
+            from: agent_arg(pos, "agent id")?,
+            to: agent_arg(pos, "new agent id")?,
+            checkpoint: from.take().map(|c| checkpoint_arg(&c)).transpose()?,
+        },
+        "workspace" => match pos.next().as_deref() {
+            Some("migrate") => Snap::Migrate(agent_arg(pos, "agent id")?),
+            Some(other) => return Err(ArgError::UnknownAction(format!("workspace {other}"))),
+            None => return Err(ArgError::Missing("workspace action (migrate)")),
+        },
+        _ => return Ok(None),
+    }))
 }
 
 #[cfg(test)]
@@ -432,6 +537,8 @@ mod tests {
             "--purge",
             "--network",
             "--uid",
+            "--label",
+            "--from",
         ] {
             assert!(USAGE.contains(flag), "{flag}");
         }
@@ -526,5 +633,82 @@ mod tests {
         ));
         assert!(matches!(p("--bogus x"), Err(ArgError::UnknownFlag(_))));
         assert!(matches!(p("--image"), Err(ArgError::MissingValue(_))));
+    }
+
+    fn snap_of(s: &str) -> Result<Snap, ArgError> {
+        match p(s)?.job {
+            Job::Snap(op) => Ok(op),
+            other => panic!("{s}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_operations() {
+        let a = |s: &str| AgentId::parse(s).unwrap_or_else(|e| panic!("{e}"));
+        let c = |s: &str| CheckpointId::parse(s).unwrap_or_else(|e| panic!("{e}"));
+        let ok = |s: &str| snap_of(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        assert_eq!(ok("--image i checkpoints a1"), Snap::List(a("a1")));
+        assert_eq!(ok("--image i checkpoint a1"), Snap::Take(a("a1"), None));
+        let labelled = parse(
+            [
+                "--image",
+                "i",
+                "--label",
+                "before refactor",
+                "checkpoint",
+                "a1",
+            ]
+            .map(str::to_owned),
+        );
+        let Ok(Command::Fleet(cli)) = labelled else {
+            panic!("{labelled:?}")
+        };
+        let label = Label::parse("before refactor").ok();
+        assert!(matches!(cli.job, Job::Snap(Snap::Take(_, l)) if l == label));
+        assert_eq!(
+            ok("--image i restore a1 20261028-130512"),
+            Snap::Restore(a("a1"), c("20261028-130512"))
+        );
+        assert_eq!(
+            ok("--image i delete-checkpoint a1 x1"),
+            Snap::Delete(a("a1"), c("x1"))
+        );
+        assert_eq!(
+            ok("--image i --from x1 fork a1 b1"),
+            Snap::Fork {
+                from: a("a1"),
+                to: a("b1"),
+                checkpoint: Some(c("x1"))
+            }
+        );
+        assert_eq!(ok("--image i workspace migrate a1"), Snap::Migrate(a("a1")));
+        for (bad, want) in [
+            (
+                "--image i --label x restore a1 c1",
+                "--label only applies to checkpoint",
+            ),
+            (
+                "--image i --from c1 checkpoint a1",
+                "--from only applies to fork",
+            ),
+            (
+                "--image i --label x status a1",
+                "--label only applies to checkpoint",
+            ),
+            ("--image i restore a1", "missing checkpoint"),
+            ("--image i restore a1 ../x", "id must match"),
+            ("--image i fork a1", "missing new agent id"),
+            ("--image i workspace", "missing workspace action (migrate)"),
+            (
+                "--image i workspace grow a1",
+                "unknown action workspace grow",
+            ),
+            ("--image i checkpoint a1 extra", "unexpected argument extra"),
+        ] {
+            let got = p(bad)
+                .map(|c| format!("{:?}", c.job))
+                .unwrap_or_else(|e| e.to_string());
+            assert!(got.contains(want), "{bad}: {got}");
+        }
     }
 }

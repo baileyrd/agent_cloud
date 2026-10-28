@@ -13,6 +13,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 | An agent claims another agent's wider egress | Profiles follow a per-boot proxy credential, not the source IP; only its SHA-256 is stored, a wrong or unknown one gets 407 (never the base list), and it changes on every create and resume (ADR-016) |
 | An agent's proxy credential leaks | It grants only that agent's profiles, from any agent VM, until its next pause or resume; it is never on a host command line, only in the VM's environment and containerd's root-only record (ADR-016) |
 | A token widens egress | `egress:write` attaches profiles root installed on the host; no API call defines hosts. Every change is audited (ADR-016) |
+| A fork leaks the source agent's secrets | A fork copies the workspace, so it holds the source's Claude Code login and Git credentials; forking needs `agents:write` for both agents. Egress profiles are not copied (ADR-018) |
+| Checkpoints keep data an agent deleted | Read-only snapshots in root-only `checkpoints/<agent>/` (0700), never mounted into a VM; capped per agent and deleted by purge (ADR-018) |
 | Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
 | Agent attacks the viewer's browser | Only sanitised text and SGR colours reach the page; strict CSP; see [Viewer](#viewer) |

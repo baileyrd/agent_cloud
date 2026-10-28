@@ -10,7 +10,7 @@
 //!
 //! Sans-IO: parsing and rendering here, serving in [`crate::web`].
 
-use ac_domain::{AgentId, JobId};
+use ac_domain::{AgentId, CheckpointId, JobId};
 use rusty_json::Value;
 
 /// The MCP endpoint.
@@ -26,6 +26,8 @@ pub enum Kind {
     Agent,
     /// A job id: the path's `{job}`.
     Job,
+    /// A checkpoint id: the path's `{cp}`.
+    Checkpoint,
     /// Free text, for the body.
     Text,
     /// A lowercase word, for the query (`part=stream`).
@@ -98,6 +100,13 @@ const FORCE: Arg = arg(
     Kind::Bool,
     false,
     "Interrupt the agent's queued or running job first; without it the call is refused while one exists.",
+);
+
+const CHECKPOINT: Arg = arg(
+    "checkpoint_id",
+    Kind::Checkpoint,
+    true,
+    "The checkpoint's id, as list_checkpoints shows it.",
 );
 
 /// Every tool, in `tools/list` order.
@@ -294,6 +303,62 @@ pub const TOOLS: &[Tool] = &[
             arg("limit", Kind::Count, false, "Most records to return."),
         ],
     },
+    Tool {
+        name: "list_checkpoints",
+        about: "An agent's workspace checkpoints, oldest first, and how many it may keep.",
+        method: "GET",
+        path: "/api/v1/agents/{id}/checkpoints",
+        send: Send::Query,
+        args: &[AGENT],
+    },
+    Tool {
+        name: "create_checkpoint",
+        about: "Checkpoint a running or paused agent's workspace; refused when the agent has as many as it may keep.",
+        method: "POST",
+        path: "/api/v1/agents/{id}/checkpoints",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg("label", Kind::Text, false, "A note to keep with it, 1-80 characters."),
+        ],
+    },
+    Tool {
+        name: "delete_checkpoint",
+        about: "Delete one of an agent's checkpoints.",
+        method: "DELETE",
+        path: "/api/v1/agents/{id}/checkpoints/{cp}",
+        send: Send::Query,
+        args: &[AGENT, CHECKPOINT],
+    },
+    Tool {
+        name: "restore_checkpoint",
+        about: "Put a checkpoint back as a paused agent's workspace; what it replaces is kept as a new checkpoint.",
+        method: "POST",
+        path: "/api/v1/agents/{id}/restore",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg("checkpoint", Kind::Text, true, "The checkpoint's id, as list_checkpoints shows it."),
+        ],
+    },
+    Tool {
+        name: "fork_agent",
+        about: "Create a new agent on a copy of this agent's workspace, now or at a checkpoint. The token needs both agents.",
+        method: "POST",
+        path: "/api/v1/agents/{id}/fork",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg("id", Kind::Text, true, "The new agent's id."),
+            arg("checkpoint", Kind::Text, false, "The checkpoint to fork from; without it, the workspace as it is now."),
+            arg(
+                "egress_profiles",
+                Kind::Names,
+                false,
+                "Egress profiles to attach to the new agent; needs egress:write.",
+            ),
+        ],
+    },
 ];
 
 /// A JSON-RPC request id: a string or a number, echoed as given.
@@ -436,6 +501,7 @@ pub fn build(tool: &Tool, args: &Value) -> Result<Call, String> {
         match (a.kind, tool.send) {
             (Kind::Agent, _) => path = path.replace("{id}", &text),
             (Kind::Job, _) => path = path.replace("{job}", &text),
+            (Kind::Checkpoint, _) => path = path.replace("{cp}", &text),
             (_, Send::Query) => query.push(format!("{}={text}", a.name)),
             (_, Send::Body) => {
                 body.insert(a.name, v.clone());
@@ -474,6 +540,12 @@ fn check(a: &Arg, v: &Value) -> Result<String, String> {
                 .map(|id| id.to_string())
                 .map_err(|e| format!("{}: {e}", a.name))
         }
+        Kind::Checkpoint => {
+            let s = v.as_str().ok_or_else(|| want("a string"))?;
+            CheckpointId::parse(s)
+                .map(|id| id.to_string())
+                .map_err(|e| format!("{}: {e}", a.name))
+        }
         Kind::Text => v
             .as_str()
             .map(str::to_owned)
@@ -506,7 +578,9 @@ fn listed(tool: &Tool) -> Value {
     for a in tool.args {
         let mut p = Value::object();
         match a.kind {
-            Kind::Agent | Kind::Job | Kind::Text | Kind::Word => p.insert("type", "string"),
+            Kind::Agent | Kind::Job | Kind::Checkpoint | Kind::Text | Kind::Word => {
+                p.insert("type", "string")
+            }
             Kind::Bool => p.insert("type", "boolean"),
             Kind::Count => p.insert("type", "integer").insert("minimum", 0),
             Kind::Names => {
@@ -642,7 +716,7 @@ mod tests {
             let ids = t
                 .args
                 .iter()
-                .filter(|a| matches!(a.kind, Kind::Agent | Kind::Job));
+                .filter(|a| matches!(a.kind, Kind::Agent | Kind::Job | Kind::Checkpoint));
             let holes = t.path.matches('{').count();
             assert_eq!(
                 ids.count(),
@@ -651,6 +725,37 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_tools_fill_the_cp_placeholder_and_the_body() {
+        assert_eq!(
+            call(
+                "delete_checkpoint",
+                r#"{"agent_id":"a1","checkpoint_id":"20261028-120000-2"}"#
+            )
+            .map(|c| (c.method, c.target)),
+            Ok((
+                "DELETE",
+                "/api/v1/agents/a1/checkpoints/20261028-120000-2".into()
+            ))
+        );
+        assert!(call(
+            "delete_checkpoint",
+            r#"{"agent_id":"a1","checkpoint_id":"../x"}"#
+        )
+        .is_err_and(|e| e.starts_with("checkpoint_id")));
+        let fork = call(
+            "fork_agent",
+            r#"{"agent_id":"a1","id":"b1","egress_profiles":["pypi"]}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fork.target, "/api/v1/agents/a1/fork");
+        let body = Value::parse(std::str::from_utf8(&fork.body).unwrap_or_default());
+        assert_eq!(
+            body.ok().and_then(|b| b.get("id").cloned()),
+            Some(Value::from("b1"))
+        );
     }
 
     #[test]

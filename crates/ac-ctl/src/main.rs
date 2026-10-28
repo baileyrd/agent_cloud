@@ -28,7 +28,7 @@ use ac_domain::tune::{recommend, HostFacts};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::PortError;
 use ac_store::EngineStore;
-use args::{Action, Cli, Command, Doctor, Job, Tune, USAGE};
+use args::{Action, Cli, Command, Doctor, Job, Snap, Tune, USAGE};
 use platform_linux::LinuxSpawner;
 
 /// Exit code when another process holds the data directory.
@@ -68,6 +68,8 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         namespace: cli.namespace.clone(),
         image: cli.image.clone(),
         workspace_root: cli.workspaces.clone(),
+        checkpoint_root: cli.data.join("checkpoints"),
+        btrfs_bin: std::env::var("AC_BTRFS").unwrap_or_else(|_| "btrfs".to_owned()),
         env_dir: cli.data.join("boot"),
         workspace_owner: Some((cli.uid, cli.uid)),
         network,
@@ -85,13 +87,22 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
     });
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
+    let max = match std::env::var("AC_CHECKPOINT_MAX") {
+        Ok(v) => v
+            .parse::<usize>()
+            .map_err(|e| format!("AC_CHECKPOINT_MAX={v}: {e}"))?,
+        Err(_) => 8,
+    };
+    let snapshots = std::sync::Arc::new(CtrRuntime::new(LinuxSpawner, cfg.clone()));
     let fleet = Fleet::new(
         CtrRuntime::new(LinuxSpawner, cfg),
         EngineStore::open(&cli.data)?,
     )
-    .with_admission(Box::new(capacity), margin);
+    .with_admission(Box::new(capacity), margin)
+    .with_snapshots(snapshots, max.max(1));
     let (action, id) = match &cli.job {
         Job::Agent(action, id) => (*action, id),
+        Job::Snap(op) => return Ok(snap(&fleet, op)?),
         Job::Reconcile => {
             let changed = fleet.reconcile()?;
             if changed.is_empty() {
@@ -111,6 +122,48 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             .ok_or_else(|| FleetError::NotFound(id.clone()))?,
     };
     Ok(format!("{id} {state:?}").to_lowercase())
+}
+
+/// Run a workspace operation; the line(s) to print.
+fn snap<R: ac_ports::Runtime, S: ac_ports::SessionStore>(
+    fleet: &Fleet<R, S>,
+    op: &Snap,
+) -> Result<String, FleetError> {
+    Ok(match op {
+        Snap::List(id) => {
+            let (all, max) = fleet.checkpoints(id)?;
+            let mut lines: Vec<String> = all
+                .iter()
+                .map(|c| match &c.label {
+                    Some(l) => format!("{} {}", c.id, l.as_str()),
+                    None => c.id.to_string(),
+                })
+                .collect();
+            lines.push(format!("{} of at most {max} checkpoints", all.len()));
+            lines.join("\n")
+        }
+        Snap::Take(id, label) => fleet.checkpoint(id, label.as_ref())?.to_string(),
+        Snap::Delete(id, cp) => {
+            fleet.delete_checkpoint(id, cp)?;
+            format!("{id} deleted {cp}")
+        }
+        Snap::Restore(id, cp) => {
+            let kept = fleet.restore(id, cp)?;
+            format!("{id} restored {cp}; the workspace it replaced is checkpoint {kept}")
+        }
+        Snap::Fork {
+            from,
+            to,
+            checkpoint,
+        } => {
+            let state = fleet.fork(from, checkpoint.as_ref(), to, None)?;
+            format!("{to} {state:?}").to_lowercase()
+        }
+        Snap::Migrate(id) => {
+            fleet.migrate(id)?;
+            format!("{id} migrated: its workspace is a subvolume")
+        }
+    })
 }
 
 /// Kata's configuration: `AC_KATA_CONFIG`, else the installed one.

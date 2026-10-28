@@ -494,6 +494,34 @@ otherwise); pause and destroy refuse an agent with a job (409) unless `?force=tr
 lives in `/var/lib/agent-cloud/jobs.mmap`; prompts and collected output in `/var/lib/agent-cloud/jobs/<agent>/`
 (root, 0700); state changes appear in `GET .../history` as `job <id> <state>`.
 
+**Checkpoints and forks** (ADR-018): needs the data directory on btrfs and `btrfs-progs` (`dnf install
+btrfs-progs`; Fedora Workstation has it). New workspaces are then subvolumes. The gateway logs one line at
+startup: `checkpoints: on`, `off` (not btrfs), or the workspaces still to migrate. Migrate each one once, with
+the agent paused and the gateway stopped (`ac-ctl` needs the data directory):
+
+```bash
+sudo systemctl stop ac-gateway
+sudo ac-ctl --image "$AC_IMAGE" workspace migrate a1   # a1 must be paused
+sudo systemctl start ac-gateway
+```
+
+Then, with a token that has `agents:write` (and `agents:read` to list):
+
+```bash
+A=http://$AC_BIND/api/v1/agents/a1
+H | curl -sS -H @- -d '{"label":"before refactor"}' $A/checkpoints   # {"id":"20261028-130512","label":...} 201
+H | curl -sS -H @- $A/checkpoints                                     # {"id":"a1","max":8,"checkpoints":[...]}
+H | curl -sS -H @- -X POST $A/pause
+H | curl -sS -H @- -d '{"checkpoint":"20261028-130512"}' $A/restore   # {"restored":...,"kept":...}
+H | curl -sS -H @- -d '{"id":"a2","checkpoint":"20261028-130512"}' $A/fork   # a2, running, 201
+H | curl -sS -H @- -X DELETE $A/checkpoints/20261028-130512
+```
+
+A restore keeps the workspace it replaced as a new checkpoint (`kept`), so restoring that undoes it. Each agent
+keeps at most `AC_CHECKPOINT_MAX` (default 8) checkpoints, a restore's included; at the cap, delete one first.
+Checkpoints live in `/var/lib/agent-cloud/checkpoints/<agent>/` (root, 0700) and are deleted by purge. To check
+the btrfs side on a new host: `sudo scripts/btrfs-checkpoint-test.sh` (a loopback btrfs, removed after).
+
 **Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the
 allowlist's owner and mode, and that the gateway and proxy listen only on private addresses. It checks that

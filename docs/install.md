@@ -520,7 +520,10 @@ H | curl -sS -H @- -X DELETE $A/checkpoints/20261028-130512
 A restore keeps the workspace it replaced as a new checkpoint (`kept`), so restoring that undoes it. Each agent
 keeps at most `AC_CHECKPOINT_MAX` (default 8) checkpoints, a restore's included; at the cap, delete one first.
 Checkpoints live in `/var/lib/agent-cloud/checkpoints/<agent>/` (root, 0700) and are deleted by purge. To check
-the btrfs side on a new host: `sudo scripts/btrfs-checkpoint-test.sh` (a loopback btrfs, removed after).
+the btrfs side on a new host: `sudo scripts/btrfs-checkpoint-test.sh` (a loopback btrfs, removed after). Verified
+on BaileyServ (2026-10-28): with a job in a1 writing a line and a 4 KiB file each second, a checkpoint took 0.6 s
+and the job kept writing; a fork from it booted in 4.8 s and read back 25 lines and 25 whole files inside its VM;
+restore (0.7 s) and the restore of what it kept both read back correctly inside a1 after resume.
 
 **Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the

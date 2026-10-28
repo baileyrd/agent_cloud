@@ -703,7 +703,8 @@ not reach. Adding it to the base list would open a code-delivery channel to ever
 MAC or IP; profiles editable through the API.
 
 ## ADR-017: An MCP interface on the gateway, split by token scope
-**Status:** accepted (2026-10-28; tested over loopback, not yet against a live MCP client on BaileyServ).
+**Status:** accepted (2026-10-28; verified on BaileyServ the same day with Claude Code 2.1.312 added by
+`claude mcp add`: 21 of 22 tools listed for a token without `egress:write`, checkpoint tools and a 409 passed through).
 **Context:** An MCP client (Claude Code, claude.ai connectors, another agent) could only drive the gateway through
 hand-written REST calls. The Ephemeral Sandbox comparison (2026-10-27) found its per-capability MCP tool sets the
 idea worth borrowing; ADR-011's scopes already split what a caller may do.
@@ -737,7 +738,8 @@ up to 30 s, under the same waiter cap as REST.
 notifications; OAuth (claude.ai custom connectors can send the bearer token as a request header).
 
 ## ADR-018: Workspace checkpoints and forks on btrfs subvolumes
-**Status:** accepted (2026-10-28; built and tested on a loopback btrfs, not yet on BaileyServ or with a live VM).
+**Status:** accepted (2026-10-28; verified on BaileyServ the same day with live VMs: a1 migrated, a checkpoint taken
+while a job wrote a file a second, a fork booted from it, restore and its undo, each read back inside the VM).
 **Context:** An agent that breaks its workspace (a bad refactor, a deleted directory) can only be fixed by hand,
 and trying two approaches from one starting point means copying a workspace by hand. LayerFS-style branching
 filesystems were considered and rejected: FUSE on top of virtiofs, a non-durable store and a very large

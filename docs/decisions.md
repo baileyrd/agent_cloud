@@ -305,6 +305,8 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
   | `GET /api/v1/egress/profiles`, `GET .../{id}/egress` (ADR-016) | `agents:read` |
   | `PUT .../{id}/egress` (set its profiles; also `egress_profiles` on create) | `egress:write` |
+  | `GET .../{id}/checkpoints` (ADR-018) | `agents:read` |
+  | `POST .../{id}/checkpoints`, `DELETE .../checkpoints/{cp}`, `POST .../{id}/restore`, `.../fork` (the token must also be for the fork's new agent) | `agents:write` |
 
 - *Agents:* a token restricted to some agents gets 404 for any other agent id, existing or not, before its scope
   is looked at, so it cannot probe for ids. (A wrong method is still 405; that depends on the path's shape only.)
@@ -316,8 +318,8 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   refused for that. rusty_serve does not give handlers the peer address, so the count is per gateway, not per
   source address; the limiter keys by source (bounded to 1024) and gets the address once rusty_serve passes it.
 - *Audit:* every state-changing call that passed the checks (create, pause, resume, destroy, job submit and
-  cancel, take-over, release, egress) writes `audit token=<name> action=<action> [force=true] [purge=true] [job=<id>]
-  status=<code>` to the agent's `ac-history` log (shown by `GET .../history`) and the same line with
+  cancel, take-over, release, egress, checkpoint, restore, fork; ADR-018) writes `audit token=<name> action=<action>
+  [force=true] [purge=true] [job=<id>] status=<code>` to the agent's `ac-history` log (shown by `GET .../history`) and the same line with
   `agent=<id>` to the gateway's journal. Viewer input is not audited per call: it comes from the viewer whose
   take-over was. No prompt, body or terminal content.
 - *Viewer page:* asks `whoami` after the token is entered, shows the token's name and scopes, and hides
@@ -698,3 +700,74 @@ not reach. Adding it to the base list would open a code-delivery channel to ever
 
 **Not now:** per-profile ports (443 and 80 as the base list); per-agent base lists; binding a credential to a VM's
 MAC or IP; profiles editable through the API.
+
+## ADR-018: Workspace checkpoints and forks on btrfs subvolumes
+**Status:** accepted (2026-10-28; built and tested on a loopback btrfs, not yet on BaileyServ or with a live VM).
+**Context:** An agent that breaks its workspace (a bad refactor, a deleted directory) can only be fixed by hand,
+and trying two approaches from one starting point means copying a workspace by hand. LayerFS-style branching
+filesystems were considered and rejected: FUSE on top of virtiofs, a non-durable store and a very large
+dependency, for a single host with few long-lived workspaces. BaileyServ's data disk is already btrfs.
+
+**Decision.**
+- *Volumes:* on a btrfs workspace root, every new workspace is a subvolume (`btrfs subvolume create`). The path
+  `<data>/workspaces/<id>` and the bind mount do not change. Elsewhere workspaces stay plain directories and the
+  routes below answer 409. A subvolume is recognised by statfs(2) (`BTRFS_SUPER_MAGIC`) and its root's inode
+  number (256); nothing is spawned to tell.
+- *Checkpoint:* `btrfs subvolume snapshot -r` of the workspace to `<data>/checkpoints/<id>/<checkpoint>` (both
+  directories 0700). The id is the UTC time, `YYYYMMDD-HHMMSS`, with `-2`, `-3` for the same second, so ids sort
+  by age. An optional label (1 to 80 characters, no control characters) is kept beside the snapshot as
+  `<checkpoint>.label`, never inside it. The filesystem is the record: no registry rows, so nothing can drift.
+  Running or paused agents; at most `AC_CHECKPOINT_MAX` (default 8) per agent, then 409 until one is deleted.
+- *Restore:* paused agents only (a running VM's bind mount would keep the old subvolume), and no job. It first
+  checkpoints the current workspace (labelled `before restore of <checkpoint>`, so it needs room under the cap),
+  then snapshots the checkpoint to `<id>.restore`, renames the workspace to `<id>.old`, renames `<id>.restore`
+  into place and deletes `<id>.old`. Every restore can be undone by restoring what it kept. A swap cut short by
+  a crash is finished or undone by the next restore or migrate of that agent.
+- *Fork:* a writable snapshot of a running, paused or destroyed agent's workspace, or of one of its
+  checkpoints, becomes the workspace of a new agent, which then boots through the create path (admission, a new
+  proxy credential, its own network). Nothing else is inherited: egress profiles are attached explicitly
+  (`egress_profiles`, needing `egress:write`), and no jobs come along. The new id must have no workspace and no
+  running or paused VM.
+- *Migrate:* `ac-ctl workspace migrate <id>` (paused or destroyed agents) turns a plain-directory workspace
+  into a subvolume: `btrfs subvolume create <id>.migrate`, `cp -a --reflink=auto <id>/. <id>.migrate/`
+  (reflinked on btrfs, so it costs metadata only), then the same rename swap. It is the one step that walks the
+  agent-controlled tree as root, once, with the VM stopped; `cp -a` copies symlinks as links. The gateway logs
+  at startup which workspaces are still plain directories.
+- *Purge* deletes the agent's checkpoints and its workspace with `btrfs subvolume delete` (read-only snapshots
+  cannot be removed with `rm`).
+- *API:*
+  - `GET .../{id}/checkpoints` (`agents:read`): `{"id","max","checkpoints":[{"id","label"?}]}`, oldest first.
+  - `POST .../{id}/checkpoints` (`agents:write`), body `{"label"?}`: 201 `{"id","label"?}`.
+  - `DELETE .../{id}/checkpoints/{cp}` (`agents:write`).
+  - `POST .../{id}/restore` (`agents:write`), body `{"checkpoint"}`: `{"id","restored","kept"}`.
+  - `POST .../{id}/fork` (`agents:write`), body `{"id","checkpoint"?,"egress_profiles"?}`: 201 and the new
+    agent. The token must be for the new agent too (404 otherwise, as for any other agent).
+  Refusals (wrong state, plain directory, cap, taken id) are 409 and change nothing; an unknown checkpoint is
+  404. Audited as `checkpoint`, `checkpoint-delete` (`checkpoint=<id>`), `restore` and `fork` (`to=<id>`,
+  `checkpoint=<id>`, `profiles=`).
+- *ac-ctl:* `checkpoints`, `checkpoint [--label TEXT]`, `delete-checkpoint`, `restore`, `fork [--from CP]` and
+  `workspace migrate`, with the same rules. A fork from `ac-ctl` attaches no profiles.
+- *Code:* the rules are pure (`ac_domain::checkpoint`: ids, labels, which states and volumes allow which
+  operation, the cap). The `Snapshots` port is separate from `Runtime` (volumes, not VMs); `ac_ctr::snap`
+  implements it with `btrfs` through the same spawner and timeout as `ctr` (`AC_BTRFS` names the binary).
+
+**Evidence (2026-10-28).** `scripts/btrfs-checkpoint-test.sh` on a 256 MiB loopback btrfs (kernel 6.18,
+btrfs-progs 6.6.3, as root): workspace created as a subvolume, a checkpoint refused a write (read-only),
+restore brought the old file back and kept the replaced one, a fork from that checkpoint held its contents, a
+plain directory migrated with its contents, and purge left nothing behind. The unit tests run the same steps
+against a stand-in `btrfs`, including crash recovery of a half-done swap.
+
+**Consequences:**
+- A checkpoint of a running agent is crash-consistent: what the guest had written through virtiofs at that
+  instant, as if the power went. Kata's virtiofs does not enable writeback caching by default, so writes reach
+  the host on `write()` **[unverified on BaileyServ]**. Pause first for a clean point.
+- A fork copies the source's Claude Code login and Git credentials, since they live in the workspace.
+- Checkpoints keep deleted and rewritten data on disk; the cap bounds how much. btrfs qgroups stay off (they
+  slow down with many snapshots), so a per-agent disk quota is still open.
+- *Rollback:* an older gateway treats subvolumes as directories, so create, pause, resume and destroy keep
+  working. Its purge of a workspace still works as root (`rmdir` of an emptied subvolume), but it does not
+  delete checkpoints: remove `<data>/checkpoints/<id>/*` with `btrfs subvolume delete`.
+
+**Not now:** checkpoints before each job (an opt-in on the job body, with its own rotating cap); sizes in the
+list (`btrfs filesystem du` is slow on a rotational disk); an XFS reflink backend (no host needs one); memory
+snapshots (the roadmap's separate item).

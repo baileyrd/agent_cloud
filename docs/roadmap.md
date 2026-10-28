@@ -96,9 +96,9 @@
   status (`reconcile done` or `failed`); verified 2026-10-24 (restart then curl with no sleep, gateway SIGKILL
   with a1 running and with a1's VM killed). A reboot is still to test.
 - [x] MCP interface on the gateway (`POST /api/v1/mcp`), one tool per route, listed by the token's scopes
-  (ADR-017); to try with a real MCP client on BaileyServ
-- [ ] Workspace checkpoints, restore and forks on btrfs subvolumes, through the gateway and `ac-ctl` (ADR-018;
-  tested on a loopback btrfs 2026-10-28; still to run on BaileyServ with live VMs)
+  (ADR-017); verified 2026-10-28 with Claude Code as the client on BaileyServ
+- [x] Workspace checkpoints, restore and forks on btrfs subvolumes, through the gateway and `ac-ctl` (ADR-018;
+  verified on BaileyServ with live VMs 2026-10-28: checkpoint mid-write, fork, restore and undo)
 
 ## Later
 - Local model option for an offline posture

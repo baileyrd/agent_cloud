@@ -2,7 +2,7 @@
 //! incremental `btrfs send --no-data` between the snapshots taken as it started and as it ended.
 //! Pure: the listing in, the paths out.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 /// The workspace paths a `btrfs receive --dump` listing says changed: added, removed, renamed
 /// (both names), written, truncated, or with a new owner, mode or extended attribute. Sorted,
@@ -11,8 +11,10 @@ use std::collections::{BTreeSet, HashSet};
 /// control character.
 ///
 /// Left out: changes to times only (`utimes`; a `touch` is not seen), the root itself, and the
-/// temporary `o<ino>-<gen>-<seq>` names send gives new files before renaming them. A file the
-/// agent itself names like that is left out only where it is created or renamed to.
+/// temporary `o<ino>-<gen>-<seq>` names send gives inodes on their way in or out. A path under
+/// such a name (a new directory's files, written before it is renamed into place, or a removed
+/// directory's files, unlinked after it is renamed away) is shown under the directory's real
+/// name. A file the agent itself names like that is left out.
 pub fn paths(dump: &str) -> Vec<String> {
     let mut lines = dump.lines().map(words);
     // The first line names the received snapshot, `./<name>`, which every path starts with.
@@ -24,14 +26,9 @@ pub fn paths(dump: &str) -> Vec<String> {
             .filter(|r| !r.is_empty())
             .map(str::to_owned)
     };
-    let (mut changed, mut temps) = (BTreeSet::new(), HashSet::new());
-    let mut note = |path: String, temps: &mut HashSet<String>| {
-        if is_temp(&path) {
-            temps.insert(path);
-        } else {
-            changed.insert(path);
-        }
-    };
+    // Every path named, and each temporary name's real one: where it was renamed to, or for a
+    // name something was renamed to (a removal), where it came from.
+    let (mut named, mut real) = (Vec::new(), HashMap::new());
     for w in lines {
         let (Some(cmd), Some(path)) = (w.first(), w.get(1).and_then(|p| rel(p))) else {
             continue;
@@ -39,18 +36,41 @@ pub fn paths(dump: &str) -> Vec<String> {
         match cmd.as_str() {
             "utimes" => {}
             "rename" => {
-                if !temps.remove(&path) {
-                    note(path, &mut temps);
-                }
                 let dest = w[2..].iter().find_map(|a| a.strip_prefix("dest="));
                 if let Some(dest) = dest.and_then(rel) {
-                    note(dest, &mut temps);
+                    if is_temp(&path) {
+                        real.insert(path.clone(), dest.clone());
+                    } else if is_temp(&dest) {
+                        real.insert(dest.clone(), path.clone());
+                    }
+                    named.push(dest);
                 }
+                named.push(path);
             }
-            _ => note(path, &mut temps),
+            _ => named.push(path),
         }
     }
+    let changed: BTreeSet<String> = named
+        .into_iter()
+        .map(|p| resolve(p, &real))
+        .filter(|p| !p.split('/').any(is_temp))
+        .collect();
     changed.into_iter().collect()
+}
+
+/// `path` with its longest temporary prefix replaced by that name's real one, until none is left
+/// (a temporary name can be renamed into another; bounded in case one names itself).
+fn resolve(mut path: String, real: &HashMap<String, String>) -> String {
+    for _ in 0..16 {
+        let prefix = path
+            .match_indices('/')
+            .map(|(i, _)| &path[..i])
+            .chain([path.as_str()])
+            .rfind(|p| real.contains_key(*p));
+        let Some(prefix) = prefix else { break };
+        path = format!("{}{}", real[prefix], &path[prefix.len()..]);
+    }
+    path
 }
 
 /// Whitespace-separated words, a backslash keeping the character after it (and itself) in the
@@ -148,6 +168,35 @@ utimes          ./j1.end/dir                    atime=2026-10-28T19:21:04+0000 m
         let dump =
             "snapshot ./s uuid=x\nrename ./s/a dest=./s/o9-1-0\nrename ./s/o9-1-0 dest=./s/b\n";
         assert_eq!(paths(dump), ["a", "b"]);
+    }
+
+    /// Shapes seen on BaileyServ (btrfs-progs 7.1, kernel 7.2): a new directory whose files are
+    /// written before it is renamed into place, and a removed one renamed away before its files
+    /// are unlinked.
+    #[test]
+    fn files_under_a_temporary_directory_get_its_real_name() {
+        let dump = "snapshot ./s uuid=x
+mkdir ./s/o20-1-0
+mkfile ./s/o21-1-0
+rename ./s/o21-1-0 dest=./s/o20-1-0/exit_code
+update_extent ./s/o20-1-0/exit_code offset=0 len=2
+mkfile ./s/o20-1-0/result.txt
+rename ./s/o20-1-0 dest=./s/.jobs/j2
+rename ./s/.jobs/j1 dest=./s/o9-1-0
+unlink ./s/o9-1-0/prompt.txt
+rmdir ./s/o9-1-0
+mkfile ./s/o30-1-0
+";
+        assert_eq!(
+            paths(dump),
+            [
+                ".jobs/j1",
+                ".jobs/j1/prompt.txt",
+                ".jobs/j2",
+                ".jobs/j2/exit_code",
+                ".jobs/j2/result.txt"
+            ]
+        );
     }
 
     #[test]

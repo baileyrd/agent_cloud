@@ -825,7 +825,9 @@ without trusting the agent.
   crash left behind.
 - *Paths:* `ac_domain::changes::paths` reads the listing: every path added, removed, renamed (both names),
   written, truncated, or given a new owner, mode or xattr. Times-only changes (`utimes`), the root, and send's
-  temporary `o<ino>-<gen>-<seq>` names are left out. Paths stay escaped as btrfs prints them (`\ `, `\\`,
+  temporary `o<ino>-<gen>-<seq>` names are left out; a path under one (a new directory's files, written before
+  it is renamed into place, or a removed one's, unlinked after it is renamed away) gets the directory's real
+  name, as first seen live on BaileyServ (2026-10-28). Paths stay escaped as btrfs prints them (`\ `, `\\`,
   `\ooo`), so none holds whitespace or a control character.
 - *Note:* one history line after the job's end state, `job <id> changed <n> paths: <path> <path> ...`, the
   runner's own files (`.jobs/`, the root's `.job-*`) left out, at most `CHANGE_NOTE_CAP` (2 KiB) of paths and

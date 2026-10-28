@@ -46,10 +46,11 @@
 - [x] `tini` as the agent image's PID 1, so killed jobs leave no zombies; no Claude Code self-update
   (`DISABLE_AUTOUPDATER=1`) (verified on BaileyServ 2026-10-22)
 - [ ] Per-agent CPU, memory and disk limits
-- [ ] Backups with a tested restore: workspaces by incremental `btrfs send` to a second btrfs disk, daily by
-  `ac-backup.timer`, with `ac-ctl restore-backup` (ADR-021; tested on loopback btrfs 2026-10-28). To do: verify
-  on BaileyServ with a second disk (a full and an incremental backup of a live agent, and a restore read back
-  inside its VM); back up the registry, tokens and egress agents file too
+- [ ] Backups with a tested restore: workspaces as incremental `btrfs send` stream files in any directory (a share
+  on another machine), daily by `ac-backup.timer`, with `ac-ctl restore-backup` replaying a chain (ADR-021; tested
+  on loopback filesystems 2026-10-28). To do: verify on BaileyServ against a share on Beast (a full and an
+  incremental backup of a live agent, and a restore read back inside its VM); back up the registry, tokens and
+  egress agents file too
 - [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
   (BaileyServ, 2026-10-22)
 - [x] The watchdog tells slow from wedged: it acts only on sustained failures on an idle host, through a logged

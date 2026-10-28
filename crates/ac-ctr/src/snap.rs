@@ -530,18 +530,35 @@ pub(crate) mod tests {
     use super::*;
     use crate::CtrConfig;
 
-    /// `btrfs subvolume create|snapshot [-r]|delete`, `send [-p P] SNAP`, `receive DIR` and
-    /// `property get -ts PATH ro`, each call logged to `$LOG`. Read-only subvolumes are listed in
-    /// `$LOG.ro`; a send is a tar stream. With `$LOG.fail-receive` present, receive leaves a
-    /// partial (writable) subvolume and fails, as a full disk would. `send -q --no-data` writes a
-    /// listing of `file` as written, which `receive --dump` prints (job changes).
+    /// `btrfs subvolume create|snapshot [-r]|delete`, `send -q [-p P] -f FILE SNAP` and
+    /// `receive -f FILE DIR`, each call logged to `$LOG`. Read-only subvolumes are listed in
+    /// `$LOG.ro`; a stream is a tar of the snapshot. With `$LOG.fail-send` present, send writes
+    /// part of a stream and fails, as a full disk would. `send -q --no-data` writes a listing of
+    /// `file` as written, which `receive --dump` prints (job changes).
     const FAKE_BTRFS: &str = r#"set -eu
 echo "$*" >> "$LOG"
 ro="$LOG.ro"
 touch "$ro"
 case "$1 ${2:-}" in
-"send -q") printf 'snapshot ./%s uuid=x\nwrite ./%s/file offset=0 len=1\n' "${8##*/}" "${8##*/}" > "$7" ;;
+"send -q")
+    if [ "$3" = --no-data ]; then
+        printf 'snapshot ./%s uuid=x\nwrite ./%s/file offset=0 len=1\n' "${8##*/}" "${8##*/}" > "$7"
+        exit 0
+    fi
+    shift 2
+    if [ "$1" = -p ]; then shift 2; fi
+    if [ -e "$LOG.fail-send" ]; then
+        echo partial > "$2"; echo "ERROR: No space left on device" >&2; exit 1
+    fi
+    grep -qxF "$3" "$ro" || { echo "ERROR: $3 is not read-only" >&2; exit 1; }
+    tar -C "$(dirname "$3")" -cf "$2" "$(basename "$3")" ;;
 "receive --dump") cat "$4" ;;
+"receive -f")
+    tar -C "$4" -xf "$3"
+    first=$(tar -tf "$3" | head -n 1)
+    name="$4/${first%/}"
+    chmod +t "$name"
+    echo "$name" >> "$ro" ;;
 "subvolume create") mkdir "$3"; chmod +t "$3" ;;
 "subvolume snapshot")
     shift 2
@@ -550,19 +567,6 @@ case "$1 ${2:-}" in
     cp -a "$1" "$2"
     if [ -n "$r" ]; then echo "$2" >> "$ro"; fi ;;
 "subvolume delete") rm -rf "$3"; grep -vxF "$3" "$ro" > "$ro.tmp" || true; mv "$ro.tmp" "$ro" ;;
-send*)
-    shift
-    if [ "$1" = -p ]; then shift 2; fi
-    grep -qxF "$1" "$ro" || { echo "ERROR: $1 is not read-only" >&2; exit 1; }
-    tar -C "$(dirname "$1")" -cf - "$(basename "$1")" ;;
-receive*)
-    first=$(tar -C "$2" -xvf - | head -n 1)
-    name="$2/${first%/}"
-    chmod +t "$name"
-    if [ -e "$LOG.fail-receive" ]; then echo "ERROR: No space left on device" >&2; exit 1; fi
-    echo "$name" >> "$ro" ;;
-"property get")
-    if grep -qxF "$4" "$ro"; then echo ro=true; else echo ro=false; fi ;;
 *) exit 2 ;;
 esac"#;
 

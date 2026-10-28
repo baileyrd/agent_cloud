@@ -47,7 +47,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] No git remotes with embedded tokens in workspaces
 - [ ] Data directory (registry + event logs) owned by the control-plane user, mode 0700; one process per directory is enforced by a lock
 - [ ] Backups for the data directory and workspace volumes, with a tested restore (workspaces: ADR-021, tested on
-  loopback btrfs, to verify on BaileyServ; the rest of the data directory: not yet)
+  loopback filesystems, to verify on BaileyServ; the rest of the data directory: not yet)
 - [ ] Production desktop image: Chromium managed policy applied; DevTools policy decided
 - [x] Terminal viewer: view-only by default, enforced in the gateway; one take-over holder;
   agent output sanitised to text and SGR before the browser (verified 2026-10-20, see [Viewer](#viewer))

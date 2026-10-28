@@ -526,24 +526,29 @@ on BaileyServ (2026-10-28): with a job in a1 writing a line and a 4 KiB file eac
 and the job kept writing; a fork from it booted in 4.8 s and read back 25 lines and 25 whole files inside its VM;
 restore (0.7 s) and the restore of what it kept both read back correctly inside a1 after resume.
 
-**Backups** (ADR-021): needs a second disk formatted btrfs and mounted at `/mnt/agent-backups` (another path:
-`sudo systemctl edit ac-backup.service` and override `ExecStart` and `RequiresMountsFor`). Workspaces must be
-subvolumes (migrate plain ones first, as above). None of these commands opens the registry, so they work while
-the gateway runs:
+**Backups** (ADR-021): `ac-ctl backup` writes each workspace as `btrfs send` stream files into a directory,
+best on another machine. Mount it at `/mnt/agent-backups` (another path: `sudo systemctl edit ac-backup.service`
+and override `ExecStart` and `RequiresMountsFor`). The share can be any filesystem; only the workspaces need btrfs,
+and they must be subvolumes (migrate plain ones first, as above). None of these commands opens the registry, so
+they work while the gateway runs. For example, an NFS share on Beast exported to this host only (on Beast:
+`/srv/agent-backups baileyserv(rw,sync,no_root_squash)` in `/etc/exports`; root must write it, since the streams
+hold the agents' logins):
 
 ```bash
-sudo mkfs.btrfs -L agent-backups /dev/sdX && sudo mkdir -p /mnt/agent-backups
-echo 'LABEL=agent-backups /mnt/agent-backups btrfs noatime 0 0' | sudo tee -a /etc/fstab && sudo mount /mnt/agent-backups
-sudo ac-ctl backup /mnt/agent-backups               # a1 backed up 20261028-130512 (full)
-sudo ac-ctl backup /mnt/agent-backups a1            # a1 backed up ... (incremental from 20261028-130512)
-sudo ac-ctl backups /mnt/agent-backups              # a1 20261028-130512 ...
+sudo mkdir -p /mnt/agent-backups
+echo 'beast:/srv/agent-backups /mnt/agent-backups nfs4 _netdev,hard,noatime 0 0' | sudo tee -a /etc/fstab
+sudo mount /mnt/agent-backups
+sudo ac-ctl backup /mnt/agent-backups          # a1 backed up 20261028-130512 (full, 1.2 GiB)
+sudo ac-ctl backup /mnt/agent-backups a1       # a1 backed up ... (incremental from 20261028-130512, 3.1 MiB)
+sudo ac-ctl backups /mnt/agent-backups         # a1 20261028-130512 full / a1 ... incremental from ...
 sudo install -m 0644 deploy/ac-backup.service deploy/ac-backup.timer /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ac-backup.timer   # daily at 03:30
 ```
 
-Each run keeps the newest 7 per agent (`--keep N` changes it) and exits 1 if any agent was not backed up; check
-with `systemctl status ac-backup` or `journalctl -u ac-backup`. To restore, pause the agent through the gateway,
-then:
+An SMB share works the same way (`cifs` in fstab, with a root-only credentials file). Each run sends against the
+last backup, in full every 7th (`--full-every N`), keeps the newest 7 restorable backups per agent and the streams
+they need (`--keep N`), and exits 1 if any agent was not backed up; check with `systemctl status ac-backup` or
+`journalctl -u ac-backup`. To restore, pause the agent through the gateway, then:
 
 ```bash
 sudo ac-ctl restore-backup /mnt/agent-backups a1                   # the newest; or name one
@@ -551,8 +556,7 @@ sudo ac-ctl restore-backup /mnt/agent-backups a1                   # the newest;
 ```
 
 then resume it. On a new host, or after a purge, the restore makes the workspace and `create` boots it. To check
-the btrfs side on a new host: `sudo scripts/btrfs-backup-test.sh` (two loopback btrfs filesystems, removed
-after).
+the btrfs side on a new host: `sudo scripts/btrfs-backup-test.sh` (loopback filesystems, removed after).
 
 **Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the

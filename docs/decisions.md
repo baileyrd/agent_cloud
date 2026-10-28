@@ -809,7 +809,7 @@ list (`btrfs filesystem du` is slow on a rotational disk); an XFS reflink backen
 snapshots (the roadmap's separate item).
 
 ## ADR-020: One operation catalog for REST and MCP; `ac-ctl` stays local
-**Status:** proposed (2026-10-28); implemented on its branch for review.
+**Status:** accepted (2026-10-28).
 **Context:** The Ephemeral Sandbox comparison (2026-10-27) suggested generating the CLI and the MCP tools from one
 declaration, once there were two real consumers. There are now two tables that describe the same operations:
 `access::ROUTES` (method, path, scope, audit name) and `mcp::TOOLS` (name, description, method, path, arguments),
@@ -817,7 +817,7 @@ kept in step by a test. `ac-ctl` is not a third copy of them: it drives `Fleet` 
 refuses while the gateway holds it (exit 3), so it works with the gateway stopped (`reconcile` after a reboot,
 `workspace migrate`, recovery), needs no token, and has commands with no route (`reconcile`, `migrate`, `doctor`,
 `tune`). Of the gateway's 22 tools, 10 have an `ac-ctl` twin; jobs, egress, history, capacity and whoami do not.
-**Decision (proposed):**
+**Decision:**
 - *One table for the gateway.* A route of `access::ROUTES` carries its MCP tool, if it has one (name, description,
   where arguments go, the arguments). `mcp::TOOLS` goes; `tools/list`, `tools/call` and the scope a tool gets all
   read the route. Method and path are written once, so a tool cannot drift from its route; the cross-check

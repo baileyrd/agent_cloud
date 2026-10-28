@@ -195,7 +195,8 @@ the agent user, by capped execs. Prompts are never in an argv; history records o
 - A container-in-VM boundary is only as strong as the hypervisor and guest kernel config.
   Keep Kata and the host kernel patched.
 - The command guard only blocks known-bad patterns.
-- Tokens do not expire; revoke them. `admin` (and the deprecated legacy token) can do everything.
+- Tokens expire only if created with `--expires` (ADR-022); otherwise revoke them. An expired token stays in
+  the file (listed as expired) until revoked. `admin` (and the deprecated legacy token) can do everything.
 - Failed authentications are limited per gateway (20 a minute are logged, then 429), not per source address:
   rusty_serve does not tell handlers the peer's address. Tokens are 256-bit, so this bounds log volume rather
   than guessing.

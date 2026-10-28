@@ -902,7 +902,7 @@ fn viewer_scopes_and_viewer_ids_belong_to_their_token() {
     let file = TokenFile::new(dir.join("tokens"), me);
     let make = |name: &str, scopes: &str| {
         let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
-        file.create(name, scopes, Agents::All, 1)
+        file.create(name, scopes, Agents::All, 1, None)
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let (watch, control) = (
@@ -1110,7 +1110,7 @@ fn egress_routes_need_egress_write_and_are_audited() {
     let make = |name: &str, scopes: &str, agents: &str| {
         let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
         let agents = Agents::parse(agents).unwrap_or_else(|e| panic!("{e}"));
-        file.create(name, scopes, agents, 1)
+        file.create(name, scopes, agents, 1, None)
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let life = make("life", "agents:read,agents:write", "*");
@@ -1225,7 +1225,7 @@ fn mcp_tools_follow_the_token_scopes() {
     let scopes = Scopes::parse("jobs:read,jobs:write").unwrap_or_else(|e| panic!("{e}"));
     let agents = Agents::parse("a1").unwrap_or_else(|e| panic!("{e}"));
     let jobs = file
-        .create("worker", scopes, agents, 1)
+        .create("worker", scopes, agents, 1, None)
         .unwrap_or_else(|e| panic!("{e}"));
     let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
     let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));

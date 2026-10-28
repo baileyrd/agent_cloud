@@ -1,11 +1,12 @@
 //! API tokens (ADR-011): which routes a caller may use, for which agents.
 //!
 //! The tokens file (`/etc/agent-cloud/tokens`, owned by the gateway's user, mode 0600) has one
-//! token per line, `name scopes agents sha256 [created]`; `#` starts a comment. `scopes` is a comma
-//! list of [`Scope`] names, `agents` is `*` or a comma list of agent ids, `sha256` is the hex digest
-//! of the token (the token itself is shown once, by `ac-gateway token create`, and never stored),
-//! `created` is Unix seconds. The old single token (`AC_TOKEN_FILE`) is an implicit `admin` token
-//! for every agent named `legacy`.
+//! token per line, `name scopes agents sha256 [created [expires]]`; `#` starts a comment. `scopes`
+//! is a comma list of [`Scope`] names, `agents` is `*` or a comma list of agent ids, `sha256` is the
+//! hex digest of the token (the token itself is shown once, by `ac-gateway token create`, and never
+//! stored), `created` and `expires` are Unix seconds (ADR-022: from `expires` on, the token is
+//! refused; without it, the token lasts until revoked). The old single token (`AC_TOKEN_FILE`) is
+//! an implicit `admin` token for every agent named `legacy`.
 //!
 //! The file is re-read when it changes (as ac-egress's allowlist is): a missing file means no file
 //! tokens; an unreadable, too open or malformed one is an error, so the gateway refuses to start
@@ -16,7 +17,7 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ac_domain::AgentId;
 use rusty_crypto_key::constant_time_eq;
@@ -30,7 +31,7 @@ const MAX_NAME: usize = 32;
 pub const LEGACY: &str = "legacy";
 /// Written at the top of a new tokens file.
 const HEADER: &str =
-    "# agent-cloud API tokens (ADR-011): name scopes agents sha256(token) created\n\
+    "# agent-cloud API tokens (ADR-011, ADR-022): name scopes agents sha256(token) created [expires]\n\
     # Managed with `ac-gateway token create|list|revoke`; tokens themselves are never stored.\n";
 
 /// What a token may do. `Admin` implies every other scope.
@@ -178,12 +179,18 @@ pub struct Token {
     pub agents: Agents,
     /// When it was created (Unix seconds), if recorded.
     pub created: Option<u64>,
+    /// When it stops working (Unix seconds); `None`: when revoked.
+    pub expires: Option<u64>,
     hash: [u8; 32],
 }
 
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Token({} {} {})", self.name, self.scopes, self.agents)
+        write!(f, "Token({} {} {})", self.name, self.scopes, self.agents)?;
+        match self.expires {
+            Some(e) => write!(f, " until {}", utc(e)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -195,8 +202,14 @@ impl Token {
             scopes: Scopes(Scope::Admin.bit()),
             agents: Agents::All,
             created: None,
+            expires: None,
             hash: Sha256::digest(secret.as_bytes()),
         }
+    }
+
+    /// Whether it still works at `now` (Unix seconds): it has no expiry, or `now` is before it.
+    pub fn live(&self, now: u64) -> bool {
+        self.expires.is_none_or(|e| now < e)
     }
 }
 
@@ -287,24 +300,64 @@ impl Tokens {
 
 fn parse_line(line: &str) -> Result<Token, String> {
     let fields: Vec<&str> = line.split_whitespace().collect();
-    let (name, scopes, agents, hash, created) = match fields[..] {
-        [n, s, a, h] => (n, s, a, h, None),
-        [n, s, a, h, c] => (n, s, a, h, Some(c)),
-        _ => return Err("want: name scopes agents sha256 [created]".into()),
+    let (name, scopes, agents, hash, created, expires) = match fields[..] {
+        [n, s, a, h] => (n, s, a, h, None, None),
+        [n, s, a, h, c] => (n, s, a, h, Some(c), None),
+        [n, s, a, h, c, e] => (n, s, a, h, Some(c), Some(e)),
+        _ => return Err("want: name scopes agents sha256 [created [expires]]".into()),
     };
     check_name(name)?;
+    let created = created.map(|c| secs("created", c)).transpose()?;
+    let expires = expires.map(|e| secs("expires", e)).transpose()?;
+    if let (Some(c), Some(e)) = (created, expires) {
+        if e <= c {
+            return Err(format!("expires {e} is not after created {c}"));
+        }
+    }
     Ok(Token {
         name: name.to_owned(),
         scopes: Scopes::parse(scopes)?,
         agents: Agents::parse(agents)?,
-        created: created
-            .map(|c| {
-                c.parse()
-                    .map_err(|_| format!("created {c:?} is not Unix seconds"))
-            })
-            .transpose()?,
+        created,
+        expires,
         hash: unhex(hash).ok_or("sha256 must be 64 lowercase hex digits")?,
     })
+}
+
+fn secs(field: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{field} {value:?} is not Unix seconds"))
+}
+
+/// A lifetime as `ac-gateway token create --expires` takes it: a whole number of `m`inutes,
+/// `h`ours or `d`ays, more than zero and at most 3650 days.
+pub fn parse_lifetime(text: &str) -> Result<u64, String> {
+    const MAX: u64 = 3650 * 86_400;
+    let bad = || format!("bad lifetime {text:?}: want a number and m, h or d (e.g. 90d)");
+    let unit = match text.as_bytes().last() {
+        Some(b'm') => 60,
+        Some(b'h') => 3_600,
+        Some(b'd') => 86_400,
+        _ => return Err(bad()),
+    };
+    // The last byte is ASCII, so this is a char boundary.
+    let n = &text[..text.len() - 1];
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    n.parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit))
+        .filter(|s| (1..=MAX).contains(s))
+        .ok_or_else(bad)
+}
+
+/// Now, in Unix seconds (0 if the clock is before 1970).
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A token name: 1 to 32 of `a-z 0-9 _ -`, starting with a letter or digit.
@@ -463,18 +516,24 @@ impl TokenFile {
     }
 
     /// Add a token and return its secret (32 random bytes as hex), which is shown once and never
-    /// stored. The line is appended; the rest of the file, comments included, is kept.
+    /// stored. It expires `lifetime` seconds after `now`, or never. The line is appended; the rest
+    /// of the file, comments included, is kept.
     pub fn create(
         &self,
         name: &str,
         scopes: Scopes,
         agents: Agents,
         now: u64,
+        lifetime: Option<u64>,
     ) -> Result<String, String> {
         check_name(name)?;
+        let expires = match lifetime {
+            None => String::new(),
+            Some(l) => format!(" {}", now.checked_add(l).ok_or("lifetime too long")?),
+        };
         let secret = random_hex()?;
         let line = format!(
-            "{name} {scopes} {agents} {} {now}\n",
+            "{name} {scopes} {agents} {} {now}{expires}\n",
             hex(&Sha256::digest(secret.as_bytes()))
         );
         self.edit(|text| {
@@ -595,7 +654,7 @@ mod tests {
     #[test]
     fn parses_lines_comments_and_created() {
         let t = parse(&format!(
-            "# tokens\n\nci jobs:read,jobs:write a1,a2 {DIGEST} 1761004800  # CI\nops admin * {}\n",
+            "# tokens\n\nci jobs:read,jobs:write a1,a2 {DIGEST} 1761004800  # CI\nops admin * {} 5 9\n",
             "0".repeat(64)
         ));
         let all: Vec<&Token> = t.iter().collect();
@@ -603,8 +662,14 @@ mod tests {
         assert_eq!(all[0].name, "ci");
         assert_eq!(all[0].scopes.to_string(), "jobs:read,jobs:write");
         assert_eq!(all[0].agents.to_string(), "a1,a2");
-        assert_eq!(all[0].created, Some(1_761_004_800));
-        assert_eq!((all[1].agents.clone(), all[1].created), (Agents::All, None));
+        assert_eq!(
+            (all[0].created, all[0].expires),
+            (Some(1_761_004_800), None)
+        );
+        assert_eq!(
+            (all[1].agents.clone(), all[1].created, all[1].expires),
+            (Agents::All, Some(5), Some(9))
+        );
         assert!(Tokens::parse("# only comments\n\n").is_ok_and(|t| t.is_empty()));
     }
 
@@ -613,7 +678,7 @@ mod tests {
         let ok = format!("ci jobs:read a1 {DIGEST}");
         for (text, want) in [
             ("ci jobs:read a1".to_owned(), "line 1: want"),
-            (format!("{ok} 1 extra"), "line 1: want"),
+            (format!("{ok} 1 2 extra"), "line 1: want"),
             (
                 format!("ci jobs:read,root a1 {DIGEST}"),
                 "unknown scope \"root\"",
@@ -637,6 +702,12 @@ mod tests {
                 format!("ci jobs:read a1 {DIGEST} yesterday"),
                 "Unix seconds",
             ),
+            (
+                format!("ci jobs:read a1 {DIGEST} 1 soon"),
+                "expires \"soon\" is not Unix seconds",
+            ),
+            (format!("ci jobs:read a1 {DIGEST} 5 5"), "not after created"),
+            (format!("ci jobs:read a1 {DIGEST} 5 4"), "not after created"),
             (format!("Ci jobs:read a1 {DIGEST}"), "bad token name"),
             (format!("-ci jobs:read a1 {DIGEST}"), "bad token name"),
             (
@@ -745,7 +816,13 @@ mod tests {
 
         let jobs = Scopes::parse("jobs:read,jobs:write").unwrap_or_default();
         let secret = file
-            .create("ci", jobs, Agents::parse("a1").unwrap_or(Agents::All), 1)
+            .create(
+                "ci",
+                jobs,
+                Agents::parse("a1").unwrap_or(Agents::All),
+                1,
+                None,
+            )
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()));
         let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -767,13 +844,14 @@ mod tests {
             Scopes::parse("admin").unwrap_or_default(),
             Agents::All,
             2,
+            Some(100),
         );
         assert!(other.is_ok());
         assert!(
-            file.create("ci", jobs, Agents::All, 3).is_err(),
+            file.create("ci", jobs, Agents::All, 3, None).is_err(),
             "duplicate name"
         );
-        assert!(file.create("bad name", jobs, Agents::All, 3).is_err());
+        assert!(file.create("bad name", jobs, Agents::All, 3, None).is_err());
         let names: Vec<String> = file
             .list()
             .unwrap_or_default()
@@ -781,6 +859,16 @@ mod tests {
             .map(|t| t.name.clone())
             .collect();
         assert_eq!(names, ["ci", "ops"]);
+        let ops = file.list().unwrap_or_default();
+        let ops = ops
+            .iter()
+            .find(|t| t.name == "ops")
+            .map(|t| (t.created, t.expires));
+        assert_eq!(
+            ops,
+            Some((Some(2), Some(102))),
+            "expires = created + lifetime"
+        );
 
         assert!(file.revoke("ci").is_ok());
         assert!(file.revoke("ci").is_err(), "already gone");
@@ -817,7 +905,8 @@ mod tests {
                 "x",
                 Scopes::parse("admin").unwrap_or_default(),
                 Agents::All,
-                1
+                1,
+                None
             )
             .is_err());
 
@@ -857,6 +946,56 @@ mod tests {
             .unwrap_or_default();
         assert!(err.contains("larger than"), "{err}");
         let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
+    }
+
+    #[test]
+    fn expiry_is_exclusive_and_optional() {
+        let mut t = parse(&format!("ci jobs:read a1 {DIGEST} 10 20"))
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| Token::admin("x", "y"));
+        assert!(t.live(0) && t.live(19), "before");
+        assert!(!t.live(20) && !t.live(u64::MAX), "at and after");
+        t.expires = None;
+        assert!(t.live(u64::MAX), "no expiry: until revoked");
+        assert!(Token::admin(LEGACY, "s").live(u64::MAX));
+    }
+
+    #[test]
+    fn lifetimes() {
+        for (text, want) in [
+            ("30m", 1_800),
+            ("12h", 43_200),
+            ("90d", 7_776_000),
+            ("3650d", 315_360_000),
+        ] {
+            assert_eq!(parse_lifetime(text), Ok(want), "{text}");
+        }
+        for bad in [
+            "",
+            "d",
+            "0d",
+            "30",
+            "30s",
+            "1w",
+            "-1d",
+            "+1d",
+            " 1d",
+            "1.5d",
+            "3651d",
+            "1D",
+            "99999999999999999999d",
+            "١d",
+            "1١",
+        ] {
+            assert!(parse_lifetime(bad).is_err(), "{bad:?}");
+        }
+        let file = TokenFile::new(tmp(), me());
+        let admin = Scopes::parse("admin").unwrap_or_default();
+        assert!(file
+            .create("x", admin, Agents::All, u64::MAX, Some(1))
+            .is_err_and(|e| e.contains("too long")));
     }
 
     #[test]

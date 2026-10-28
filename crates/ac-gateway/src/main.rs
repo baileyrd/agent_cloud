@@ -58,7 +58,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use ac_ctr::capacity::{CapacityConfig, GuestSource, HostCapacity};
 use ac_ctr::facts::{collect, LinuxHost, Paths, Scope};
@@ -564,7 +564,7 @@ fn run() -> Result<(), String> {
     server.run().map_err(|e| e.to_string())
 }
 
-const USAGE: &str = "usage: ac-gateway token create <name> --scopes <s,...> [--agents <id,...>|*]
+const USAGE: &str = "usage: ac-gateway token create <name> --scopes <s,...> [--agents <id,...>|*] [--expires <n>m|h|d]
        ac-gateway token list
        ac-gateway token revoke <name>
 scopes: agents:read agents:write jobs:read jobs:write viewer:read viewer:control egress:write admin
@@ -577,34 +577,49 @@ fn token_cli(args: &[String]) -> Result<(), String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args[..] {
         ["create", name, ref rest @ ..] => {
-            let (mut scopes, mut agents) = (None, Agents::All);
+            let (mut scopes, mut agents, mut lifetime) = (None, Agents::All, None);
             let mut rest = rest.iter();
             while let Some(flag) = rest.next() {
                 let value = rest.next().ok_or(USAGE)?;
                 match *flag {
                     "--scopes" => scopes = Some(Scopes::parse(value)?),
                     "--agents" => agents = Agents::parse(value)?,
+                    "--expires" => lifetime = Some(tokens::parse_lifetime(value)?),
                     _ => return Err(USAGE.into()),
                 }
             }
             let scopes = scopes.ok_or(USAGE)?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            let secret = file.create(name, scopes, agents.clone(), now)?;
+            let now = tokens::unix_now();
+            let secret = file.create(name, scopes, agents.clone(), now, lifetime)?;
             println!("{secret}");
+            let until = lifetime.map_or_else(
+                || "until revoked".to_owned(),
+                |l| format!("until {}", tokens::utc(now.saturating_add(l))),
+            );
             eprintln!(
-                "token {name} ({scopes} for {agents}) added to {}; shown once, never stored",
+                "token {name} ({scopes} for {agents}, {until}) added to {}; shown once, never stored",
                 file.path().display()
             );
             Ok(())
         }
         ["list"] => {
-            println!("{:<20} {:<40} {:<20} CREATED", "NAME", "SCOPES", "AGENTS");
+            println!(
+                "{:<20} {:<40} {:<20} {:<20} EXPIRES",
+                "NAME", "SCOPES", "AGENTS", "CREATED"
+            );
+            let now = tokens::unix_now();
             for t in file.list()?.iter() {
                 let created = t.created.map_or_else(|| "-".to_owned(), tokens::utc);
+                let expires = match t.expires {
+                    None => "-".to_owned(),
+                    Some(e) if t.live(now) => tokens::utc(e),
+                    Some(e) => format!("{} (expired)", tokens::utc(e)),
+                };
                 let (scopes, agents) = (t.scopes.to_string(), t.agents.to_string());
-                println!("{:<20} {scopes:<40} {agents:<20} {created}", t.name);
+                println!(
+                    "{:<20} {scopes:<40} {agents:<20} {created:<20} {expires}",
+                    t.name
+                );
             }
             Ok(())
         }

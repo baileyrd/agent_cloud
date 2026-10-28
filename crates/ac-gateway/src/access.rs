@@ -21,7 +21,8 @@ pub enum Need {
     Scope(Scope),
 }
 
-/// One route: method, path pattern (`{id}` is the agent, `{job}` and `{viewer}` any segment),
+/// One route: method, path pattern (`{id}` is the agent, `{job}`, `{viewer}` and `{cp}` any
+/// segment),
 /// what it needs, and the action name it is audited under (`None`: not audited).
 #[derive(Debug)]
 pub struct Rule {
@@ -58,7 +59,8 @@ const A: &str = "/api/v1/agents/{id}";
 /// it comes from the viewer whose take-over was, and a viewer id works only with the token that
 /// opened it. Picking a window changes only what that viewer sees, so it needs `viewer:read`.
 /// Attaching egress profiles widens what an agent may reach, so it has its own scope (ADR-016);
-/// a create that attaches some needs it too, which the handler checks.
+/// a create or fork that attaches some needs it too, which the handler checks. A fork's new agent
+/// is in its body, so the handler checks the token is for it too (ADR-018).
 pub const ROUTES: &[Rule] = &[
     rule("GET", "/api/v1/whoami", Need::Token, None),
     rule("GET", "/api/v1/agents", S(AgentsRead), None),
@@ -77,6 +79,36 @@ pub const ROUTES: &[Rule] = &[
         "/api/v1/agents/{id}/resume",
         S(AgentsWrite),
         Some("resume"),
+    ),
+    rule(
+        "GET",
+        "/api/v1/agents/{id}/checkpoints",
+        S(AgentsRead),
+        None,
+    ),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/checkpoints",
+        S(AgentsWrite),
+        Some("checkpoint"),
+    ),
+    rule(
+        "DELETE",
+        "/api/v1/agents/{id}/checkpoints/{cp}",
+        S(AgentsWrite),
+        Some("checkpoint-delete"),
+    ),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/restore",
+        S(AgentsWrite),
+        Some("restore"),
+    ),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/fork",
+        S(AgentsWrite),
+        Some("fork"),
     ),
     rule("GET", "/api/v1/egress/profiles", S(AgentsRead), None),
     rule("GET", "/api/v1/agents/{id}/egress", S(AgentsRead), None),
@@ -293,6 +325,11 @@ mod tests {
             ("DELETE", "/api/v1/agents/a1", S(AgentsWrite)),
             ("POST", "/api/v1/agents/a1/pause", S(AgentsWrite)),
             ("POST", "/api/v1/agents/a1/resume", S(AgentsWrite)),
+            ("GET", "/api/v1/agents/a1/checkpoints", S(AgentsRead)),
+            ("POST", "/api/v1/agents/a1/checkpoints", S(AgentsWrite)),
+            ("DELETE", "/api/v1/agents/a1/checkpoints/x", S(AgentsWrite)),
+            ("POST", "/api/v1/agents/a1/restore", S(AgentsWrite)),
+            ("POST", "/api/v1/agents/a1/fork", S(AgentsWrite)),
             ("GET", "/api/v1/egress/profiles", S(AgentsRead)),
             ("GET", "/api/v1/agents/a1/egress", S(AgentsRead)),
             ("PUT", "/api/v1/agents/a1/egress", S(EgressWrite)),
@@ -315,7 +352,7 @@ mod tests {
         }
         assert_eq!(
             ROUTES.len(),
-            25,
+            30,
             "a new route needs a row above and in ADR-011"
         );
     }

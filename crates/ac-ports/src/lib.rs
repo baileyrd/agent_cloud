@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ac_domain::health::{ExecClient, Pressure};
-use ac_domain::{AgentId, Job, JobId, ProfileName, State};
+use ac_domain::{AgentId, Checkpoint, CheckpointId, Job, JobId, Label, ProfileName, State, Volume};
 
 /// Adapter failure with context; adapters map their own errors into this.
 #[derive(Debug)]
@@ -66,6 +66,35 @@ pub trait Runtime {
     fn destroy(&self, id: &AgentId, purge: bool) -> Result<(), PortError>;
     /// Agents whose VM is up: the runtime has a task for them that has not stopped.
     fn running(&self) -> Result<Vec<AgentId>, PortError>;
+}
+
+/// Agents' workspace volumes as btrfs subvolumes: checkpoints, restore, forks (ADR-018). Every
+/// method acts on whole volumes and never opens a path inside a workspace, which the agent
+/// controls. The caller checks lifecycle state and the cap ([`ac_domain::checkpoint`]) first.
+pub trait Snapshots {
+    /// What `id`'s workspace is on disk.
+    fn volume(&self, id: &AgentId) -> Result<Volume, PortError>;
+    /// `id`'s checkpoints, oldest first.
+    fn checkpoints(&self, id: &AgentId) -> Result<Vec<Checkpoint>, PortError>;
+    /// Snapshot `id`'s workspace read-only; returns the new checkpoint's id.
+    fn checkpoint(&self, id: &AgentId, label: Option<&Label>) -> Result<CheckpointId, PortError>;
+    /// Delete one checkpoint.
+    fn delete(&self, id: &AgentId, cp: &CheckpointId) -> Result<(), PortError>;
+    /// Replace `id`'s workspace (its VM stopped) with a writable snapshot of `cp`, after keeping
+    /// the current one as a checkpoint, whose id is returned.
+    fn restore(&self, id: &AgentId, cp: &CheckpointId) -> Result<CheckpointId, PortError>;
+    /// Make `to`'s workspace a writable snapshot of `from`'s, or of its checkpoint `cp`.
+    fn fork(
+        &self,
+        from: &AgentId,
+        cp: Option<&CheckpointId>,
+        to: &AgentId,
+    ) -> Result<(), PortError>;
+    /// Turn `id`'s plain-directory workspace (its VM stopped) into a subvolume with the same
+    /// contents.
+    fn migrate(&self, id: &AgentId) -> Result<(), PortError>;
+    /// Delete every checkpoint of `id`; nothing there is fine.
+    fn purge(&self, id: &AgentId) -> Result<(), PortError>;
 }
 
 /// The agents' proxy credentials and profile attachments (ADR-016), kept in the agents file the

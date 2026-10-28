@@ -4,13 +4,19 @@
 //! its guest would not fit `/dev/shm` ([`ac_domain::capacity::admit`]). With
 //! [`Fleet::with_egress`], every boot gets a new proxy credential (ADR-016): issued before the VM
 //! starts (a failure to store it fails the boot), revoked before it stops and whenever a start
-//! fails, forgotten on purge, and swept by the reconcile for agents without a VM.
+//! fails, forgotten on purge, and swept by the reconcile for agents without a VM. With
+//! [`Fleet::with_snapshots`], workspaces can be checkpointed, restored and forked (ADR-018), and a
+//! purge deletes the agent's checkpoints too.
 
 use std::fmt;
 use std::sync::Arc;
 
-use ac_domain::{capacity, AgentId, Command, ProfileName, Shortfall, State, TransitionError};
-use ac_ports::{Boot, Capacity, Egress, PortError, Runtime, SessionStore};
+use ac_domain::checkpoint::{self, Op};
+use ac_domain::{
+    capacity, AgentId, Checkpoint, CheckpointId, Command, Label, ProfileName, Refusal, Shortfall,
+    State, TransitionError,
+};
+use ac_ports::{Boot, Capacity, Egress, PortError, Runtime, SessionStore, Snapshots};
 
 /// Why a fleet operation failed.
 #[derive(Debug)]
@@ -23,6 +29,12 @@ pub enum FleetError {
     Illegal(TransitionError),
     /// Its guest would not fit `/dev/shm`; nothing was changed.
     NoCapacity(Shortfall),
+    /// A workspace operation is not allowed now (ADR-018); nothing was changed.
+    Refused(Refusal),
+    /// The agent has no checkpoint with this id.
+    NoCheckpoint(AgentId, CheckpointId),
+    /// The fleet was built without [`Fleet::with_snapshots`].
+    SnapshotsOff,
     /// The runtime or store failed; state is left as last persisted.
     Port(PortError),
 }
@@ -34,6 +46,9 @@ impl fmt::Display for FleetError {
             Self::NotFound(id) => write!(f, "agent {id} not found"),
             Self::Illegal(e) => e.fmt(f),
             Self::NoCapacity(e) => e.fmt(f),
+            Self::Refused(e) => e.fmt(f),
+            Self::NoCheckpoint(id, cp) => write!(f, "agent {id} has no checkpoint {cp}"),
+            Self::SnapshotsOff => f.write_str("checkpoints are off"),
             Self::Port(e) => e.fmt(f),
         }
     }
@@ -47,6 +62,12 @@ impl From<PortError> for FleetError {
     }
 }
 
+impl From<Refusal> for FleetError {
+    fn from(e: Refusal) -> Self {
+        Self::Refused(e)
+    }
+}
+
 impl From<TransitionError> for FleetError {
     fn from(e: TransitionError) -> Self {
         Self::Illegal(e)
@@ -57,6 +78,12 @@ impl From<TransitionError> for FleetError {
 struct Admission {
     capacity: Box<dyn Capacity + Send>,
     margin_mib: u64,
+}
+
+/// Workspace snapshots, and how many checkpoints each agent may keep.
+struct Snapshotting {
+    port: Arc<dyn Snapshots + Send + Sync>,
+    max: usize,
 }
 
 /// What admission sees now (`GET /api/v1/capacity`), in MiB.
@@ -84,6 +111,7 @@ pub struct Fleet<R, S> {
     store: S,
     admission: Option<Admission>,
     egress: Option<Arc<dyn Egress + Send + Sync>>,
+    snapshots: Option<Snapshotting>,
 }
 
 impl<R: Runtime, S: SessionStore> Fleet<R, S> {
@@ -94,7 +122,16 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
             store,
             admission: None,
             egress: None,
+            snapshots: None,
         }
+    }
+
+    /// Checkpoint, restore and fork workspaces through `port`, keeping at most `max` checkpoints
+    /// per agent (a restore's automatic one counts). Without it those calls fail with
+    /// [`FleetError::SnapshotsOff`].
+    pub fn with_snapshots(mut self, port: Arc<dyn Snapshots + Send + Sync>, max: usize) -> Self {
+        self.snapshots = Some(Snapshotting { port, max });
+        self
     }
 
     /// Give every boot a new proxy credential from `egress`, and take it away when the VM goes.
@@ -156,6 +193,16 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
             return Err(FleetError::AlreadyExists(id.clone()));
         }
         self.admit(id)?;
+        self.boot_new(id, profiles)
+    }
+
+    /// Issue `id`'s credential, record it `Creating` and boot it on its workspace (made if
+    /// missing). A failed boot leaves it `Creating`.
+    fn boot_new(
+        &self,
+        id: &AgentId,
+        profiles: Option<&[ProfileName]>,
+    ) -> Result<State, FleetError> {
         let boot = self.issue(id, profiles)?;
         self.store.set_state(id, State::Creating)?;
         self.started(id, self.runtime.create(id, &boot))?;
@@ -190,7 +237,7 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     pub fn destroy(&self, id: &AgentId, purge: bool) -> Result<State, FleetError> {
         if purge && self.store.state(id)? == Some(State::Destroyed) {
             self.runtime.destroy(id, true)?;
-            self.forget(id)?;
+            self.purged(id)?;
             return Ok(State::Destroyed);
         }
         let state = self.step(id, Command::Destroy, |r| {
@@ -198,9 +245,107 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
             r.destroy(id, purge)
         })?;
         if purge {
-            self.forget(id)?;
+            self.purged(id)?;
         }
         Ok(state)
+    }
+
+    /// `id`'s workspace is gone: delete its checkpoints and forget its egress line.
+    fn purged(&self, id: &AgentId) -> Result<(), PortError> {
+        if let Some(s) = &self.snapshots {
+            s.port.purge(id)?;
+        }
+        self.forget(id)
+    }
+
+    /// `id`'s checkpoints, oldest first, and the most it may keep.
+    pub fn checkpoints(&self, id: &AgentId) -> Result<(Vec<Checkpoint>, usize), FleetError> {
+        let s = self.snaps()?;
+        self.known(id)?;
+        Ok((s.port.checkpoints(id)?, s.max))
+    }
+
+    /// Snapshot `id`'s workspace read-only. Running or paused; refused at the cap.
+    pub fn checkpoint(
+        &self,
+        id: &AgentId,
+        label: Option<&Label>,
+    ) -> Result<CheckpointId, FleetError> {
+        let s = self.snaps()?;
+        checkpoint::check(id, Op::Checkpoint, self.known(id)?, s.port.volume(id)?)?;
+        checkpoint::check_room(id, s.port.checkpoints(id)?.len(), s.max)?;
+        Ok(s.port.checkpoint(id, label)?)
+    }
+
+    /// Delete one of `id`'s checkpoints.
+    pub fn delete_checkpoint(&self, id: &AgentId, cp: &CheckpointId) -> Result<(), FleetError> {
+        let s = self.snaps()?;
+        self.known(id)?;
+        self.has_checkpoint(s, id, cp)?;
+        Ok(s.port.delete(id, cp)?)
+    }
+
+    /// Put checkpoint `cp` back as `id`'s workspace. Paused only; the workspace it replaces is
+    /// kept as a checkpoint first (so the cap must leave room), whose id is returned.
+    pub fn restore(&self, id: &AgentId, cp: &CheckpointId) -> Result<CheckpointId, FleetError> {
+        let s = self.snaps()?;
+        checkpoint::check(id, Op::Restore, self.known(id)?, s.port.volume(id)?)?;
+        let count = self.has_checkpoint(s, id, cp)?;
+        checkpoint::check_room(id, count, s.max)?;
+        Ok(s.port.restore(id, cp)?)
+    }
+
+    /// Create agent `to` on a writable snapshot of `from`'s workspace, or of its checkpoint `cp`,
+    /// attaching `profiles` like a create. Nothing but files comes from `from`: not its egress
+    /// profiles, not its jobs. A failed boot leaves `to` `Creating` on its forked workspace.
+    pub fn fork(
+        &self,
+        from: &AgentId,
+        cp: Option<&CheckpointId>,
+        to: &AgentId,
+        profiles: Option<&[ProfileName]>,
+    ) -> Result<State, FleetError> {
+        let s = self.snaps()?;
+        checkpoint::check(from, Op::Fork, self.known(from)?, s.port.volume(from)?)?;
+        if let Some(cp) = cp {
+            self.has_checkpoint(s, from, cp)?;
+        }
+        checkpoint::check_fork_target(to, self.store.state(to)?, s.port.volume(to)?)?;
+        self.admit(to)?;
+        s.port.fork(from, cp, to)?;
+        self.boot_new(to, profiles)
+    }
+
+    /// Turn `id`'s plain-directory workspace into a subvolume. Its VM must be stopped.
+    pub fn migrate(&self, id: &AgentId) -> Result<(), FleetError> {
+        let s = self.snaps()?;
+        checkpoint::check(id, Op::Migrate, self.known(id)?, s.port.volume(id)?)?;
+        Ok(s.port.migrate(id)?)
+    }
+
+    fn snaps(&self) -> Result<&Snapshotting, FleetError> {
+        self.snapshots.as_ref().ok_or(FleetError::SnapshotsOff)
+    }
+
+    /// `id`'s state; unknown is an error.
+    fn known(&self, id: &AgentId) -> Result<State, FleetError> {
+        self.store
+            .state(id)?
+            .ok_or_else(|| FleetError::NotFound(id.clone()))
+    }
+
+    /// How many checkpoints `id` has, if `cp` is one of them.
+    fn has_checkpoint(
+        &self,
+        s: &Snapshotting,
+        id: &AgentId,
+        cp: &CheckpointId,
+    ) -> Result<usize, FleetError> {
+        let all = s.port.checkpoints(id)?;
+        match all.iter().any(|c| &c.id == cp) {
+            true => Ok(all.len()),
+            false => Err(FleetError::NoCheckpoint(id.clone(), cp.clone())),
+        }
     }
 
     /// Bring the registry in line with the runtime after a host reboot or a VM crash: an agent
@@ -326,6 +471,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use ac_domain::Volume;
 
     #[derive(Default)]
     struct FakeStore(RefCell<HashMap<String, State>>);
@@ -791,5 +937,250 @@ mod tests {
             fleet.store.state(&id()).ok().flatten(),
             Some(State::Creating)
         );
+    }
+
+    /// Each agent's volume, and its checkpoints.
+    type Disk = (HashMap<String, Volume>, HashMap<String, Vec<CheckpointId>>);
+
+    /// Workspaces as a map, and a log of calls.
+    #[derive(Default)]
+    struct FakeSnaps {
+        disk: std::sync::Mutex<Disk>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeSnaps {
+        fn with(volumes: &[(&str, Volume)]) -> Arc<Self> {
+            let s = Self::default();
+            if let Ok(mut d) = s.disk.lock() {
+                for (id, v) in volumes {
+                    d.0.insert((*id).to_owned(), *v);
+                }
+            }
+            Arc::new(s)
+        }
+        fn log(&self, call: String) {
+            if let Ok(mut c) = self.calls.lock() {
+                c.push(call);
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+        fn add(&self, id: &AgentId) -> CheckpointId {
+            let mut d = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            let list = d.1.entry(id.to_string()).or_default();
+            let cp = CheckpointId::next(1_793_192_712, list);
+            list.push(cp.clone());
+            cp
+        }
+    }
+
+    impl Snapshots for FakeSnaps {
+        fn volume(&self, id: &AgentId) -> Result<Volume, PortError> {
+            let d = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(d.0.get(id.as_str()).copied().unwrap_or(Volume::Missing))
+        }
+        fn checkpoints(&self, id: &AgentId) -> Result<Vec<Checkpoint>, PortError> {
+            let d = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            let ids = d.1.get(id.as_str()).cloned().unwrap_or_default();
+            Ok(ids
+                .into_iter()
+                .map(|id| Checkpoint { id, label: None })
+                .collect())
+        }
+        fn checkpoint(&self, id: &AgentId, _: Option<&Label>) -> Result<CheckpointId, PortError> {
+            self.log(format!("checkpoint {id}"));
+            Ok(self.add(id))
+        }
+        fn delete(&self, id: &AgentId, cp: &CheckpointId) -> Result<(), PortError> {
+            self.log(format!("delete {id} {cp}"));
+            let mut d = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            d.1.entry(id.to_string()).or_default().retain(|c| c != cp);
+            Ok(())
+        }
+        fn restore(&self, id: &AgentId, cp: &CheckpointId) -> Result<CheckpointId, PortError> {
+            self.log(format!("restore {id} {cp}"));
+            Ok(self.add(id))
+        }
+        fn fork(
+            &self,
+            from: &AgentId,
+            cp: Option<&CheckpointId>,
+            to: &AgentId,
+        ) -> Result<(), PortError> {
+            self.log(format!("fork {from} {cp:?} {to}"));
+            let mut d = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            d.0.insert(to.to_string(), Volume::Subvolume);
+            Ok(())
+        }
+        fn migrate(&self, id: &AgentId) -> Result<(), PortError> {
+            self.log(format!("migrate {id}"));
+            let mut d = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+            d.0.insert(id.to_string(), Volume::Subvolume);
+            Ok(())
+        }
+        fn purge(&self, id: &AgentId) -> Result<(), PortError> {
+            self.log(format!("purge {id}"));
+            Ok(())
+        }
+    }
+
+    fn snap_fleet<'a>(
+        rt: &'a FakeRuntime,
+        snaps: &Arc<FakeSnaps>,
+        agents: &[(&str, State)],
+    ) -> Fleet<&'a FakeRuntime, FakeStore> {
+        let store = FakeStore::default();
+        for (id, state) in agents {
+            let _ = store.set_state(&agent(id), *state);
+        }
+        Fleet::new(rt, store).with_snapshots(snaps.clone(), 2)
+    }
+
+    #[test]
+    fn snapshots_off_is_its_own_error() {
+        let rt = FakeRuntime::default();
+        let fleet = Fleet::new(&rt, FakeStore::default());
+        assert!(matches!(
+            fleet.checkpoint(&id(), None),
+            Err(FleetError::SnapshotsOff)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_needs_a_live_agent_on_a_subvolume_and_room() {
+        let rt = FakeRuntime::default();
+        let snaps = FakeSnaps::with(&[("a1", Volume::Subvolume), ("plain", Volume::Directory)]);
+        let fleet = snap_fleet(
+            &rt,
+            &snaps,
+            &[
+                ("a1", State::Running),
+                ("plain", State::Paused),
+                ("gone", State::Destroyed),
+            ],
+        );
+        assert!(fleet.checkpoint(&id(), None).is_ok());
+        assert!(fleet.checkpoint(&id(), None).is_ok());
+        let full = fleet.checkpoint(&id(), None);
+        assert!(matches!(
+            full,
+            Err(FleetError::Refused(Refusal::Full { max: 2, .. }))
+        ));
+        let plain = fleet.checkpoint(&agent("plain"), None);
+        assert!(matches!(
+            plain,
+            Err(FleetError::Refused(Refusal::Volume { .. }))
+        ));
+        let gone = fleet.checkpoint(&agent("gone"), None);
+        assert!(matches!(
+            gone,
+            Err(FleetError::Refused(Refusal::State { .. }))
+        ));
+        assert!(matches!(
+            fleet.checkpoint(&agent("nobody"), None),
+            Err(FleetError::NotFound(_))
+        ));
+        assert_eq!(snaps.calls(), ["checkpoint a1", "checkpoint a1"]);
+        let (list, max) = fleet.checkpoints(&id()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((list.len(), max), (2, 2));
+    }
+
+    #[test]
+    fn restore_needs_paused_a_known_checkpoint_and_room_for_the_one_it_keeps() {
+        let rt = FakeRuntime::default();
+        let snaps = FakeSnaps::with(&[("a1", Volume::Subvolume)]);
+        let fleet = snap_fleet(&rt, &snaps, &[("a1", State::Running)]);
+        let cp = fleet
+            .checkpoint(&id(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let running = fleet.restore(&id(), &cp);
+        assert!(matches!(
+            running,
+            Err(FleetError::Refused(Refusal::State { .. }))
+        ));
+        let _ = fleet.pause(&id());
+        let unknown = CheckpointId::parse("20200101-000000").unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            fleet.restore(&id(), &unknown),
+            Err(FleetError::NoCheckpoint(..))
+        ));
+        let pre = fleet.restore(&id(), &cp).unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(pre, cp);
+        // Two now, the cap: the next restore has no room for the checkpoint it keeps.
+        assert!(matches!(
+            fleet.restore(&id(), &cp),
+            Err(FleetError::Refused(Refusal::Full { .. }))
+        ));
+        let _ = fleet.delete_checkpoint(&id(), &pre);
+        assert!(fleet.restore(&id(), &cp).is_ok());
+        assert!(matches!(
+            fleet.delete_checkpoint(&id(), &unknown),
+            Err(FleetError::NoCheckpoint(..))
+        ));
+    }
+
+    #[test]
+    fn fork_snapshots_then_boots_like_a_create() {
+        let rt = FakeRuntime::default();
+        let snaps = FakeSnaps::with(&[("a1", Volume::Subvolume), ("old", Volume::Directory)]);
+        let fleet = snap_fleet(
+            &rt,
+            &snaps,
+            &[("a1", State::Destroyed), ("old", State::Destroyed)],
+        );
+        let b1 = agent("b1");
+        assert!(matches!(
+            fleet.fork(&id(), None, &b1, None),
+            Ok(State::Running)
+        ));
+        assert_eq!(fleet.state(&b1).ok().flatten(), Some(State::Running));
+        assert_eq!(*rt.calls.borrow(), ["create"]);
+        // b1 now exists; a destroyed agent that kept its workspace is taken too.
+        for to in ["b1", "old"] {
+            let r = fleet.fork(&id(), None, &agent(to), None);
+            assert!(
+                matches!(r, Err(FleetError::Refused(Refusal::Taken(_)))),
+                "{to}"
+            );
+        }
+        let unknown = CheckpointId::parse("20200101-000000").unwrap_or_else(|e| panic!("{e}"));
+        let r = fleet.fork(&id(), Some(&unknown), &agent("c1"), None);
+        assert!(matches!(r, Err(FleetError::NoCheckpoint(..))));
+        assert_eq!(snaps.calls(), ["fork a1 None b1"]);
+    }
+
+    #[test]
+    fn migrate_needs_a_stopped_vm_and_a_plain_directory() {
+        let rt = FakeRuntime::default();
+        let snaps = FakeSnaps::with(&[("a1", Volume::Directory), ("up", Volume::Directory)]);
+        let fleet = snap_fleet(
+            &rt,
+            &snaps,
+            &[("a1", State::Paused), ("up", State::Running)],
+        );
+        let up = fleet.migrate(&agent("up"));
+        assert!(matches!(
+            up,
+            Err(FleetError::Refused(Refusal::State { .. }))
+        ));
+        assert!(fleet.migrate(&id()).is_ok());
+        let again = fleet.migrate(&id());
+        assert!(matches!(
+            again,
+            Err(FleetError::Refused(Refusal::Volume { .. }))
+        ));
+    }
+
+    #[test]
+    fn purge_deletes_checkpoints_but_destroy_keeps_them() {
+        let rt = FakeRuntime::default();
+        let snaps = FakeSnaps::with(&[("a1", Volume::Subvolume)]);
+        let fleet = snap_fleet(&rt, &snaps, &[("a1", State::Running)]);
+        let _ = fleet.destroy(&id(), false);
+        assert!(snaps.calls().is_empty());
+        let _ = fleet.destroy(&id(), true);
+        assert_eq!(snaps.calls(), ["purge a1"]);
     }
 }

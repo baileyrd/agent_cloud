@@ -177,8 +177,9 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
     }
 
     /// One line in the gateway log and an event in the agent's history: token name, action, its
-    /// flags, the job a submit created, the egress profiles a create or attach named (validated
-    /// names only), the status. No prompt, body or terminal content.
+    /// flags, the job a submit created, the egress profiles a create, fork or attach named
+    /// (validated names only), a fork's new agent and checkpoint, a deleted checkpoint, the
+    /// status. No prompt, body or terminal content.
     fn audit(
         &self,
         token: &Token,
@@ -195,7 +196,17 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             "egress" => Some("profiles"),
             _ => None,
         };
-        if let Some(Ok(Some(p))) = key.map(|k| crate::profiles_in(r.body, k)) {
+        let mut profiles = key.map(|k| crate::profiles_in(r.body, k));
+        if action == "fork" {
+            if let Ok(f) = crate::Fork::parse(r.body) {
+                line.push_str(&format!(" to={}", f.to));
+                if let Some(cp) = &f.checkpoint {
+                    line.push_str(&format!(" checkpoint={cp}"));
+                }
+                profiles = Some(Ok(f.profiles));
+            }
+        }
+        if let Some(Ok(Some(p))) = profiles {
             let names = ac_domain::egress::names(&p);
             line.push_str(&format!(
                 " profiles={}",
@@ -207,6 +218,10 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             if query.split('&').any(|p| p == flag) {
                 line.push_str(&format!(" {flag}"));
             }
+        }
+        if rule.path.contains("{cp}") {
+            let cp = target.split('/').nth(6).unwrap_or_default();
+            line.push_str(&format!(" checkpoint={}", shown(cp)));
         }
         if rule.path.contains("{job}") {
             let job = target.split('/').nth(6).unwrap_or_default();

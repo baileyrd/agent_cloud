@@ -1032,6 +1032,8 @@ fn ctr(
         namespace: "agents".into(),
         image: "agent:latest".into(),
         workspace_root: root.join("workspaces"),
+        checkpoint_root: root.join("checkpoints"),
+        btrfs_bin: "btrfs".into(),
         env_dir: root.join("boot"),
         workspace_owner: None,
         network: None,

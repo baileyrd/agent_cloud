@@ -12,6 +12,7 @@ platform.workspace = true
 rusty_libc.workspace = true
 
 [dev-dependencies]
+platform-linux.workspace = true
 platform-mock.workspace = true
 
 [lints]

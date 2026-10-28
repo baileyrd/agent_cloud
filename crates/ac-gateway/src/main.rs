@@ -25,6 +25,10 @@
 //! /etc/agent-cloud/egress-allow.txt), `AC_EGRESS_PROXY` (what credentials name, default
 //! 10.89.0.1:3128). Every create and resume boots with a new credential; a malformed agents file
 //! refuses the start.
+//! Checkpoints (ADR-018): `AC_CHECKPOINT_MAX` (checkpoints each agent may keep, default 8),
+//! `AC_BTRFS` (the btrfs binary, default `btrfs`). Checkpoints live under `$AC_DATA/checkpoints`;
+//! at startup the gateway logs whether the workspace root is on btrfs and which workspaces are
+//! still plain directories.
 //! Admission (ADR-012): `AC_SHM_MARGIN_MIB` (MiB of `/dev/shm` kept free, default 512),
 //! `AC_VM_MEMORY_MIB` (guest size, instead of `default_memory` in `AC_KATA_CONFIG`, default
 //! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
@@ -334,6 +338,32 @@ fn settings_check() {
     }
 }
 
+/// `AC_CHECKPOINT_MAX`, default 8, at least 1.
+fn checkpoint_max() -> Result<usize, String> {
+    match env("AC_CHECKPOINT_MAX", "8").parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        Ok(_) => Err("AC_CHECKPOINT_MAX must be at least 1".to_owned()),
+        Err(e) => Err(format!("AC_CHECKPOINT_MAX: {e}")),
+    }
+}
+
+/// One line on whether workspaces can be checkpointed, naming those still to migrate.
+fn log_volumes(rt: &CtrRuntime<LinuxSpawner>) {
+    match rt.plain_workspaces() {
+        Ok(None) => eprintln!("ac-gateway: checkpoints: the workspace root is not on btrfs; off"),
+        Ok(Some(plain)) if plain.is_empty() => eprintln!("ac-gateway: checkpoints: on"),
+        Ok(Some(plain)) => {
+            let names: Vec<&str> = plain.iter().map(ac_domain::AgentId::as_str).collect();
+            eprintln!(
+                "ac-gateway: checkpoints: on; plain-directory workspaces to migrate (paused, \
+                 ac-ctl workspace migrate <id>): {}",
+                names.join(" ")
+            )
+        }
+        Err(e) => eprintln!("ac-gateway: checkpoints: {e}"),
+    }
+}
+
 fn run() -> Result<(), String> {
     let notify = Notify::from_env();
     let mut file = tokens_file()?;
@@ -365,6 +395,8 @@ fn run() -> Result<(), String> {
         namespace: env("AC_NAMESPACE", "agents"),
         image,
         workspace_root: data.join("workspaces"),
+        checkpoint_root: data.join("checkpoints"),
+        btrfs_bin: env("AC_BTRFS", "btrfs"),
         env_dir: data.join("boot"),
         workspace_owner: Some((uid, uid)),
         network,
@@ -394,8 +426,11 @@ fn run() -> Result<(), String> {
     );
     let runtime = CtrRuntime::new(LinuxSpawner, cfg.clone());
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
-    let mut fleet =
-        Fleet::new(runtime, Arc::clone(&store)).with_admission(Box::new(host_capacity()?), margin);
+    let snapshots = CtrRuntime::new(LinuxSpawner, cfg.clone());
+    log_volumes(&snapshots);
+    let mut fleet = Fleet::new(runtime, Arc::clone(&store))
+        .with_admission(Box::new(host_capacity()?), margin)
+        .with_snapshots(Arc::new(snapshots), checkpoint_max()?);
     let egress = match networked {
         true => Some(Arc::new(egress_store()?)),
         false => None,

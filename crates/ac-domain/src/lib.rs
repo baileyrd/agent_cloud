@@ -2,6 +2,7 @@
 
 pub mod allowlist;
 pub mod capacity;
+pub mod checkpoint;
 pub mod egress;
 pub mod health;
 pub mod id;
@@ -12,6 +13,7 @@ pub mod tune;
 
 pub use allowlist::{Allowlist, AllowlistError};
 pub use capacity::{GuestMemory, Shortfall};
+pub use checkpoint::{Checkpoint, CheckpointId, Label, Refusal, Volume};
 pub use egress::{Attachment, ProfileName};
 pub use id::{AgentId, IdError};
 pub use job::{Job, JobEvent, JobId, JobInputError, JobState, JobTransitionError};

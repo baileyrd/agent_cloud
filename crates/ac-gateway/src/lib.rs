@@ -18,6 +18,14 @@
 //! `PUT .../{id}/egress` with `{"profiles":["rust"]}` replaces them (the proxy applies it to the
 //! next request). A create may carry `{"egress_profiles":[...]}`, which needs `egress:write` too.
 //! The API attaches only profiles that exist; it never defines hosts.
+//!
+//! Checkpoints and forks (ADR-018): `GET .../{id}/checkpoints` lists them and the cap,
+//! `POST .../{id}/checkpoints` with `{"label"?}` makes one (201), `DELETE .../checkpoints/{cp}`
+//! deletes one, `POST .../{id}/restore` with `{"checkpoint"}` puts one back on a paused agent and
+//! keeps what it replaced as a checkpoint, and `POST .../{id}/fork` with
+//! `{"id","checkpoint"?,"egress_profiles"?}` creates agent `id` on a copy of the workspace (201).
+//! A fork needs a token for both agents, and `egress:write` to attach profiles. A refused one is
+//! 409 and changes nothing; without snapshots (no `with_snapshots`), 404.
 
 pub mod access;
 pub mod bind;
@@ -32,7 +40,7 @@ pub mod web;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use ac_domain::{AgentId, ProfileName, Shortfall, State};
+use ac_domain::{AgentId, CheckpointId, Label, ProfileName, Shortfall, State};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::{Runtime, SessionStore};
 use egress::Profiles;
@@ -216,9 +224,110 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
                 (None, _) => error(400, "purge must be true or false"),
                 (_, None) => error(400, "force must be true or false"),
             },
-            (_, None | Some("pause" | "resume" | "egress")) => error(405, "method not allowed"),
+            ("GET", Some("checkpoints")) => self.checkpoints(&id),
+            ("POST", Some("checkpoints")) => self.checkpoint(&id, body),
+            ("POST", Some("restore")) => self.restore(&id, body),
+            ("POST", Some("fork")) => self.fork(&id, body, agents, may_attach),
+            ("DELETE", Some(a)) if one_checkpoint(a).is_some() => match one_checkpoint(a) {
+                Some(Ok(cp)) => match self.fleet.delete_checkpoint(&id, &cp) {
+                    Ok(()) => Reply {
+                        status: 200,
+                        body: format!(r#"{{"id":"{id}","deleted":"{cp}"}}"#),
+                    },
+                    Err(e) => map_error(&e),
+                },
+                _ => error(400, "bad checkpoint id"),
+            },
+            (
+                _,
+                None | Some("pause" | "resume" | "egress" | "checkpoints" | "restore" | "fork"),
+            ) => error(405, "method not allowed"),
+            (_, Some(a)) if one_checkpoint(a).is_some() => error(405, "method not allowed"),
             _ => error(404, "not found"),
         }
+    }
+
+    /// `{"id","max","checkpoints":[{"id","label"?}, ...]}`, oldest first.
+    fn checkpoints(&self, id: &AgentId) -> Reply {
+        match self.fleet.checkpoints(id) {
+            Ok((all, max)) => {
+                let items: Vec<String> = all
+                    .iter()
+                    .map(|c| checkpoint_json(&c.id, c.label.as_ref()))
+                    .collect();
+                Reply {
+                    status: 200,
+                    body: format!(
+                        r#"{{"id":"{id}","max":{max},"checkpoints":[{}]}}"#,
+                        items.join(",")
+                    ),
+                }
+            }
+            Err(e) => map_error(&e),
+        }
+    }
+
+    fn checkpoint(&self, id: &AgentId, body: &[u8]) -> Reply {
+        let label = match only_text(body, "label") {
+            Ok(None) => None,
+            Ok(Some(l)) => match Label::parse(&l) {
+                Ok(l) => Some(l),
+                Err(e) => return error(400, &e.to_string()),
+            },
+            Err(reply) => return reply,
+        };
+        match self.fleet.checkpoint(id, label.as_ref()) {
+            Ok(cp) => Reply {
+                status: 201,
+                body: checkpoint_json(&cp, label.as_ref()),
+            },
+            Err(e) => map_error(&e),
+        }
+    }
+
+    /// Refused while the agent has a job (a paused agent normally has none).
+    fn restore(&self, id: &AgentId, body: &[u8]) -> Reply {
+        let cp = match only_text(body, "checkpoint") {
+            Ok(Some(cp)) => match CheckpointId::parse(&cp) {
+                Ok(cp) => cp,
+                Err(e) => return error(400, &format!("checkpoint: {e}")),
+            },
+            Ok(None) => return error(400, "body must be {\"checkpoint\":\"<id>\"}"),
+            Err(reply) => return reply,
+        };
+        if self.jobs.busy(id) {
+            return error(409, &format!("agent {id} has a queued or running job"));
+        }
+        match self.fleet.restore(id, &cp) {
+            Ok(kept) => Reply {
+                status: 200,
+                body: format!(r#"{{"id":"{id}","restored":"{cp}","kept":"{kept}"}}"#),
+            },
+            Err(e) => map_error(&e),
+        }
+    }
+
+    /// The new agent must be one the token is for: 404 otherwise, as for any other agent.
+    fn fork(&self, from: &AgentId, body: &[u8], agents: &Agents, may_attach: bool) -> Reply {
+        let f = match Fork::parse(body) {
+            Ok(f) => f,
+            Err(reply) => return reply,
+        };
+        if !agents.contains(f.to.as_str()) {
+            return error(404, "not found");
+        }
+        if let Some(p) = &f.profiles {
+            if !p.is_empty() && !may_attach {
+                return error(403, "attaching egress profiles needs scope egress:write");
+            }
+            if let Err(reply) = self.usable(p) {
+                return reply;
+            }
+        }
+        let made = self
+            .fleet
+            .fork(from, f.checkpoint.as_ref(), &f.to, f.profiles.as_deref());
+        self.done(&f.to, made, 201)
     }
 
     /// Create, attaching the body's `egress_profiles` (which needs `egress:write`) before boot.
@@ -432,9 +541,61 @@ fn no_egress() -> Reply {
     error(404, "egress profiles are off (AC_NETWORK is not 1)")
 }
 
-/// `{"<key>": ["name", ...]}`, the body's only member, as validated profile names without
-/// duplicates. `None` for an empty body or one without `key`.
-pub fn profiles_in(body: &[u8], key: &str) -> Result<Option<Vec<ProfileName>>, Reply> {
+/// A fork's body: `{"id","checkpoint"?,"egress_profiles"?}`.
+#[derive(Debug)]
+pub struct Fork {
+    /// The new agent.
+    pub to: AgentId,
+    /// The checkpoint to fork from; `None`: the workspace as it is now.
+    pub checkpoint: Option<CheckpointId>,
+    /// Profiles to attach to the new agent.
+    pub profiles: Option<Vec<ProfileName>>,
+}
+
+impl Fork {
+    /// Parse and validate a fork's body.
+    pub fn parse(body: &[u8]) -> Result<Self, Reply> {
+        let value = members(body, &["id", "checkpoint", "egress_profiles"])?;
+        let to = match text(value.as_ref(), "id")? {
+            Some(id) => AgentId::parse(id).map_err(|e| error(400, &format!("id: {e}")))?,
+            None => {
+                return Err(error(
+                    400,
+                    "body must name the new agent: {\"id\":\"<id>\"}",
+                ))
+            }
+        };
+        let checkpoint = text(value.as_ref(), "checkpoint")?
+            .map(CheckpointId::parse)
+            .transpose()
+            .map_err(|e| error(400, &format!("checkpoint: {e}")))?;
+        let profiles = match &value {
+            Some(v) => profile_list(v, "egress_profiles")?,
+            None => None,
+        };
+        Ok(Self {
+            to,
+            checkpoint,
+            profiles,
+        })
+    }
+}
+
+/// `checkpoints/<cp>` as a checkpoint id (`Err` if malformed); `None` for any other action.
+fn one_checkpoint(action: &str) -> Option<Result<CheckpointId, ac_domain::IdError>> {
+    let cp = action.strip_prefix("checkpoints/")?;
+    (!cp.contains('/')).then(|| CheckpointId::parse(cp))
+}
+
+fn checkpoint_json(cp: &CheckpointId, label: Option<&Label>) -> String {
+    match label {
+        Some(l) => format!(r#"{{"id":"{cp}","label":"{}"}}"#, escape(l.as_str())),
+        None => format!(r#"{{"id":"{cp}"}}"#),
+    }
+}
+
+/// The body as a JSON object with no member outside `allowed`; `None` for an empty body.
+fn members(body: &[u8], allowed: &[&str]) -> Result<Option<Value>, Reply> {
     let bad = |m: &str| error(400, m);
     if body.trim_ascii().is_empty() {
         return Ok(None);
@@ -444,12 +605,44 @@ pub fn profiles_in(body: &[u8], key: &str) -> Result<Option<Vec<ProfileName>>, R
     let Some(obj) = value.as_object() else {
         return Err(bad("body must be a JSON object"));
     };
-    if let Some(k) = obj.keys().find(|k| k.as_str() != key) {
+    if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(bad(&format!(
             "unknown member {:?}",
             k.chars().take(40).collect::<String>()
         )));
     }
+    Ok(Some(value))
+}
+
+/// The string member `key`, if present.
+fn text<'a>(value: Option<&'a Value>, key: &str) -> Result<Option<&'a str>, Reply> {
+    match value.and_then(|v| v.get(key)) {
+        None => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| error(400, &format!("{key} must be a string"))),
+    }
+}
+
+/// The string member `key`, the body's only one; `None` for an empty body or one without it.
+fn only_text(body: &[u8], key: &str) -> Result<Option<String>, Reply> {
+    let value = members(body, &[key])?;
+    Ok(text(value.as_ref(), key)?.map(str::to_owned))
+}
+
+/// `{"<key>": ["name", ...]}`, the body's only member, as validated profile names without
+/// duplicates. `None` for an empty body or one without `key`.
+pub fn profiles_in(body: &[u8], key: &str) -> Result<Option<Vec<ProfileName>>, Reply> {
+    match members(body, &[key])? {
+        Some(value) => profile_list(&value, key),
+        None => Ok(None),
+    }
+}
+
+/// Member `key` of `value` as validated profile names without duplicates; `None` if absent.
+fn profile_list(value: &Value, key: &str) -> Result<Option<Vec<ProfileName>>, Reply> {
+    let bad = |m: &str| error(400, m);
     let Some(list) = value.get(key) else {
         return Ok(None);
     };
@@ -503,8 +696,8 @@ impl<R, S> Api<R, S> {
 
 fn map_error(e: &FleetError) -> Reply {
     let status = match e {
-        FleetError::NotFound(_) => 404,
-        FleetError::AlreadyExists(_) | FleetError::Illegal(_) => 409,
+        FleetError::NotFound(_) | FleetError::NoCheckpoint(..) | FleetError::SnapshotsOff => 404,
+        FleetError::AlreadyExists(_) | FleetError::Illegal(_) | FleetError::Refused(_) => 409,
         FleetError::NoCapacity(s) => return no_capacity(s),
         FleetError::Port(_) => 500,
     };
@@ -1134,5 +1327,163 @@ mod tests {
         let r = call(&api(true), "POST", "/api/v1/agents/a1");
         assert_eq!(r.0, 500);
         assert!(r.1.contains(r#"bad \"thing\""#), "{}", r.1);
+    }
+
+    /// Every workspace a subvolume; checkpoints in memory, numbered from a fixed time.
+    #[derive(Default)]
+    struct Snaps(Mutex<HashMap<String, Vec<ac_domain::Checkpoint>>>);
+
+    impl ac_ports::Snapshots for Snaps {
+        fn volume(&self, id: &AgentId) -> Result<ac_domain::Volume, PortError> {
+            Ok(match id.as_str() {
+                "free" | "other" => ac_domain::Volume::Missing,
+                _ => ac_domain::Volume::Subvolume,
+            })
+        }
+        fn checkpoints(&self, id: &AgentId) -> Result<Vec<ac_domain::Checkpoint>, PortError> {
+            let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(m.get(id.as_str()).cloned().unwrap_or_default())
+        }
+        fn checkpoint(
+            &self,
+            id: &AgentId,
+            label: Option<&Label>,
+        ) -> Result<CheckpointId, PortError> {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let list = m.entry(id.to_string()).or_default();
+            let taken: Vec<CheckpointId> = list.iter().map(|c| c.id.clone()).collect();
+            let cp = CheckpointId::next(1_793_192_712, &taken);
+            list.push(ac_domain::Checkpoint {
+                id: cp.clone(),
+                label: label.cloned(),
+            });
+            Ok(cp)
+        }
+        fn delete(&self, id: &AgentId, cp: &CheckpointId) -> Result<(), PortError> {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            m.entry(id.to_string()).or_default().retain(|c| &c.id != cp);
+            Ok(())
+        }
+        fn restore(&self, id: &AgentId, _: &CheckpointId) -> Result<CheckpointId, PortError> {
+            self.checkpoint(id, None)
+        }
+        fn fork(
+            &self,
+            _: &AgentId,
+            _: Option<&CheckpointId>,
+            _: &AgentId,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn migrate(&self, _: &AgentId) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn purge(&self, _: &AgentId) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    fn snap_api() -> Api<Rt, Store> {
+        Api::new(
+            Fleet::new(Rt { fail: false }, Store::default())
+                .with_snapshots(Arc::new(Snaps::default()), 2),
+        )
+    }
+
+    const A1: &str = "/api/v1/agents/a1";
+
+    #[test]
+    fn checkpoints_off_is_404_with_its_reason() {
+        let a = api(false);
+        let _ = call(&a, "POST", A1);
+        let (status, body) = call(&a, "GET", &format!("{A1}/checkpoints"));
+        assert_eq!(
+            (status, body.as_str()),
+            (404, r#"{"error":"checkpoints are off"}"#)
+        );
+    }
+
+    #[test]
+    fn checkpoint_list_and_delete() {
+        let a = snap_api();
+        let _ = call(&a, "POST", A1);
+        let cps = format!("{A1}/checkpoints");
+        let (status, body) = send(&a, "POST", &cps, r#"{"label":"before \"x\""}"#, false);
+        assert_eq!(status, 201);
+        assert_eq!(body, r#"{"id":"20261028-130512","label":"before \"x\""}"#);
+        assert_eq!(send(&a, "POST", &cps, "", false).0, 201);
+        assert_eq!(
+            call(&a, "GET", &cps).1,
+            r#"{"id":"a1","max":2,"checkpoints":[{"id":"20261028-130512","label":"before \"x\""},{"id":"20261028-130512-2"}]}"#
+        );
+        let (status, body) = send(&a, "POST", &cps, "", false);
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("delete one first"), "{body}");
+        for bad in [r#"{"label":""}"#, r#"{"label":3}"#, r#"{"name":"x"}"#, "[]"] {
+            assert_eq!(send(&a, "POST", &cps, bad, false).0, 400, "{bad}");
+        }
+        assert_eq!(call(&a, "DELETE", &format!("{cps}/20261028-130512")).0, 200);
+        assert_eq!(call(&a, "DELETE", &format!("{cps}/20261028-130512")).0, 404);
+        assert_eq!(call(&a, "DELETE", &format!("{cps}/BAD")).0, 400);
+        assert_eq!(call(&a, "POST", &format!("{cps}/20261028-130512-2")).0, 405);
+        assert_eq!(call(&a, "DELETE", &format!("{cps}/x/y")).0, 404);
+        assert_eq!(call(&a, "GET", "/api/v1/agents/zz/checkpoints").0, 404);
+    }
+
+    #[test]
+    fn restore_needs_a_paused_agent() {
+        let a = snap_api();
+        let _ = call(&a, "POST", A1);
+        let _ = send(&a, "POST", &format!("{A1}/checkpoints"), "", false);
+        let restore = format!("{A1}/restore");
+        let body = r#"{"checkpoint":"20261028-130512"}"#;
+        assert_eq!(send(&a, "POST", &restore, body, false).0, 409);
+        let _ = call(&a, "POST", &format!("{A1}/pause"));
+        assert_eq!(
+            send(&a, "POST", &restore, body, false),
+            (
+                200,
+                r#"{"id":"a1","restored":"20261028-130512","kept":"20261028-130512-2"}"#.into()
+            )
+        );
+        let unknown = r#"{"checkpoint":"20200101-000000"}"#;
+        assert_eq!(send(&a, "POST", &restore, unknown, false).0, 404);
+        assert_eq!(send(&a, "POST", &restore, "", false).0, 400);
+        assert_eq!(
+            send(&a, "POST", &restore, r#"{"checkpoint":"../x"}"#, false).0,
+            400
+        );
+    }
+
+    #[test]
+    fn fork_needs_a_token_for_the_new_agent_and_egress_write_for_profiles() {
+        let a = snap_api();
+        let _ = call(&a, "POST", A1);
+        let fork = format!("{A1}/fork");
+        let only_a1 = Agents::Only(vec![AgentId::parse("a1").unwrap_or_else(|e| panic!("{e}"))]);
+        let r = a.request("POST", &fork, br#"{"id":"free"}"#, &only_a1, false);
+        assert_eq!(
+            (r.status, r.body.as_str()),
+            (404, r#"{"error":"not found"}"#)
+        );
+        let with_profiles = br#"{"id":"free","egress_profiles":["rust"]}"#;
+        assert_eq!(
+            a.request("POST", &fork, with_profiles, &Agents::All, false)
+                .status,
+            403
+        );
+        assert_eq!(
+            send(&a, "POST", &fork, r#"{"id":"free"}"#, false),
+            (201, r#"{"id":"free","state":"running"}"#.into())
+        );
+        // "a1" has a workspace already, and is running.
+        let (status, body) = send(&a, "POST", &fork, r#"{"id":"a1"}"#, false);
+        assert_eq!(status, 409);
+        assert!(body.contains("already has a workspace"), "{body}");
+        let from_unknown = r#"{"id":"other","checkpoint":"20200101-000000"}"#;
+        assert_eq!(send(&a, "POST", &fork, from_unknown, false).0, 404);
+        for bad in ["", r#"{"id":"BAD"}"#, r#"{"id":"x","extra":1}"#] {
+            assert_eq!(send(&a, "POST", &fork, bad, false).0, 400, "{bad}");
+        }
     }
 }

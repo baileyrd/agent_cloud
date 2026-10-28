@@ -31,7 +31,7 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
     agents only) puts one back and keeps the workspace it replaces as a new checkpoint; fork
     creates and boots a new agent on a copy of the workspace, or of checkpoint --from. workspace
     migrate turns a paused agent's plain-directory workspace into a subvolume.
-  Backups (ADR-019; root; dest on another btrfs filesystem): backup sends each subvolume
+  Backups (ADR-021; root; dest on another btrfs filesystem): backup sends each subvolume
     workspace (or those named) to <dest>/<agent>/<backup>, incrementally after the first, and
     keeps the newest --keep (default 7) there; exit 1 if any agent was not backed up (a plain
     directory needs workspace migrate). backups lists them. restore-backup puts one (default the

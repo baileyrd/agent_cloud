@@ -525,7 +525,7 @@ on BaileyServ (2026-10-28): with a job in a1 writing a line and a 4 KiB file eac
 and the job kept writing; a fork from it booted in 4.8 s and read back 25 lines and 25 whole files inside its VM;
 restore (0.7 s) and the restore of what it kept both read back correctly inside a1 after resume.
 
-**Backups** (ADR-019): needs a second disk formatted btrfs and mounted at `/mnt/agent-backups` (another path:
+**Backups** (ADR-021): needs a second disk formatted btrfs and mounted at `/mnt/agent-backups` (another path:
 `sudo systemctl edit ac-backup.service` and override `ExecStart` and `RequiresMountsFor`). Workspaces must be
 subvolumes (migrate plain ones first, as above). None of these commands opens the registry, so they work while
 the gateway runs:

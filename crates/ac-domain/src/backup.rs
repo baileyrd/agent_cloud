@@ -1,4 +1,4 @@
-//! Workspace backups (ADR-019) as pure rules: which earlier backup a new one is sent against,
+//! Workspace backups (ADR-021) as pure rules: which earlier backup a new one is sent against,
 //! which backups retention removes, and when a backup may be restored over a workspace.
 
 use std::fmt;

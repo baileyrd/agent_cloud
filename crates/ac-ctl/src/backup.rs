@@ -1,4 +1,4 @@
-//! `ac-ctl backup`, `backups` and `restore-backup` (ADR-019). None of them opens the registry, so
+//! `ac-ctl backup`, `backups` and `restore-backup` (ADR-021). None of them opens the registry, so
 //! they run beside `ac-gateway`; a backup and a restore hold `<data>/backup.lock` against each
 //! other.
 

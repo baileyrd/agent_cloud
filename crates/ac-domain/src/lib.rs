@@ -3,6 +3,7 @@
 pub mod allowlist;
 pub mod backup;
 pub mod capacity;
+pub mod changes;
 pub mod checkpoint;
 pub mod egress;
 pub mod health;

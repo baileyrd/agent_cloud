@@ -19,6 +19,10 @@
 //! `<data>/jobs/<agent>/<job>/`, served as `text/plain` with `nosniff`, and never parsed here. The
 //! gateway never writes, chowns or reads a path below the workspace root (the agent controls it);
 //! the prompt goes in with `O_CREAT|O_EXCL` at the root and the start exec moves it.
+//!
+//! What a started job changed (ADR-019) is noted in the agent's history when it ends: [`Changes`]
+//! compares workspace snapshots from its start and end, which btrfs does without root opening a
+//! path inside the workspace.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -51,6 +55,8 @@ pub const MAX_WAITERS: usize = 8;
 pub const RESULT_CAP: usize = 256 * 1024;
 /// What is kept of a job's stream log (its end).
 pub const STREAM_CAP: usize = 1024 * 1024;
+/// Most bytes of paths in a job's change note (ADR-019); the rest are counted.
+pub const CHANGE_NOTE_CAP: usize = 2048;
 /// How often a running job is probed with an exec when it has not said it finished. Execs are
 /// kept rare and unhurried: a `ctr` exec SIGKILLed at a short budget while the host was loaded
 /// left a1's shim wedged (2026-10-21, a 2 s status poll every 2 s).
@@ -207,6 +213,59 @@ pub trait JobRunner: Send + Sync + 'static {
     fn kill(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
     /// Up to [`RESULT_CAP`] bytes of the result, or the last [`STREAM_CAP`] of the log.
     fn read(&self, agent: &AgentId, job: &JobId, part: Part) -> Result<Vec<u8>, String>;
+}
+
+/// Which workspace paths a job changed (ADR-019): a snapshot as it starts, compared with one as
+/// it ends. Implemented over btrfs for [`CtrRuntime`]; tests use a fake.
+pub trait Changes: Send + Sync + 'static {
+    /// Snapshot the agent's workspace as `job` starts; nothing, and `Ok`, where it cannot be.
+    fn begin(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
+    /// The paths changed since [`Changes::begin`], whose snapshot is then deleted; `None` if it
+    /// took none.
+    fn end(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String>;
+}
+
+impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
+    fn begin(&self, agent: &AgentId, job: &JobId) -> Result<(), String> {
+        self.job_begin(agent, job).map_err(|e| e.to_string())
+    }
+
+    fn end(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+        self.job_changes(agent, job).map_err(|e| e.to_string())
+    }
+}
+
+/// The history note for the paths job `id` changed, leaving out the runner's own files (the
+/// `.jobs` directory and the root's `.job-*` names, see `START`). Paths are listed, space-separated,
+/// until [`CHANGE_NOTE_CAP`] bytes; the rest are counted.
+pub fn change_note(id: &JobId, paths: &[String]) -> String {
+    let ours = |p: &&String| {
+        p.as_str() == ".jobs"
+            || p.starts_with(".jobs/")
+            || (p.starts_with(".job-") && !p.contains('/'))
+    };
+    let paths: Vec<&String> = paths.iter().filter(|p| !ours(p)).collect();
+    let mut note = match paths.len() {
+        0 => return format!("job {id} changed no paths"),
+        1 => format!("job {id} changed 1 path:"),
+        n => format!("job {id} changed {n} paths:"),
+    };
+    let budget = note.len() + CHANGE_NOTE_CAP;
+    let shown = paths
+        .iter()
+        .take_while(|p| {
+            let fits = note.len() + 1 + p.len() <= budget;
+            if fits {
+                note.push(' ');
+                note.push_str(p);
+            }
+            fits
+        })
+        .count();
+    if shown < paths.len() {
+        note.push_str(&format!(" (and {} more)", paths.len() - shown));
+    }
+    note
 }
 
 impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
@@ -473,6 +532,7 @@ pub struct Jobs {
     store: Arc<dyn JobStore + Send + Sync>,
     agents: Arc<dyn SessionStore + Send + Sync>,
     runner: Box<dyn JobRunner>,
+    changes: Option<Box<dyn Changes>>,
     dir: PathBuf,
     claude: Vec<String>,
     notes: Notes,
@@ -503,6 +563,7 @@ impl Jobs {
             store,
             agents,
             runner: Box::new(runner),
+            changes: None,
             dir,
             claude,
             notes: Box::new(|_, _| {}),
@@ -520,6 +581,13 @@ impl Jobs {
     /// Record state changes with `notes` (the agent's history log).
     pub fn with_notes(mut self, notes: impl Fn(&AgentId, &str) + Send + Sync + 'static) -> Self {
         self.notes = Box::new(notes);
+        self
+    }
+
+    /// Note in the agent's history which paths each started job changed, found by `changes`
+    /// (ADR-019). Without this, no change notes.
+    pub fn with_changes(mut self, changes: impl Changes) -> Self {
+        self.changes = Some(Box::new(changes));
         self
     }
 
@@ -835,10 +903,20 @@ impl Jobs {
     }
 
     fn start(&self, j: &Job) {
+        // The snapshot comes first, so a job never runs ahead of it; a refused start drops it.
+        if let Some(Err(e)) = self.changes.as_ref().map(|c| c.begin(&j.agent, &j.id)) {
+            eprintln!(
+                "ac-gateway: jobs: {}/{}: start snapshot: {e}",
+                j.agent, j.id
+            );
+        }
         if self
             .transition(&j.agent, &j.id, JobEvent::Start, None)
             .is_err()
         {
+            if let Some(Err(e)) = self.changes.as_ref().map(|c| c.end(&j.agent, &j.id)) {
+                eprintln!("ac-gateway: jobs: {}/{}: drop snapshot: {e}", j.agent, j.id);
+            }
             return;
         }
         let started = std::fs::read(self.job_dir(j).join("prompt.txt"))
@@ -872,7 +950,8 @@ impl Jobs {
     }
 
     /// Apply `event` to a job under the lock, persist it, prune old jobs if it ended, note it in
-    /// the agent's history and wake long-polls.
+    /// the agent's history and wake long-polls. A started job that ended then gets its change
+    /// note, outside the lock.
     fn transition(
         &self,
         agent: &AgentId,
@@ -882,6 +961,7 @@ impl Jobs {
     ) -> Result<Job, Reply> {
         let mut book = self.lock();
         let mut j = self.find(agent, id)?;
+        let was = j.state;
         j.apply(event, (self.clock)())
             .map_err(|e| error(409, &e.to_string()))?;
         if let Some(r) = reason {
@@ -907,7 +987,22 @@ impl Jobs {
         }
         drop(book);
         self.changed.notify_all();
+        if was == JobState::Running && j.state.is_terminal() {
+            self.note_changes(&j);
+        }
         Ok(j)
+    }
+
+    /// Note in `j`'s agent's history which paths it changed, if a start snapshot was taken.
+    fn note_changes(&self, j: &Job) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        match changes.end(&j.agent, &j.id) {
+            Ok(Some(paths)) => (self.notes)(&j.agent, &change_note(&j.id, &paths)),
+            Ok(None) => {}
+            Err(e) => eprintln!("ac-gateway: jobs: {}/{}: changes: {e}", j.agent, j.id),
+        }
     }
 
     /// Keep the newest [`KEEP`] finished jobs of `agent`. Called with the lock held.

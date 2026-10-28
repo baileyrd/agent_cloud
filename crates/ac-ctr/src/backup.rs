@@ -1,4 +1,4 @@
-//! Workspace backups over btrfs send and receive (ADR-019). A backup is a read-only snapshot of
+//! Workspace backups over btrfs send and receive (ADR-021). A backup is a read-only snapshot of
 //! the workspace, sent to `<dest>/<agent>/<backup>` on another btrfs filesystem. The last one
 //! sent stays on this host under `backup_root/<agent>/` as the parent of the next send, so only
 //! what changed crosses. Each received backup is a whole subvolume: retention deletes any of

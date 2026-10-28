@@ -116,7 +116,7 @@ pub struct CtrConfig {
     pub workspace_root: PathBuf,
     /// Parent directory of per-agent checkpoint directories (ADR-018), made 0700.
     pub checkpoint_root: PathBuf,
-    /// Parent directory of per-agent backup parents (ADR-019): the last snapshot sent to a
+    /// Parent directory of per-agent backup parents (ADR-021): the last snapshot sent to a
     /// backup destination, kept so the next send is incremental. Made 0700.
     pub backup_root: PathBuf,
     /// Path or name of the `btrfs` binary (btrfs-progs).

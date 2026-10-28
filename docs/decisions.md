@@ -808,7 +808,68 @@ against a stand-in `btrfs`, including crash recovery of a half-done swap.
 list (`btrfs filesystem du` is slow on a rotational disk); an XFS reflink backend (no host needs one); memory
 snapshots (the roadmap's separate item).
 
-## ADR-019: Workspace backups by btrfs send to a second disk
+## ADR-019: Each job's changed paths in the agent's history
+**Status:** accepted (2026-10-28; the adapter test ran against real btrfs, btrfs-progs 6.6.3 on kernel 6.18).
+**Context:** After a job, the only record of what it did to the workspace is its own final message, which the
+agent wrote. Workspaces are btrfs subvolumes (ADR-018), so the filesystem can say what changed, cheaply and
+without trusting the agent.
+
+**Decision.**
+- *Snapshots:* as a job starts, before its window opens, a read-only snapshot of the workspace goes to
+  `<data>/checkpoints/<id>/<job>.start`. When the job ends from `running` (any of succeeded, failed, cancelled,
+  timed out, interrupted), a second goes to `<job>.end`. Names with a `.` are never checkpoint ids, so neither
+  is listed nor counted under `AC_CHECKPOINT_MAX`. A job that never started gets none.
+- *Diff:* `btrfs send -q --no-data -p <job>.start -f <job>.send <job>.end`, then `btrfs receive --dump -f
+  <job>.send`. Send compares the two trees in the kernel and reads no file data; root never opens a path inside
+  the workspace. Both snapshots and the stream are deleted afterwards, on failure too; a purge deletes any a
+  crash left behind.
+- *Paths:* `ac_domain::changes::paths` reads the listing: every path added, removed, renamed (both names),
+  written, truncated, or given a new owner, mode or xattr. Times-only changes (`utimes`), the root, and send's
+  temporary `o<ino>-<gen>-<seq>` names are left out. Paths stay escaped as btrfs prints them (`\ `, `\\`,
+  `\ooo`), so none holds whitespace or a control character.
+- *Note:* one history line after the job's end state, `job <id> changed <n> paths: <path> <path> ...`, the
+  runner's own files (`.jobs/`, the root's `.job-*`) left out, at most `CHANGE_NOTE_CAP` (2 KiB) of paths and
+  then `(and <k> more)`. It is shown by `GET .../history` and the `get_history` tool, with no new route.
+- *Where it cannot:* a plain-directory workspace takes no snapshot and gets no note; a failed snapshot or diff
+  is logged to the journal and the job is unaffected.
+- *Code:* `jobs::Changes` (begin, end) is a seam beside `JobRunner`, implemented by `CtrRuntime` over
+  `ac_ctr::snap` and faked in the job tests.
+
+**Consequences:**
+- What a job did is known from the filesystem, not from the agent's account of it. The names are still
+  agent-chosen text.
+- A start snapshot keeps what the job deletes or rewrites on disk until it ends; the end snapshot lives only for
+  the diff.
+- Each started job costs two snapshot creations and deletions, and a metadata send proportional to what changed.
+  A job interrupted by pause or destroy is diffed under the lifecycle lock, before the VM stops.
+- A change undone within the job (a file written then removed) can still be listed; a `touch` is not.
+
+**Not now:** a structured route for the summary (it would be one more `access::ROUTES` entry, ADR-020); keeping the start snapshot as a restorable checkpoint (ADR-018's "checkpoints before each job").
+
+## ADR-020: One operation catalog for REST and MCP; `ac-ctl` stays local
+**Status:** accepted (2026-10-28).
+**Context:** The Ephemeral Sandbox comparison (2026-10-27) suggested generating the CLI and the MCP tools from one
+declaration, once there were two real consumers. There are now two tables that describe the same operations:
+`access::ROUTES` (method, path, scope, audit name) and `mcp::TOOLS` (name, description, method, path, arguments),
+kept in step by a test. `ac-ctl` is not a third copy of them: it drives `Fleet` directly on the data directory and
+refuses while the gateway holds it (exit 3), so it works with the gateway stopped (`reconcile` after a reboot,
+`workspace migrate`, recovery), needs no token, and has commands with no route (`reconcile`, `migrate`, `doctor`,
+`tune`). Of the gateway's 22 tools, 10 have an `ac-ctl` twin; jobs, egress, history, capacity and whoami do not.
+**Decision:**
+- *One table for the gateway.* A route of `access::ROUTES` carries its MCP tool, if it has one (name, description,
+  where arguments go, the arguments). `mcp::TOOLS` goes; `tools/list`, `tools/call` and the scope a tool gets all
+  read the route. Method and path are written once, so a tool cannot drift from its route; the cross-check
+  test becomes a pinned list of tool names plus one id argument per path placeholder. On the wire only the
+  `tools/list` order changes (it now follows the route table); names, descriptions and schemas are the same.
+- *`ac-ctl` keeps its own parser.* Generating its commands from the route table would mean turning it into a
+  REST client (a token on the host, an HTTP client, and no way to work with the gateway stopped) or giving the
+  table a second, local dispatch path. Neither has a forcing function yet.
+**Revisit when:** `ac-ctl` needs to act while the gateway runs (then it becomes a client of the same table, and
+its fleet commands are generated from it), or a third front end (a web UI form, another protocol) appears.
+**Consequences:** one place to add an operation to REST and MCP, a little less code; `ac-ctl` and the tools
+can still differ in naming (`create` vs `create_agent`) and in what they offer.
+
+## ADR-021: Workspace backups by btrfs send to a second disk
 **Status:** proposed (2026-10-28; tested on two loopback btrfs filesystems by `scripts/btrfs-backup-test.sh`, not
 yet on BaileyServ with a second disk).
 **Context:** checkpoints (ADR-018) undo an agent's mistakes, but they sit on the same disk as the workspace: a
@@ -876,26 +937,3 @@ including a receive that fails half way.
 registry needs the gateway's cooperation, and agents and tokens can be recreated); checkpoints in backups; a
 gateway route or MCP tool; destinations that are not btrfs (stream files, or a remote over SSH with
 `btrfs receive` there); encryption at the destination (use an encrypted filesystem).
-
-## ADR-020: One operation catalog for REST and MCP; `ac-ctl` stays local
-**Status:** accepted (2026-10-28).
-**Context:** The Ephemeral Sandbox comparison (2026-10-27) suggested generating the CLI and the MCP tools from one
-declaration, once there were two real consumers. There are now two tables that describe the same operations:
-`access::ROUTES` (method, path, scope, audit name) and `mcp::TOOLS` (name, description, method, path, arguments),
-kept in step by a test. `ac-ctl` is not a third copy of them: it drives `Fleet` directly on the data directory and
-refuses while the gateway holds it (exit 3), so it works with the gateway stopped (`reconcile` after a reboot,
-`workspace migrate`, recovery), needs no token, and has commands with no route (`reconcile`, `migrate`, `doctor`,
-`tune`). Of the gateway's 22 tools, 10 have an `ac-ctl` twin; jobs, egress, history, capacity and whoami do not.
-**Decision:**
-- *One table for the gateway.* A route of `access::ROUTES` carries its MCP tool, if it has one (name, description,
-  where arguments go, the arguments). `mcp::TOOLS` goes; `tools/list`, `tools/call` and the scope a tool gets all
-  read the route. Method and path are written once, so a tool cannot drift from its route; the cross-check
-  test becomes a pinned list of tool names plus one id argument per path placeholder. On the wire only the
-  `tools/list` order changes (it now follows the route table); names, descriptions and schemas are the same.
-- *`ac-ctl` keeps its own parser.* Generating its commands from the route table would mean turning it into a
-  REST client (a token on the host, an HTTP client, and no way to work with the gateway stopped) or giving the
-  table a second, local dispatch path. Neither has a forcing function yet.
-**Revisit when:** `ac-ctl` needs to act while the gateway runs (then it becomes a client of the same table, and
-its fleet commands are generated from it), or a third front end (a web UI form, another protocol) appears.
-**Consequences:** one place to add an operation to REST and MCP, a little less code; `ac-ctl` and the tools
-can still differ in naming (`create` vs `create_agent`) and in what they offer.

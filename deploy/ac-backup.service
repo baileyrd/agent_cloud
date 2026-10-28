@@ -1,4 +1,4 @@
-# Back up every agent's workspace to a second btrfs disk (ADR-019), run by ac-backup.timer.
+# Back up every agent's workspace to a second btrfs disk (ADR-021), run by ac-backup.timer.
 # ac-ctl backup does not open the registry, so it runs while ac-gateway and the agents do.
 # The destination is a btrfs filesystem on another disk, mounted at /mnt/agent-backups; to use
 # another path, `systemctl edit ac-backup.service` and override ExecStart and RequiresMountsFor.

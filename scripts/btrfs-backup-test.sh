@@ -1,5 +1,5 @@
 #!/bin/sh
-# Back up and restore workspaces on real btrfs through `ac-ctl` (ADR-019): two 256 MiB loopback
+# Back up and restore workspaces on real btrfs through `ac-ctl` (ADR-021): two 256 MiB loopback
 # btrfs filesystems, one for the data directory and one for the backups, removed after. Covers a
 # full then an incremental send, retention, a backup cut short, restore over a workspace (kept as
 # a checkpoint) and into a purged one, and the refusals. Needs root, btrfs-progs and a kernel

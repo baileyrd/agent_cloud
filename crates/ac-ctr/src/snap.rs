@@ -455,6 +455,7 @@ send*)
 receive*)
     first=$(tar -C "$2" -xvf - | head -n 1)
     name="$2/${first%/}"
+    chmod +t "$name"
     if [ -e "$LOG.fail-receive" ]; then echo "ERROR: No space left on device" >&2; exit 1; fi
     echo "$name" >> "$ro" ;;
 "property get")

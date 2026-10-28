@@ -18,7 +18,7 @@ calls the agents themselves make.
 - A virtual desktop (Xorg dummy display, Xfce, policy-locked Chromium) the agent can drive.
 - An MCP endpoint (`POST /api/v1/mcp`) whose tools follow the caller's token scopes (ADR-017).
 - A single authenticated WebSocket for watching and taking over the desktop.
-- Persistent workspace volumes with checkpoints, restore and forks on btrfs, an embedded agent registry and append-only per-agent event history (no database server).
+- Persistent workspace volumes with checkpoints, restore and forks on btrfs, an embedded agent registry and append-only per-agent event history (no database server). Workspaces are backed up incrementally to a second btrfs disk (`ac-ctl backup`, ADR-021).
 - Allowlisted egress: agents reach model APIs and Git hosts only, through `ac-egress` (ADR-007).
 
 ## What this is not

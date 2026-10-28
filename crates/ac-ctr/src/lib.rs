@@ -8,6 +8,7 @@
 //! A boot's environment (the proxy credential, ADR-016) goes to `ctr run --env-file`: a 0600 file
 //! in a 0700 directory, removed once `ctr run` returns, so it is never in a command line.
 
+pub mod backup;
 pub mod capacity;
 pub mod exec;
 pub mod facts;
@@ -115,6 +116,9 @@ pub struct CtrConfig {
     pub workspace_root: PathBuf,
     /// Parent directory of per-agent checkpoint directories (ADR-018), made 0700.
     pub checkpoint_root: PathBuf,
+    /// Parent directory of per-agent backup parents (ADR-021): the last snapshot sent to a
+    /// backup destination, kept so the next send is incremental. Made 0700.
+    pub backup_root: PathBuf,
     /// Path or name of the `btrfs` binary (btrfs-progs).
     pub btrfs_bin: String,
     /// Directory (made 0700) for each boot's `--env-file`, which lives only while `ctr run` runs.
@@ -819,6 +823,7 @@ mod tests {
             image: "agent:latest".into(),
             workspace_root: root.to_path_buf(),
             checkpoint_root: root.join("checkpoints"),
+            backup_root: root.join("backups"),
             btrfs_bin: "btrfs".into(),
             env_dir: root.join("boot"),
             workspace_owner: None,

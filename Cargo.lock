@@ -14,6 +14,7 @@ dependencies = [
  "platform-linux",
  "rusty_atomic_file",
  "rusty_json",
+ "rusty_multimodal_db_engine",
 ]
 
 [[package]]

@@ -65,6 +65,36 @@ fn stamp(secs: u64) -> String {
     )
 }
 
+/// The Unix time an id made by [`CheckpointId::next`] stands for (its `YYYYMMDD-HHMMSS`, any
+/// `-N` ignored); `None` for any other id.
+pub fn stamp_secs(id: &CheckpointId) -> Option<u64> {
+    let s = id.as_str();
+    let (date, time) = (s.get(..8)?, s.get(9..15)?);
+    if s.as_bytes().get(8) != Some(&b'-') || !matches!(s.as_bytes().get(15), None | Some(b'-')) {
+        return None;
+    }
+    let num = |t: &str| {
+        t.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| t.parse::<u32>().ok())?
+    };
+    let part = |t: &str, at: usize, len: usize| t.get(at..at + len).and_then(num);
+    let d = rusty_time::Date::from_ymd(
+        i32::try_from(part(date, 0, 4)?).ok()?,
+        u8::try_from(part(date, 4, 2)?).ok()?,
+        u8::try_from(part(date, 6, 2)?).ok()?,
+    )
+    .ok()?;
+    let t = rusty_time::Time::from_hms_nano(
+        u8::try_from(part(time, 0, 2)?).ok()?,
+        u8::try_from(part(time, 2, 2)?).ok()?,
+        u8::try_from(part(time, 4, 2)?).ok()?,
+        0,
+    )
+    .ok()?;
+    u64::try_from(rusty_time::DateTime::new(d, t, 0).timestamp()).ok()
+}
+
 /// A checkpoint's free-text label: 1 to [`MAX_LABEL`] characters, no control characters, not
 /// blank.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +336,22 @@ mod tests {
         assert_eq!(CheckpointId::next(t, &taken).as_str(), "20261028-130512-3");
         assert!(cp("20261028-130512") < cp("20261028-130512-2"));
         assert!(cp("20261028-130512-9") < cp("20261028-130513"));
+    }
+
+    #[test]
+    fn stamps_read_back_as_the_time_they_were_made_at() {
+        let t = 1_793_192_712;
+        assert_eq!(stamp_secs(&CheckpointId::next(t, &[])), Some(t));
+        assert_eq!(stamp_secs(&cp("20261028-130512-3")), Some(t));
+        for other in [
+            "a1",
+            "20261028-130512x",
+            "20261328-130512",
+            "2026102-8130512",
+            "20261028-1305",
+        ] {
+            assert_eq!(stamp_secs(&cp(other)), None, "{other}");
+        }
     }
 
     #[test]

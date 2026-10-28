@@ -27,7 +27,7 @@ Built as one deployable with clear module boundaries (see [ADR-005](decisions.md
 | Spawner | Creates, pauses and destroys agents; provisions workspace volumes |
 | Host settings | `ac-ctl doctor`/`tune`: settings recommended from host facts and a workload profile, each marked measured or extrapolated; never takes the registry lock (ADR-014) |
 | Session store | Embedded registry on `rusty_multimodal_db_engine` (agents, lifecycle state, jobs) plus an append-only segment log per agent for events ([ADR-009](decisions.md)) |
-| Workspace volumes | One quota-limited volume per agent; on btrfs a subvolume, with checkpoints, restore and forks (ADR-018) |
+| Workspace volumes | One quota-limited volume per agent; on btrfs a subvolume, with checkpoints, restore and forks (ADR-018), backed up to a second btrfs disk (ADR-021) |
 | Secrets | Root-owned 0600 env files; never readable by the agent user |
 | Egress proxy | Allowlist for model APIs and Git hosts; everything else dropped |
 

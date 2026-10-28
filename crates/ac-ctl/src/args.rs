@@ -3,9 +3,10 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use ac_domain::backup::DEFAULT_KEEP;
 use ac_domain::checkpoint::LabelError;
 use ac_domain::tune::Profile;
-use ac_domain::{AgentId, CheckpointId, IdError, Label};
+use ac_domain::{AgentId, BackupId, CheckpointId, IdError, Label};
 
 /// Usage text.
 pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces DIR] [--ctr PATH] \
@@ -17,6 +18,9 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
        ac-ctl --image IMAGE [...] restore <agent-id> <checkpoint>
        ac-ctl --image IMAGE [...] [--network] [--from CHECKPOINT] fork <agent-id> <new-agent-id>
        ac-ctl --image IMAGE [...] workspace migrate <agent-id>
+       ac-ctl [--data DIR] [--workspaces DIR] [--keep N] backup <dest> [<agent-id>...]
+       ac-ctl [--data DIR] backups <dest> [<agent-id>]
+       ac-ctl [--data DIR] [--workspaces DIR] restore-backup <dest> <agent-id> [<backup>]
        ac-ctl doctor [--profile idle|build|heavy] [--json] [--facts-file F] [--root DIR] [--explain]
        ac-ctl tune [--profile idle|build|heavy] [--facts-file F] [--root DIR] [--apply [--force] \
 [--restart-gateway]]
@@ -27,6 +31,12 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
     agents only) puts one back and keeps the workspace it replaces as a new checkpoint; fork
     creates and boots a new agent on a copy of the workspace, or of checkpoint --from. workspace
     migrate turns a paused agent's plain-directory workspace into a subvolume.
+  Backups (ADR-021; root; dest on another btrfs filesystem): backup sends each subvolume
+    workspace (or those named) to <dest>/<agent>/<backup>, incrementally after the first, and
+    keeps the newest --keep (default 7) there; exit 1 if any agent was not backed up (a plain
+    directory needs workspace migrate). backups lists them. restore-backup puts one (default the
+    newest) in place of a workspace with no VM, keeping the old one as a checkpoint. None of the
+    three opens the registry: they work while ac-gateway runs.
   doctor compares this host's settings with what its facts recommend for the profile (ADR-014):
     read-only; exit 0 all ok, 1 warnings, 4 errors. --facts-file plans a host from a JSON file of
     facts (deploy/hosts/) instead of this one; --explain lists every rule and its evidence.
@@ -62,6 +72,38 @@ pub enum Command {
     Doctor(Doctor),
     /// Make the host's settings what doctor recommends.
     Tune(Tune),
+    /// Back up workspaces, list backups, or restore one (no registry).
+    Backup(Backup),
+}
+
+/// `ac-ctl backup`, `backups` and `restore-backup`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Backup {
+    /// Data directory: backup parents are kept under `<data>/backups`, checkpoints under
+    /// `<data>/checkpoints`.
+    pub data: PathBuf,
+    /// Parent of per-agent workspace volumes.
+    pub workspaces: PathBuf,
+    /// Where backups go: a directory on another btrfs filesystem.
+    pub dest: PathBuf,
+    /// What to do.
+    pub op: BackupOp,
+}
+
+/// A backup operation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackupOp {
+    /// Back up these agents (empty: every workspace), keeping the newest `keep` at `dest`.
+    Send {
+        /// The agents.
+        agents: Vec<AgentId>,
+        /// Backups kept per agent.
+        keep: usize,
+    },
+    /// List the backups of one agent, or of every agent at `dest`.
+    List(Option<AgentId>),
+    /// Restore one backup (`None`: the newest) of the agent.
+    Restore(AgentId, Option<BackupId>),
 }
 
 /// `ac-ctl doctor`.
@@ -181,6 +223,8 @@ pub enum ArgError {
     OnlyWith(&'static str, &'static str),
     /// Checkpoint label rejected.
     BadLabel(LabelError),
+    /// `--keep` was not a number of at least 1.
+    BadKeep(String),
 }
 
 impl fmt::Display for ArgError {
@@ -199,6 +243,7 @@ impl fmt::Display for ArgError {
             Self::Conflict(a, b) => write!(f, "{a} and {b} exclude each other"),
             Self::OnlyWith(flag, action) => write!(f, "{flag} only applies to {action}"),
             Self::BadLabel(e) => e.fmt(f),
+            Self::BadKeep(v) => write!(f, "--keep must be a number of at least 1, got {v}"),
         }
     }
 }
@@ -224,8 +269,90 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
             .and_then(doctor)
             .map(Command::Doctor),
         Some("tune") => host_tool(args.skip(1)).and_then(tune).map(Command::Tune),
-        _ => fleet(args).map(Command::Fleet),
+        _ => match backup(args.by_ref())? {
+            Ok(b) => Ok(Command::Backup(b)),
+            Err(args) => fleet(args).map(Command::Fleet),
+        },
     }
+}
+
+/// A backup command, or every argument back when the first word after the flags names none.
+fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<String>>, ArgError> {
+    let all: Vec<String> = args.collect();
+    let (mut flags, mut pos) = (Vec::new(), Vec::new());
+    let mut it = all.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            // Every flag that takes a value, the fleet's too, so its value is not a word.
+            "--data" | "--workspaces" | "--keep" | "--image" | "--ctr" | "--namespace"
+            | "--uid" | "--label" | "--from" => flags.push((arg, it.next())),
+            a if a.starts_with("--") => flags.push((arg, None)),
+            _ => pos.push(arg.clone()),
+        }
+    }
+    let word = pos.first().cloned().unwrap_or_default();
+    if !matches!(word.as_str(), "backup" | "backups" | "restore-backup") {
+        return Ok(Err(all));
+    }
+    let (mut data, mut workspaces) = (PathBuf::from("/var/lib/agent-cloud"), None::<PathBuf>);
+    let mut keep = None::<usize>;
+    for (flag, value) in flags {
+        let value = || {
+            value
+                .cloned()
+                .ok_or_else(|| ArgError::MissingValue(flag.clone()))
+        };
+        match flag.as_str() {
+            "--data" => data = value()?.into(),
+            "--workspaces" => workspaces = Some(value()?.into()),
+            "--keep" => {
+                let v = value()?;
+                keep = Some(
+                    v.parse()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or(ArgError::BadKeep(v))?,
+                );
+            }
+            _ => return Err(ArgError::UnknownFlag(flag.clone())),
+        }
+    }
+    let mut rest = pos.into_iter().skip(1);
+    let dest = PathBuf::from(rest.next().ok_or(ArgError::Missing("backup destination"))?);
+    let op = match word.as_str() {
+        "backup" => BackupOp::Send {
+            agents: rest
+                .by_ref()
+                .map(|a| AgentId::parse(&a).map_err(ArgError::BadId))
+                .collect::<Result<_, _>>()?,
+            keep: keep.unwrap_or(DEFAULT_KEEP),
+        },
+        "backups" => BackupOp::List(
+            rest.next()
+                .map(|a| AgentId::parse(&a))
+                .transpose()
+                .map_err(ArgError::BadId)?,
+        ),
+        _ => BackupOp::Restore(
+            agent_arg(&mut rest, "agent id")?,
+            rest.next()
+                .map(|b| BackupId::parse(&b))
+                .transpose()
+                .map_err(ArgError::BadId)?,
+        ),
+    };
+    if keep.is_some() && !matches!(op, BackupOp::Send { .. }) {
+        return Err(ArgError::OnlyWith("--keep", "backup"));
+    }
+    if let Some(extra) = rest.next() {
+        return Err(ArgError::Extra(extra));
+    }
+    Ok(Ok(Backup {
+        workspaces: workspaces.unwrap_or_else(|| data.join("workspaces")),
+        data,
+        dest,
+        op,
+    }))
 }
 
 /// The flags `doctor` and `tune` share, plus tune's own, before checking which apply.
@@ -477,6 +604,66 @@ mod tests {
             host("--image i doctor"),
             Err(ArgError::UnknownAction(_))
         ));
+    }
+
+    #[test]
+    fn backup_commands() {
+        let b = |s| match host(s) {
+            Ok(Command::Backup(b)) => b,
+            other => panic!("{s}: {other:?}"),
+        };
+        let a = |s: &str| AgentId::parse(s).unwrap_or_else(|e| panic!("{e}"));
+        let all = b("backup /mnt/backup");
+        assert_eq!(all.dest, PathBuf::from("/mnt/backup"));
+        assert_eq!(
+            all.workspaces,
+            PathBuf::from("/var/lib/agent-cloud/workspaces")
+        );
+        assert_eq!(
+            all.op,
+            BackupOp::Send {
+                agents: vec![],
+                keep: DEFAULT_KEEP
+            }
+        );
+        let some = b("--data /d --keep 3 backup /b a1 a2");
+        assert_eq!(some.workspaces, PathBuf::from("/d/workspaces"));
+        assert_eq!(
+            some.op,
+            BackupOp::Send {
+                agents: vec![a("a1"), a("a2")],
+                keep: 3
+            }
+        );
+        assert_eq!(b("backups /b").op, BackupOp::List(None));
+        assert_eq!(b("backups /b a1").op, BackupOp::List(Some(a("a1"))));
+        assert_eq!(
+            b("restore-backup /b a1").op,
+            BackupOp::Restore(a("a1"), None)
+        );
+        let cp = BackupId::parse("20261028-130512").ok();
+        assert_eq!(
+            b("--workspaces /w restore-backup /b a1 20261028-130512").op,
+            BackupOp::Restore(a("a1"), cp)
+        );
+        for (line, want) in [
+            ("backup", "missing backup destination"),
+            (
+                "--keep 0 backup /b",
+                "--keep must be a number of at least 1, got 0",
+            ),
+            ("--keep 2 backups /b", "--keep only applies to backup"),
+            ("--image i backup /b", "unknown flag --image"),
+            ("backup /b ../x", "id must match"),
+            ("restore-backup /b", "missing agent id"),
+            ("backups /b a1 a2", "unexpected argument a2"),
+            ("backup /b --keep", "--keep needs a value"),
+        ] {
+            let got = host(line).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(got.contains(want), "{line}: {got}");
+        }
+        // Not a backup word: still the fleet command line.
+        assert!(matches!(host("--image i status a1"), Ok(Command::Fleet(_))));
     }
 
     #[test]

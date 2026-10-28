@@ -14,6 +14,8 @@ ac-store = { path = "../ac-store" }
 platform-linux.workspace = true
 rusty_json.workspace = true
 rusty_atomic_file.workspace = true
+# Only for `DirLock`, already in the build through ac-store.
+rusty_multimodal_db_engine.workspace = true
 
 [lints]
 workspace = true

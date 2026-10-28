@@ -293,6 +293,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | Route | Scope |
   |---|---|
   | `GET /api/v1/whoami` (name, scopes, agents; no secrets) | any valid token |
+  | `POST /api/v1/mcp` (MCP; each tool call is checked as the route it names, ADR-017) | any valid token |
   | `GET /api/v1/agents` (lists only the token's agents) | `agents:read` |
   | `GET /api/v1/capacity` (admission figures, ADR-012; counts only, no ids) | `agents:read` |
   | `GET /api/v1/agents/{id}` | `agents:read` |
@@ -698,3 +699,36 @@ not reach. Adding it to the base list would open a code-delivery channel to ever
 
 **Not now:** per-profile ports (443 and 80 as the base list); per-agent base lists; binding a credential to a VM's
 MAC or IP; profiles editable through the API.
+
+## ADR-017: An MCP interface on the gateway, split by token scope
+**Status:** accepted (2026-10-28; tested over loopback, not yet against a live MCP client on BaileyServ).
+**Context:** An MCP client (Claude Code, claude.ai connectors, another agent) could only drive the gateway through
+hand-written REST calls. The Ephemeral Sandbox comparison (2026-10-27) found its per-capability MCP tool sets the
+idea worth borrowing; ADR-011's scopes already split what a caller may do.
+**Decision:** `POST /api/v1/mcp` speaks MCP's Streamable HTTP transport over the existing listener, token and
+Origin check.
+- *Stateless, JSON only:* no `Mcp-Session-Id`, no SSE (`GET` is 405), single messages (batches are refused).
+  Versions `2025-11-25`, `2025-06-18`, `2025-03-26`: `initialize` echoes the client's when served, else the
+  newest; an unserved `MCP-Protocol-Version` header is 400. Notifications get 202.
+- *One tool per REST route* (`mcp::TOOLS`): `whoami`; `list_agents`, `get_agent`, `get_capacity`,
+  `list_egress_profiles`, `get_agent_egress` (`agents:read`); `create_agent`, `pause_agent`, `resume_agent`,
+  `destroy_agent` (`agents:write`); `set_agent_egress` (`egress:write`); `list_jobs`, `get_job`,
+  `get_job_output` (`jobs:read`); `submit_job`, `cancel_job` (`jobs:write`); `get_history` (`viewer:read`). A
+  tool names a method and a path of `access::ROUTES` and takes its scope from there; a test checks every tool
+  against the table.
+- *Same path as REST:* a call becomes that route's method, target and body, then goes through `access::check`
+  (agents first, then scope), the handler and the audit line, exactly as an HTTP request. Arguments are checked
+  by kind first (ids parsed as `AgentId`/`JobId`, query values only booleans, counts or lowercase words, unknown
+  arguments refused), so no argument can change the path or add a query parameter.
+- *Scopes decide what is listed:* `tools/list` shows only the tools the token's scopes allow. Its agents are
+  not looked at there; a call on another agent gets the route's 404.
+- *Results:* the route's body as text; a status of 300 or more is a tool error (`isError`) with `HTTP <status>:`
+  in front, so the model sees why. An unknown tool is JSON-RPC `-32602`.
+- *No viewer tools beyond history:* the terminal stream and input (`viewer:control`) need a live viewer seat,
+  which a request/response tool cannot hold.
+**Consequences:** any MCP client with a token gets the gateway's tools with no new credential, attack surface or
+dependency (`rusty_json`, already used). Job output and history reach the model as text the agent wrote: the
+server's `instructions` and the tool descriptions say it is untrusted. A `get_job` with `wait` holds a connection
+up to 30 s, under the same waiter cap as REST.
+**Not now:** structured output (`structuredContent`, `outputSchema`); resources or prompts; SSE and server-sent
+notifications; OAuth (claude.ai custom connectors can send the bearer token as a request header).

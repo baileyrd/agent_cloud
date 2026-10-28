@@ -1,0 +1,21 @@
+# Back up every agent's workspace to a second btrfs disk (ADR-019), run by ac-backup.timer.
+# ac-ctl backup does not open the registry, so it runs while ac-gateway and the agents do.
+# The destination is a btrfs filesystem on another disk, mounted at /mnt/agent-backups; to use
+# another path, `systemctl edit ac-backup.service` and override ExecStart and RequiresMountsFor.
+# A run that leaves any agent without a backup (a plain-directory workspace, a full disk) exits
+# 1, so the unit shows failed.
+[Unit]
+Description=agent-cloud workspace backups
+RequiresMountsFor=/var/lib/agent-cloud /mnt/agent-backups
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ac-ctl backup /mnt/agent-backups
+# Backups yield to the agents' builds.
+Nice=19
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes

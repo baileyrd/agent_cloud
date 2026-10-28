@@ -1,0 +1,12 @@
+# Daily workspace backups (ADR-019). Persistent: a run missed while the host was off happens at
+# the next boot.
+[Unit]
+Description=agent-cloud daily workspace backups
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

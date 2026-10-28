@@ -396,6 +396,7 @@ fn run() -> Result<(), String> {
         image,
         workspace_root: data.join("workspaces"),
         checkpoint_root: data.join("checkpoints"),
+        backup_root: data.join("backups"),
         btrfs_bin: env("AC_BTRFS", "btrfs"),
         env_dir: data.join("boot"),
         workspace_owner: Some((uid, uid)),

@@ -10,6 +10,7 @@
 //! usage, or it could not run). `tune`: 0 shown or applied, 1 refused or failed.
 
 mod args;
+mod backup;
 mod doctor;
 mod factsjson;
 mod tune;
@@ -57,6 +58,17 @@ fn env_mib(key: &str) -> Result<Option<u64>, String> {
         .transpose()
 }
 
+/// `AC_CHECKPOINT_MAX` (default 8, at least 1): checkpoints kept per agent.
+fn checkpoint_max() -> Result<usize, String> {
+    let max = match std::env::var("AC_CHECKPOINT_MAX") {
+        Ok(v) => v
+            .parse::<usize>()
+            .map_err(|e| format!("AC_CHECKPOINT_MAX={v}: {e}"))?,
+        Err(_) => 8,
+    };
+    Ok(max.max(1))
+}
+
 fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     let network = if cli.network {
         Some(Network::defaults(&cli.data)?)
@@ -69,6 +81,7 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         image: cli.image.clone(),
         workspace_root: cli.workspaces.clone(),
         checkpoint_root: cli.data.join("checkpoints"),
+        backup_root: cli.data.join("backups"),
         btrfs_bin: std::env::var("AC_BTRFS").unwrap_or_else(|_| "btrfs".to_owned()),
         env_dir: cli.data.join("boot"),
         workspace_owner: Some((cli.uid, cli.uid)),
@@ -87,19 +100,14 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
     });
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
-    let max = match std::env::var("AC_CHECKPOINT_MAX") {
-        Ok(v) => v
-            .parse::<usize>()
-            .map_err(|e| format!("AC_CHECKPOINT_MAX={v}: {e}"))?,
-        Err(_) => 8,
-    };
+    let max = checkpoint_max()?;
     let snapshots = std::sync::Arc::new(CtrRuntime::new(LinuxSpawner, cfg.clone()));
     let fleet = Fleet::new(
         CtrRuntime::new(LinuxSpawner, cfg),
         EngineStore::open(&cli.data)?,
     )
     .with_admission(Box::new(capacity), margin)
-    .with_snapshots(snapshots, max.max(1));
+    .with_snapshots(snapshots, max);
     let (action, id) = match &cli.job {
         Job::Agent(action, id) => (*action, id),
         Job::Snap(op) => return Ok(snap(&fleet, op)?),
@@ -351,6 +359,17 @@ fn main() -> ExitCode {
                 },
                 ExitCode::from,
             );
+        }
+        Command::Backup(b) => {
+            return checkpoint_max()
+                .and_then(|max| backup::run(&b, max))
+                .map_or_else(
+                    |e| {
+                        eprintln!("ac-ctl: {e}");
+                        ExitCode::FAILURE
+                    },
+                    ExitCode::from,
+                );
         }
         Command::Tune(t) => {
             return run_tune(&t).map_or_else(

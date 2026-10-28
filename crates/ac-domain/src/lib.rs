@@ -1,6 +1,7 @@
 //! Pure domain logic for agent-cloud. No I/O, no framework types.
 
 pub mod allowlist;
+pub mod backup;
 pub mod capacity;
 pub mod checkpoint;
 pub mod egress;
@@ -12,6 +13,7 @@ pub mod schedule;
 pub mod tune;
 
 pub use allowlist::{Allowlist, AllowlistError};
+pub use backup::BackupId;
 pub use capacity::{GuestMemory, Shortfall};
 pub use checkpoint::{Checkpoint, CheckpointId, Label, Refusal, Volume};
 pub use egress::{Attachment, ProfileName};

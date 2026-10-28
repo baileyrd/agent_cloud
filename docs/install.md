@@ -525,6 +525,34 @@ on BaileyServ (2026-10-28): with a job in a1 writing a line and a 4 KiB file eac
 and the job kept writing; a fork from it booted in 4.8 s and read back 25 lines and 25 whole files inside its VM;
 restore (0.7 s) and the restore of what it kept both read back correctly inside a1 after resume.
 
+**Backups** (ADR-019): needs a second disk formatted btrfs and mounted at `/mnt/agent-backups` (another path:
+`sudo systemctl edit ac-backup.service` and override `ExecStart` and `RequiresMountsFor`). Workspaces must be
+subvolumes (migrate plain ones first, as above). None of these commands opens the registry, so they work while
+the gateway runs:
+
+```bash
+sudo mkfs.btrfs -L agent-backups /dev/sdX && sudo mkdir -p /mnt/agent-backups
+echo 'LABEL=agent-backups /mnt/agent-backups btrfs noatime 0 0' | sudo tee -a /etc/fstab && sudo mount /mnt/agent-backups
+sudo ac-ctl backup /mnt/agent-backups               # a1 backed up 20261028-130512 (full)
+sudo ac-ctl backup /mnt/agent-backups a1            # a1 backed up ... (incremental from 20261028-130512)
+sudo ac-ctl backups /mnt/agent-backups              # a1 20261028-130512 ...
+sudo install -m 0644 deploy/ac-backup.service deploy/ac-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ac-backup.timer   # daily at 03:30
+```
+
+Each run keeps the newest 7 per agent (`--keep N` changes it) and exits 1 if any agent was not backed up; check
+with `systemctl status ac-backup` or `journalctl -u ac-backup`. To restore, pause the agent through the gateway,
+then:
+
+```bash
+sudo ac-ctl restore-backup /mnt/agent-backups a1                   # the newest; or name one
+# a1 restored backup 20261028-130512; the workspace it replaced is checkpoint 20261029-091502
+```
+
+then resume it. On a new host, or after a purge, the restore makes the workspace and `create` boots it. To check
+the btrfs side on a new host: `sudo scripts/btrfs-backup-test.sh` (two loopback btrfs filesystems, removed
+after).
+
 **Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on
 any FAIL. It checks that the three units are active, the `agentfw` rule counts, the `agents` zone, the
 allowlist's owner and mode, and that the gateway and proxy listen only on private addresses. It checks that

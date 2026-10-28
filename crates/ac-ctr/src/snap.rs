@@ -53,7 +53,7 @@ pub fn is_btrfs(path: &Path) -> io::Result<bool> {
     Ok(stats.f_type == BTRFS_SUPER_MAGIC)
 }
 
-fn io_fail(op: &'static str, what: &str, path: &Path, e: io::Error) -> PortError {
+pub(crate) fn io_fail(op: &'static str, what: &str, path: &Path, e: io::Error) -> PortError {
     PortError {
         op,
         cause: format!("{what} {}: {e}", path.display()),
@@ -61,13 +61,30 @@ fn io_fail(op: &'static str, what: &str, path: &Path, e: io::Error) -> PortError
 }
 
 /// `path` with `.suffix` appended to its last component.
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(format!(".{suffix}"));
     PathBuf::from(s)
 }
 
-fn now_unix() -> u64 {
+/// `root/<id>`, made 0700 (and `root` 0700) if missing: workspaces hold credentials.
+pub(crate) fn private_dir(
+    op: &'static str,
+    root: &Path,
+    id: &AgentId,
+) -> Result<PathBuf, PortError> {
+    let dir = root.join(id.as_str());
+    for d in [root, &dir] {
+        if !d.is_dir() {
+            std::fs::create_dir_all(d).map_err(|e| io_fail(op, "mkdir", d, e))?;
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| io_fail(op, "chmod", d, e))?;
+        }
+    }
+    Ok(dir)
+}
+
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -83,13 +100,13 @@ impl<S: Spawner> CtrRuntime<S> {
     }
 
     /// `btrfs <args>`, failing on a non-zero exit.
-    fn btrfs(&self, op: &'static str, args: &[&OsStr]) -> Result<(), PortError> {
+    pub(crate) fn btrfs(&self, op: &'static str, args: &[&OsStr]) -> Result<(), PortError> {
         let args: Vec<OsString> = args.iter().map(|a| a.to_os_string()).collect();
         self.run(op, OsStr::new(&self.cfg.btrfs_bin), &args, None)
             .map(drop)
     }
 
-    fn snapshot(
+    pub(crate) fn snapshot(
         &self,
         op: &'static str,
         from: &Path,
@@ -167,7 +184,12 @@ impl<S: Spawner> CtrRuntime<S> {
     /// Finish or undo a swap of `id`'s workspace that a crash cut short: drop a half-built
     /// `<id>.<building>`; if `<id>.old` is left, the swap got past its first rename, so delete
     /// it when the workspace is in place and put it back when not.
-    fn recover(&self, op: &'static str, id: &AgentId, building: &str) -> Result<(), PortError> {
+    pub(crate) fn recover(
+        &self,
+        op: &'static str,
+        id: &AgentId,
+        building: &str,
+    ) -> Result<(), PortError> {
         let ws = self.workspace(id);
         let old = sibling(&ws, "old");
         self.remove_volume(op, &sibling(&ws, building))?;
@@ -182,7 +204,12 @@ impl<S: Spawner> CtrRuntime<S> {
 
     /// Put the volume built at `new` in place of `id`'s workspace, then delete the old one. A
     /// failed second rename puts the old one back.
-    fn swap_in(&self, op: &'static str, id: &AgentId, new: &Path) -> Result<(), PortError> {
+    pub(crate) fn swap_in(
+        &self,
+        op: &'static str,
+        id: &AgentId,
+        new: &Path,
+    ) -> Result<(), PortError> {
         let ws = self.workspace(id);
         let old = sibling(&ws, "old");
         std::fs::rename(&ws, &old).map_err(|e| io_fail(op, "rename", &ws, e))?;
@@ -195,15 +222,7 @@ impl<S: Spawner> CtrRuntime<S> {
 
     /// `checkpoint_root/<id>`, made 0700 (and the root 0700) if missing.
     fn checkpoints_dir_made(&self, op: &'static str, id: &AgentId) -> Result<PathBuf, PortError> {
-        let dir = self.checkpoints_dir(id);
-        for d in [&self.cfg.checkpoint_root, &dir] {
-            if !d.is_dir() {
-                std::fs::create_dir_all(d).map_err(|e| io_fail(op, "mkdir", d, e))?;
-                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|e| io_fail(op, "chmod", d, e))?;
-            }
-        }
-        Ok(dir)
+        private_dir(op, &self.cfg.checkpoint_root, id)
     }
 
     fn read_label(&self, op: &'static str, snap: &Path) -> Result<Option<Label>, PortError> {
@@ -225,7 +244,7 @@ impl<S: Spawner> CtrRuntime<S> {
         std::fs::rename(&tmp, &path).map_err(|e| io_fail(op, "rename", &tmp, e))
     }
 
-    fn take(
+    pub(crate) fn take(
         &self,
         op: &'static str,
         id: &AgentId,
@@ -244,16 +263,13 @@ impl<S: Spawner> CtrRuntime<S> {
 }
 
 impl<S: Spawner> CtrRuntime<S> {
-    /// Agents whose workspace is still a plain directory, for `ac-ctl workspace migrate`; `None`
-    /// when the workspace root is not on btrfs, so no workspace can be snapshotted.
-    pub fn plain_workspaces(&self) -> Result<Option<Vec<AgentId>>, PortError> {
-        let (op, root) = ("plain workspaces", &self.cfg.workspace_root);
+    /// Every agent's workspace and what it is, by agent id. Entries that are no agent id (a
+    /// swap's `<id>.old`, say) are skipped.
+    pub fn workspaces(&self) -> Result<Vec<(AgentId, Volume)>, PortError> {
+        let (op, root) = ("workspaces", &self.cfg.workspace_root);
         std::fs::create_dir_all(root).map_err(|e| io_fail(op, "mkdir", root, e))?;
-        if !(self.disk.btrfs)(root).map_err(|e| io_fail(op, "statfs", root, e))? {
-            return Ok(None);
-        }
         let entries = std::fs::read_dir(root).map_err(|e| io_fail(op, "list", root, e))?;
-        let mut plain = Vec::new();
+        let mut all = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| io_fail(op, "list", root, e))?;
             let Some(id) = entry
@@ -263,11 +279,26 @@ impl<S: Spawner> CtrRuntime<S> {
             else {
                 continue;
             };
-            if self.volume_at(op, &entry.path())? == Volume::Directory {
-                plain.push(id);
-            }
+            all.push((id, self.volume_at(op, &entry.path())?));
         }
-        plain.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        all.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        Ok(all)
+    }
+
+    /// Agents whose workspace is still a plain directory, for `ac-ctl workspace migrate`; `None`
+    /// when the workspace root is not on btrfs, so no workspace can be snapshotted.
+    pub fn plain_workspaces(&self) -> Result<Option<Vec<AgentId>>, PortError> {
+        let (op, root) = ("plain workspaces", &self.cfg.workspace_root);
+        std::fs::create_dir_all(root).map_err(|e| io_fail(op, "mkdir", root, e))?;
+        if !(self.disk.btrfs)(root).map_err(|e| io_fail(op, "statfs", root, e))? {
+            return Ok(None);
+        }
+        let plain = self
+            .workspaces()?
+            .into_iter()
+            .filter(|(_, v)| *v == Volume::Directory)
+            .map(|(id, _)| id)
+            .collect();
         Ok(Some(plain))
     }
 }
@@ -379,12 +410,13 @@ impl<S: Spawner> Snapshots for CtrRuntime<S> {
         for c in self.checkpoints(id)? {
             self.delete(id, &c.id)?;
         }
-        remove_dir_if_present("purge checkpoints", &self.checkpoints_dir(id))
+        remove_dir_if_present("purge checkpoints", &self.checkpoints_dir(id))?;
+        self.purge_backup_parents(id)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! The adapter against a stand-in `btrfs` (a shell script run through the real spawner) on
     //! whatever filesystem the tests run on: a subvolume is a directory with the sticky bit, which
     //! `cp -a` and `rename` keep as btrfs keeps a subvolume. `scripts/btrfs-checkpoint-test.sh`
@@ -398,24 +430,51 @@ mod tests {
     use super::*;
     use crate::CtrConfig;
 
-    /// `btrfs subvolume create|snapshot [-r]|delete`, each call logged to `$LOG`.
+    /// `btrfs subvolume create|snapshot [-r]|delete`, `send [-p P] SNAP`, `receive DIR` and
+    /// `property get -ts PATH ro`, each call logged to `$LOG`. Read-only subvolumes are listed in
+    /// `$LOG.ro`; a send is a tar stream. With `$LOG.fail-receive` present, receive leaves a
+    /// partial (writable) subvolume and fails, as a full disk would.
     const FAKE_BTRFS: &str = r#"set -eu
 echo "$*" >> "$LOG"
-[ "$1" = subvolume ] || exit 2
-case "$2" in
-create) mkdir "$3"; chmod +t "$3" ;;
-snapshot)
+ro="$LOG.ro"
+touch "$ro"
+case "$1 ${2:-}" in
+"subvolume create") mkdir "$3"; chmod +t "$3" ;;
+"subvolume snapshot")
     shift 2
-    if [ "$1" = -r ]; then shift; fi
+    r=; if [ "$1" = -r ]; then r=1; shift; fi
     [ -e "$2" ] && { echo "ERROR: target path already exists: $2" >&2; exit 1; }
-    cp -a "$1" "$2" ;;
-delete) rm -rf "$3" ;;
+    cp -a "$1" "$2"
+    if [ -n "$r" ]; then echo "$2" >> "$ro"; fi ;;
+"subvolume delete") rm -rf "$3"; grep -vxF "$3" "$ro" > "$ro.tmp" || true; mv "$ro.tmp" "$ro" ;;
+send*)
+    shift
+    if [ "$1" = -p ]; then shift 2; fi
+    grep -qxF "$1" "$ro" || { echo "ERROR: $1 is not read-only" >&2; exit 1; }
+    tar -C "$(dirname "$1")" -cf - "$(basename "$1")" ;;
+receive*)
+    first=$(tar -C "$2" -xvf - | head -n 1)
+    name="$2/${first%/}"
+    if [ -e "$LOG.fail-receive" ]; then echo "ERROR: No space left on device" >&2; exit 1; fi
+    echo "$name" >> "$ro" ;;
+"property get")
+    if grep -qxF "$4" "$ro"; then echo ro=true; else echo ro=false; fi ;;
 *) exit 2 ;;
 esac"#;
 
     /// Runs `btrfs` as `sh -c FAKE_BTRFS`, everything else as asked.
-    struct Fake {
+    pub(crate) struct Fake {
         log: PathBuf,
+    }
+
+    /// The same wiring for the real spawner: a file (a pipe end) is duplicated, not moved.
+    fn copy(s: &Stdio) -> platform::error::Result<Stdio> {
+        Ok(match s {
+            Stdio::Inherit => Stdio::Inherit,
+            Stdio::Null => Stdio::Null,
+            Stdio::Pipe => Stdio::Pipe,
+            Stdio::File(f) => Stdio::File(f.try_clone()?),
+        })
     }
 
     impl Spawner for Fake {
@@ -431,9 +490,9 @@ esac"#;
             let mut c = Command::new(program, "/")
                 .args(argv)
                 .env(platform::process::EnvSpec::Explicit(env));
-            c.stdin = Stdio::Null;
-            c.stdout = Stdio::Pipe;
-            c.stderr = Stdio::Pipe;
+            c.stdin = copy(&cmd.stdin)?;
+            c.stdout = copy(&cmd.stdout)?;
+            c.stderr = copy(&cmd.stderr)?;
             LinuxSpawner.spawn(&c)
         }
         fn resolve(&self, program: &OsStr) -> platform::error::Result<OsString> {
@@ -455,9 +514,9 @@ esac"#;
         subvolume: |p| Ok(std::fs::symlink_metadata(p)?.permissions().mode() & 0o1000 != 0),
     };
 
-    struct Host {
-        rt: CtrRuntime<Fake>,
-        root: PathBuf,
+    pub(crate) struct Host {
+        pub(crate) rt: CtrRuntime<Fake>,
+        pub(crate) root: PathBuf,
     }
 
     impl Drop for Host {
@@ -467,7 +526,7 @@ esac"#;
     }
 
     impl Host {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             static N: AtomicUsize = AtomicUsize::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!("ac-snap-{}-{n}", std::process::id()));
@@ -478,6 +537,7 @@ esac"#;
                 image: "agent:latest".into(),
                 workspace_root: root.join("workspaces"),
                 checkpoint_root: root.join("checkpoints"),
+                backup_root: root.join("backups"),
                 btrfs_bin: "btrfs".into(),
                 env_dir: root.join("boot"),
                 workspace_owner: None,
@@ -497,12 +557,12 @@ esac"#;
             Self { rt, root }
         }
 
-        fn ws(&self, id: &AgentId) -> PathBuf {
+        pub(crate) fn ws(&self, id: &AgentId) -> PathBuf {
             self.rt.workspace(id)
         }
 
         /// A subvolume workspace for `id` holding `file` = `text`.
-        fn workspace(&self, id: &AgentId, text: &str) {
+        pub(crate) fn workspace(&self, id: &AgentId, text: &str) {
             let ws = self.ws(id);
             self.rt
                 .make_volume("test", &ws)
@@ -510,29 +570,29 @@ esac"#;
             self.write(id, text);
         }
 
-        fn write(&self, id: &AgentId, text: &str) {
+        pub(crate) fn write(&self, id: &AgentId, text: &str) {
             let _ = std::fs::write(self.ws(id).join("file"), text);
         }
 
-        fn read(&self, id: &AgentId) -> String {
+        pub(crate) fn read(&self, id: &AgentId) -> String {
             std::fs::read_to_string(self.ws(id).join("file")).unwrap_or_default()
         }
 
-        fn log(&self) -> Vec<String> {
+        pub(crate) fn log(&self) -> Vec<String> {
             let text = std::fs::read_to_string(self.root.join("log")).unwrap_or_default();
             text.lines().map(str::to_owned).collect()
         }
     }
 
-    fn agent(s: &str) -> AgentId {
+    pub(crate) fn agent(s: &str) -> AgentId {
         AgentId::parse(s).unwrap_or_else(|e| panic!("{e}"))
     }
 
-    fn label(s: &str) -> Label {
+    pub(crate) fn label(s: &str) -> Label {
         Label::parse(s).unwrap_or_else(|e| panic!("{e}"))
     }
 
-    fn ok<T>(r: Result<T, PortError>) -> T {
+    pub(crate) fn ok<T>(r: Result<T, PortError>) -> T {
         r.unwrap_or_else(|e| panic!("{e}"))
     }
 
@@ -720,6 +780,7 @@ esac"#;
             image: "agent:latest".into(),
             workspace_root: dir.join("workspaces"),
             checkpoint_root: dir.join("checkpoints"),
+            backup_root: dir.join("backups"),
             btrfs_bin: "btrfs".into(),
             env_dir: dir.join("boot"),
             workspace_owner: None,

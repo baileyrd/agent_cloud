@@ -869,71 +869,84 @@ its fleet commands are generated from it), or a third front end (a web UI form, 
 **Consequences:** one place to add an operation to REST and MCP, a little less code; `ac-ctl` and the tools
 can still differ in naming (`create` vs `create_agent`) and in what they offer.
 
-## ADR-021: Workspace backups by btrfs send to a second disk
-**Status:** proposed (2026-10-28; tested on two loopback btrfs filesystems by `scripts/btrfs-backup-test.sh`, not
-yet on BaileyServ with a second disk).
+## ADR-021: Workspace backups as btrfs send streams in files
+**Status:** proposed (2026-10-28; tested on loopback filesystems by `scripts/btrfs-backup-test.sh`, not yet on
+BaileyServ). Amended the same day, before any host ran it: the first version received each backup into a btrfs
+filesystem on a second disk (#15). BaileyServ has no second disk, so backups are now stream files in any
+directory, such as a share on another machine (Beast).
 **Context:** checkpoints (ADR-018) undo an agent's mistakes, but they sit on the same disk as the workspace: a
-dead disk or a broken filesystem loses both. M4 asks for backups with a tested restore. Workspaces are already
+dead disk or a lost host loses both. M4 asks for backups with a tested restore. Workspaces are already
 subvolumes, and a read-only snapshot is what `btrfs send` needs, so an incremental send costs only what changed.
+`btrfs send -f` writes that stream to a file, which any filesystem holds; only a restore needs btrfs.
 **Decision.**
-- *Where:* a directory on another btrfs filesystem (`<dest>`), refused otherwise: `btrfs receive` needs one.
-  Each backup is `<dest>/<agent>/<backup>`, a read-only subvolume with the workspace's owners and modes, and
-  readable as plain files. `<dest>/<agent>` is made 0700 (workspaces hold logins).
-- *Send:* a read-only snapshot of the workspace to `<data>/backups/<agent>/<backup>`, then
-  `btrfs send [-p <parent>] | btrfs receive <dest>/<agent>/`, the pipe made by the kernel (the send's stdout
-  is the receive's stdin; this process holds neither end). The parent is the newest backup kept here that
-  `<dest>` also holds, else the send is full. After a good send only the new snapshot stays here, as the next
-  parent. Ids are the checkpoint stamp (`YYYYMMDD-HHMMSS`), always after the newest one taken, so they sort by
-  age even after retention frees one or the clock steps back.
-- *Retention:* the newest `--keep` (default 7, at least 1) per agent at `<dest>`; older ones are deleted with
-  `btrfs subvolume delete`. Each received backup is a whole subvolume (extents shared, not chained), so
-  deleting any of them leaves the others whole.
-- *Cut short:* `btrfs receive` marks a subvolume read-only only once its stream is complete, so a backup cut
-  short (a crash, a full disk) is writable. It is never listed or restored, and the next backup of that agent
-  deletes it. A failed send deletes what it received and its snapshot here, keeping the old parent. Received
-  subvolumes cannot be renamed (read-only), so they are received in place, not staged.
+- *Where:* any directory (`<dest>`): a local disk, or a mount of an NFS or SMB share on another machine, or of
+  object storage. Off this host is the point; the directory is the operator's choice. `<dest>/<agent>` is made
+  0700 (workspaces hold logins).
+- *Streams:* `<dest>/<agent>/<id>.full.btrfs`, or `<id>.after-<parent>.btrfs` for one sent against the backup
+  `<parent>`. Ids are the checkpoint stamp (`YYYYMMDD-HHMMSS`), always after the newest one taken, so they sort
+  by age even after retention frees one or the clock steps back.
+- *Send:* a read-only snapshot of the workspace to `<data>/backups/<agent>/<id>`, then
+  `btrfs send -q [-p <parent>] -f <stream>.part <snapshot>`, `fsync`, rename to `<stream>`, `fsync` of the
+  directory. The parent is the newest backup kept here whose chain at `<dest>` is whole, unless that chain is
+  already `--full-every` long (default 7, at least 1): then the send is full, so a restore never replays more
+  than that. After a good send only the new snapshot stays here, as the next parent.
+- *Chains:* a backup can be restored if its chain is whole: every stream from the last full one up to it.
+- *Retention:* the newest `--keep` (default 7, at least 1) restorable backups per agent, and every stream their
+  chains need; the rest go, broken streams too. Up to `keep + full-every − 1` streams stay at once.
+- *Cut short:* a stream is listed only once renamed from `.part`, after it was flushed, so a stream cut short
+  (a crash, a full disk, a lost share) is never listed, and the next backup of that agent deletes it. A failed
+  send deletes its `.part` and its snapshot here, keeping the old parent.
 - *Restore:* `ac-ctl restore-backup <dest> <agent> [<backup>]` (default the newest). Refused while the agent's
-  Kata VM runs (read from the process list) and for a plain-directory workspace. It receives the backup into
-  `<workspaces>/<agent>.receive/`, takes a writable snapshot of it as `<agent>.restore`, deletes the received
-  copy, then swaps it in as ADR-018's restore does: a workspace that is there is kept first as a checkpoint
-  (`before restore of backup <id>`, so it needs room under `AC_CHECKPOINT_MAX`); one that is gone (purged, or a
-  new host) is simply created, and `create` boots it. Leftovers of a restore cut short are removed by the next.
+  Kata VM runs (read from the process list) and for a plain-directory workspace. It replays the chain with
+  `btrfs receive -f <stream>` into `<workspaces>/<agent>.receive/` (the full one, then each increment, found by
+  its parent's received uuid), takes a writable snapshot of the backup as `<agent>.restore`, deletes the
+  received copies, then swaps it in as ADR-018's restore does: a workspace that is there is kept first as a
+  checkpoint (`before restore of backup <id>`, so it needs room under `AC_CHECKPOINT_MAX`); one that is gone
+  (purged, or a new host) is simply created, and `create` boots it. Leftovers of a restore cut short are
+  removed by the next.
 - *No registry:* `backup`, `backups` and `restore-backup` read only the filesystem and the process list, so
   they run while `ac-gateway` holds the data directory. They touch no fleet state, so they are not the
   `ac-ctl` acting beside the gateway that ADR-020 would revisit for. A backup and a restore hold
-  `<data>/backup.lock` against each other. A checkpoint restore or migrate racing a backup of the same agent makes that agent's
-  backup fail (its snapshot finds no workspace); the next run takes it.
+  `<data>/backup.lock` against each other. A checkpoint restore or migrate racing a backup of the same agent
+  makes that agent's backup fail (its snapshot finds no workspace); the next run takes it.
 - *Schedule:* `deploy/ac-backup.service` (oneshot, `nice` 19, idle I/O class) run daily by `ac-backup.timer`
-  (`Persistent=`, so a run missed while the host was off happens at boot). A run that leaves any agent without
-  a backup (a plain-directory workspace, a full disk) exits 1, and the unit shows failed.
+  (`Persistent=`, so a run missed while the host was off happens at boot), after its destination is mounted.
+  A run that leaves any agent without a backup (a plain-directory workspace, a full or missing share) exits 1,
+  and the unit shows failed.
 - *Purge* deletes the parent kept here; the backups at `<dest>` stay (that is what they are for).
-- *Code:* the rules are pure (`ac_domain::backup`: ids, parent, retention, restore refusals and which backup).
-  `ac_ctr::backup` runs `btrfs` through the same spawner as ADR-018; the CLI (`ac-ctl`'s `backup` module) checks
-  the VM and the checkpoint cap before a restore.
+- *Code:* the rules are pure (`ac_domain::backup`: stream names, ids, chains, parent, retention, restore
+  refusals and which backup). `ac_ctr::backup` runs `btrfs` through the same spawner as ADR-018, with no time
+  limit for send and receive; the CLI (`ac-ctl`'s `backup` module) checks the VM and the checkpoint cap before
+  a restore.
 
-**Evidence (2026-10-28).** `scripts/btrfs-backup-test.sh` on two 256 MiB loopback btrfs filesystems (kernel 6.18,
-btrfs-progs 6.6.3, as root) through the `ac-ctl` binary: a full then an incremental send, owners and a 16 MiB
-file intact, backups read-only, `--keep 3` leaving the newest three in order (four backups in under a second;
-the first run of the script found that a freed id was reused and sorted wrong, now fixed by `next_id`), a
-writable partial neither listed nor kept, a restore over a broken workspace (kept as a checkpoint) and a named
-restore into a purged one, and the refusals (plain directory, unknown backup, a destination off btrfs). By hand,
-a 200 MiB workspace sent to a 120 MiB filesystem failed with both sides quoted (`No space left on device`,
-`Broken pipe`) and left nothing at the destination or here. The unit
-tests run the same steps against a stand-in `btrfs` whose send is a tar stream through the same kernel pipe,
-including a receive that fails half way.
+**Evidence (2026-10-28).** `scripts/btrfs-backup-test.sh` (kernel 6.18, btrfs-progs 6.6.3, as root) through the
+`ac-ctl` binary, with the data directory on a 256 MiB loopback btrfs and the streams on a 256 MiB loopback ext4,
+as on a mounted share: a full send of a 16 MiB workspace (16.0 MiB) and an incremental one after a one-line
+change (224 B); five more with `--keep 3 --full-every 3` leaving 4 streams, a full one among them; a `.part`
+neither listed nor kept; a restore of the newest over a broken workspace (chain replayed, owners and the 16 MiB
+file intact, the broken workspace kept as a checkpoint) and of the oldest into a purged one; a lost full stream
+hiding its chain from the list and from restore; and the refusals (plain directory, unknown backup, a missing
+destination). By hand, a 200 MiB workspace sent to a 64 MiB ext4 failed (`No space left on device`) and left
+nothing at the destination or here. In the first version, the script found that a freed id was reused and sorted
+wrong, now fixed by `next_id`. The unit tests run the same steps against a stand-in `btrfs` whose stream is a tar
+of the snapshot, including a send that fails half way and a broken chain.
 
 **Consequences:**
 - A backup of a running agent is crash-consistent, like a checkpoint: pause first for a clean point.
-- The first backup of each workspace is a full copy; later ones send only changed extents. `btrfs send` reads
-  the snapshot, so a large first backup loads the rotational disk: hence the idle I/O class.
-- A backup holds the agent's Claude Code login and Git credentials, as the workspace does; the destination
-  needs the same care as the data directory.
+- A stream cannot be browsed: to read one file from a backup, restore it (or `btrfs receive` it on any btrfs).
+  A stream is only as good as its chain, so a lost full stream loses up to `--full-every` backups; `--keep` is
+  counted in restorable backups, so retention never leaves fewer than asked.
+- The first backup of each workspace, and every `--full-every`th, is a full copy; the others carry only what
+  changed. `btrfs send` reads the snapshot, so a full one loads the rotational disk: hence the idle I/O class.
+- A backup holds the agent's Claude Code login and Git credentials, as the workspace does; the share needs the
+  same care as the data directory (export it to this host only).
 - The parent kept here pins the data it shares with the workspace until the next backup replaces it.
 - *Rollback:* an older gateway or `ac-ctl` ignores `<data>/backups`; its purge leaves the parent there: remove
-  `<data>/backups/<id>/*` with `btrfs subvolume delete`. Backups at `<dest>` are plain subvolumes, readable
-  without any of this code.
+  `<data>/backups/<id>/*` with `btrfs subvolume delete`. Streams at `<dest>` need only `btrfs receive -f` on any
+  btrfs, none of this code.
 
 **Not now:** the registry, tokens and the egress agents file (the data directory outside workspaces; copying the
 registry needs the gateway's cooperation, and agents and tokens can be recreated); checkpoints in backups; a
-gateway route or MCP tool; destinations that are not btrfs (stream files, or a remote over SSH with
-`btrfs receive` there); encryption at the destination (use an encrypted filesystem).
+gateway route or MCP tool; uploads to object storage without a mount; compression (`btrfs send --compressed-data`
+needs a newer kernel and protocol 2) and encryption (use an encrypted share or filesystem); a checksum beside each
+stream (btrfs checks every command in a stream on receive).

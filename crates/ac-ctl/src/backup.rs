@@ -51,9 +51,13 @@ fn lock(data: &Path) -> Result<DirLock, String> {
 pub fn run(b: &Backup, max_checkpoints: usize) -> Result<u8, String> {
     let rt = runtime(b);
     match &b.op {
-        BackupOp::Send { agents, keep } => {
+        BackupOp::Send {
+            agents,
+            keep,
+            full_every,
+        } => {
             let _held = lock(&b.data)?;
-            send(&rt, &b.dest, agents, *keep)
+            send(&rt, &b.dest, agents, *keep, *full_every)
         }
         BackupOp::List(agent) => list(&rt, &b.dest, agent.as_ref()),
         BackupOp::Restore(id, wanted) => {
@@ -74,12 +78,18 @@ fn targets(rt: &Rt, named: &[AgentId]) -> Result<Vec<(AgentId, Volume)>, String>
         .collect()
 }
 
-fn send(rt: &Rt, dest: &Path, named: &[AgentId], keep: usize) -> Result<u8, String> {
+fn send(
+    rt: &Rt,
+    dest: &Path,
+    named: &[AgentId],
+    keep: usize,
+    full_every: usize,
+) -> Result<u8, String> {
     let mut failed = false;
     for (id, volume) in targets(rt, named)? {
         let line = match volume {
             Volume::Subvolume => rt
-                .backup(dest, &id, keep)
+                .backup(dest, &id, keep, full_every)
                 .map(|s| {
                     let how = match &s.parent {
                         Some(p) => format!("incremental from {p}"),
@@ -89,7 +99,7 @@ fn send(rt: &Rt, dest: &Path, named: &[AgentId], keep: usize) -> Result<u8, Stri
                         0 => String::new(),
                         n => format!("; {n} older deleted"),
                     };
-                    format!("{id} backed up {} ({how}{pruned})", s.id)
+                    format!("{id} backed up {} ({how}, {}{pruned})", s.id, size(s.bytes))
                 })
                 .map_err(|e| e.to_string()),
             Volume::Directory => Err(format!(
@@ -107,6 +117,15 @@ fn send(rt: &Rt, dest: &Path, named: &[AgentId], keep: usize) -> Result<u8, Stri
         }
     }
     Ok(u8::from(failed))
+}
+
+/// `bytes` for a person: KiB, MiB or GiB with one decimal.
+fn size(bytes: u64) -> String {
+    let units = [("GiB", 1u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+    match units.iter().find(|(_, n)| bytes >= *n) {
+        Some((unit, n)) => format!("{:.1} {unit}", bytes as f64 / *n as f64),
+        None => format!("{bytes} B"),
+    }
 }
 
 /// Agent ids with a directory at `dest`.
@@ -127,8 +146,17 @@ fn list(rt: &Rt, dest: &Path, agent: Option<&AgentId>) -> Result<u8, String> {
         None => agents_at(dest)?,
     };
     for id in ids {
-        for b in rt.backups(dest, &id).map_err(|e| e.to_string())? {
-            println!("{id} {b}");
+        let streams = rt.streams(dest, &id).map_err(|e| e.to_string())?;
+        for b in backup::restorable(&streams) {
+            let how = match streams
+                .iter()
+                .find(|s| s.id == b)
+                .and_then(|s| s.parent.as_ref())
+            {
+                Some(p) => format!("incremental from {p}"),
+                None => "full".to_owned(),
+            };
+            println!("{id} {b} {how}");
         }
     }
     Ok(0)

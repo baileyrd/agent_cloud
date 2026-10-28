@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use ac_domain::backup::DEFAULT_KEEP;
+use ac_domain::backup::{DEFAULT_FULL_EVERY, DEFAULT_KEEP};
 use ac_domain::checkpoint::LabelError;
 use ac_domain::tune::Profile;
 use ac_domain::{AgentId, BackupId, CheckpointId, IdError, Label};
@@ -18,7 +18,7 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
        ac-ctl --image IMAGE [...] restore <agent-id> <checkpoint>
        ac-ctl --image IMAGE [...] [--network] [--from CHECKPOINT] fork <agent-id> <new-agent-id>
        ac-ctl --image IMAGE [...] workspace migrate <agent-id>
-       ac-ctl [--data DIR] [--workspaces DIR] [--keep N] backup <dest> [<agent-id>...]
+       ac-ctl [--data DIR] [--workspaces DIR] [--keep N] [--full-every N] backup <dest> [<agent-id>...]
        ac-ctl [--data DIR] backups <dest> [<agent-id>]
        ac-ctl [--data DIR] [--workspaces DIR] restore-backup <dest> <agent-id> [<backup>]
        ac-ctl doctor [--profile idle|build|heavy] [--json] [--facts-file F] [--root DIR] [--explain]
@@ -31,12 +31,13 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
     agents only) puts one back and keeps the workspace it replaces as a new checkpoint; fork
     creates and boots a new agent on a copy of the workspace, or of checkpoint --from. workspace
     migrate turns a paused agent's plain-directory workspace into a subvolume.
-  Backups (ADR-021; root; dest on another btrfs filesystem): backup sends each subvolume
-    workspace (or those named) to <dest>/<agent>/<backup>, incrementally after the first, and
-    keeps the newest --keep (default 7) there; exit 1 if any agent was not backed up (a plain
-    directory needs workspace migrate). backups lists them. restore-backup puts one (default the
-    newest) in place of a workspace with no VM, keeping the old one as a checkpoint. None of the
-    three opens the registry: they work while ac-gateway runs.
+  Backups (ADR-021; root; dest any directory, best on another machine or disk): backup sends
+    each subvolume workspace (or those named) as a btrfs send stream file to <dest>/<agent>/,
+    incrementally against the last one, in full every --full-every (default 7), and keeps the
+    newest --keep (default 7) there with the streams they need; exit 1 if any agent was not
+    backed up (a plain directory needs workspace migrate). backups lists them. restore-backup
+    replays one (default the newest) in place of a workspace with no VM, keeping the old one as
+    a checkpoint. None of the three opens the registry: they work while ac-gateway runs.
   doctor compares this host's settings with what its facts recommend for the profile (ADR-014):
     read-only; exit 0 all ok, 1 warnings, 4 errors. --facts-file plans a host from a JSON file of
     facts (deploy/hosts/) instead of this one; --explain lists every rule and its evidence.
@@ -99,6 +100,8 @@ pub enum BackupOp {
         agents: Vec<AgentId>,
         /// Backups kept per agent.
         keep: usize,
+        /// A full send at least this often.
+        full_every: usize,
     },
     /// List the backups of one agent, or of every agent at `dest`.
     List(Option<AgentId>),
@@ -223,8 +226,8 @@ pub enum ArgError {
     OnlyWith(&'static str, &'static str),
     /// Checkpoint label rejected.
     BadLabel(LabelError),
-    /// `--keep` was not a number of at least 1.
-    BadKeep(String),
+    /// `--keep` or `--full-every` was not a number of at least 1.
+    BadCount(&'static str, String),
 }
 
 impl fmt::Display for ArgError {
@@ -243,7 +246,7 @@ impl fmt::Display for ArgError {
             Self::Conflict(a, b) => write!(f, "{a} and {b} exclude each other"),
             Self::OnlyWith(flag, action) => write!(f, "{flag} only applies to {action}"),
             Self::BadLabel(e) => e.fmt(f),
-            Self::BadKeep(v) => write!(f, "--keep must be a number of at least 1, got {v}"),
+            Self::BadCount(flag, v) => write!(f, "{flag} must be a number of at least 1, got {v}"),
         }
     }
 }
@@ -276,6 +279,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, ArgError
     }
 }
 
+/// `value` of `flag` as a number of at least 1.
+fn count(flag: &'static str, value: String) -> Result<usize, ArgError> {
+    match value.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(ArgError::BadCount(flag, value)),
+    }
+}
+
 /// A backup command, or every argument back when the first word after the flags names none.
 fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<String>>, ArgError> {
     let all: Vec<String> = args.collect();
@@ -284,8 +295,8 @@ fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<Strin
     while let Some(arg) = it.next() {
         match arg.as_str() {
             // Every flag that takes a value, the fleet's too, so its value is not a word.
-            "--data" | "--workspaces" | "--keep" | "--image" | "--ctr" | "--namespace"
-            | "--uid" | "--label" | "--from" => flags.push((arg, it.next())),
+            "--data" | "--workspaces" | "--keep" | "--full-every" | "--image" | "--ctr"
+            | "--namespace" | "--uid" | "--label" | "--from" => flags.push((arg, it.next())),
             a if a.starts_with("--") => flags.push((arg, None)),
             _ => pos.push(arg.clone()),
         }
@@ -295,7 +306,7 @@ fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<Strin
         return Ok(Err(all));
     }
     let (mut data, mut workspaces) = (PathBuf::from("/var/lib/agent-cloud"), None::<PathBuf>);
-    let mut keep = None::<usize>;
+    let (mut keep, mut full_every) = (None::<usize>, None::<usize>);
     for (flag, value) in flags {
         let value = || {
             value
@@ -305,15 +316,8 @@ fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<Strin
         match flag.as_str() {
             "--data" => data = value()?.into(),
             "--workspaces" => workspaces = Some(value()?.into()),
-            "--keep" => {
-                let v = value()?;
-                keep = Some(
-                    v.parse()
-                        .ok()
-                        .filter(|n| *n >= 1)
-                        .ok_or(ArgError::BadKeep(v))?,
-                );
-            }
+            "--keep" => keep = Some(count("--keep", value()?)?),
+            "--full-every" => full_every = Some(count("--full-every", value()?)?),
             _ => return Err(ArgError::UnknownFlag(flag.clone())),
         }
     }
@@ -326,6 +330,7 @@ fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<Strin
                 .map(|a| AgentId::parse(&a).map_err(ArgError::BadId))
                 .collect::<Result<_, _>>()?,
             keep: keep.unwrap_or(DEFAULT_KEEP),
+            full_every: full_every.unwrap_or(DEFAULT_FULL_EVERY),
         },
         "backups" => BackupOp::List(
             rest.next()
@@ -341,8 +346,13 @@ fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<Strin
                 .map_err(ArgError::BadId)?,
         ),
     };
-    if keep.is_some() && !matches!(op, BackupOp::Send { .. }) {
-        return Err(ArgError::OnlyWith("--keep", "backup"));
+    if !matches!(op, BackupOp::Send { .. }) {
+        if keep.is_some() {
+            return Err(ArgError::OnlyWith("--keep", "backup"));
+        }
+        if full_every.is_some() {
+            return Err(ArgError::OnlyWith("--full-every", "backup"));
+        }
     }
     if let Some(extra) = rest.next() {
         return Err(ArgError::Extra(extra));
@@ -623,16 +633,18 @@ mod tests {
             all.op,
             BackupOp::Send {
                 agents: vec![],
-                keep: DEFAULT_KEEP
+                keep: DEFAULT_KEEP,
+                full_every: DEFAULT_FULL_EVERY
             }
         );
-        let some = b("--data /d --keep 3 backup /b a1 a2");
+        let some = b("--data /d --keep 3 --full-every 4 backup /b a1 a2");
         assert_eq!(some.workspaces, PathBuf::from("/d/workspaces"));
         assert_eq!(
             some.op,
             BackupOp::Send {
                 agents: vec![a("a1"), a("a2")],
-                keep: 3
+                keep: 3,
+                full_every: 4
             }
         );
         assert_eq!(b("backups /b").op, BackupOp::List(None));
@@ -653,6 +665,14 @@ mod tests {
                 "--keep must be a number of at least 1, got 0",
             ),
             ("--keep 2 backups /b", "--keep only applies to backup"),
+            (
+                "--full-every 2 restore-backup /b a1",
+                "--full-every only applies to backup",
+            ),
+            (
+                "--full-every x backup /b",
+                "--full-every must be a number of at least 1, got x",
+            ),
             ("--image i backup /b", "unknown flag --image"),
             ("backup /b ../x", "id must match"),
             ("restore-backup /b", "missing agent id"),

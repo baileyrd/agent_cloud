@@ -16,7 +16,7 @@ use rusty_serve::{Request, Response, SharedHandler};
 use crate::access::{self, Failures, Rule, Verdict};
 use crate::jobs::{self, Jobs, Route};
 use crate::mcp::{self, Message};
-use crate::tokens::{Keys, Presented, Scope, Token};
+use crate::tokens::{self, Keys, Presented, Scope, Token};
 use crate::viewer::{Answer, Hub};
 use crate::{error, escape, Api, Reply};
 
@@ -103,6 +103,9 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
         }
         let keys = self.keys.get();
         let token = match keys.find(r.authorization) {
+            Presented::Known(t) if !t.live(tokens::unix_now()) => {
+                return self.refuse(method, path, &format!("token {} expired", t.name))
+            }
             Presented::Known(t) => t,
             Presented::Missing => return self.refuse(method, path, "no bearer token"),
             Presented::Unknown(prefix) => {
@@ -321,8 +324,8 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
     }
 }
 
-/// A viewer stream that ends once its token is revoked or changed (checked at every message and
-/// keep-alive, so within a few seconds of the reload). Ending it gives up the viewer's seat.
+/// A viewer stream that ends once its token is revoked, changed or expired (checked at every
+/// message and keep-alive, so within a few seconds of the reload or the expiry). Ending it gives up the viewer's seat.
 struct Revocable {
     stream: crate::viewer::Stream,
     keys: Keys,
@@ -334,11 +337,13 @@ impl Iterator for Revocable {
 
     fn next(&mut self) -> Option<Vec<u8>> {
         let msg = self.stream.next()?;
-        self.keys.get().holds(&self.token).then_some(msg)
+        let live = self.token.live(tokens::unix_now()) && self.keys.get().holds(&self.token);
+        live.then_some(msg)
     }
 }
 
-/// `{"name","scopes","agents"}` of the caller's token.
+/// `{"name","scopes","agents","expires"}` of the caller's token; `expires` is Unix seconds or
+/// `null` (until revoked).
 fn whoami(token: &Token) -> Reply {
     let quoted = |v: Vec<String>| {
         v.iter()
@@ -366,8 +371,11 @@ fn whoami(token: &Token) -> Reply {
     Reply {
         status: 200,
         body: format!(
-            r#"{{"name":"{}","scopes":[{scopes}],"agents":{agents}}}"#,
-            escape(&token.name)
+            r#"{{"name":"{}","scopes":[{scopes}],"agents":{agents},"expires":{}}}"#,
+            escape(&token.name),
+            token
+                .expires
+                .map_or_else(|| "null".to_owned(), |e| e.to_string())
         ),
     }
 }

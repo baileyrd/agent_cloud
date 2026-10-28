@@ -170,10 +170,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
                 mcp::initialized(id, mcp::negotiate(asked.as_deref()))
             }
             Message::Ping(id) => mcp::empty(id),
-            Message::List(id) => mcp::list(id, |t| {
-                access::find(t.method, t.path)
-                    .is_ok_and(|(rule, _)| access::check(token, rule, None).is_ok())
-            }),
+            Message::List(id) => mcp::list(id, |rule| access::check(token, rule, None).is_ok()),
             Message::Call(id, name, args) => {
                 let Some(tool) = mcp::tool(&name) else {
                     return rpc(mcp::unknown_tool(id, &name));

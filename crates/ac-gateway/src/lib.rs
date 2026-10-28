@@ -18,11 +18,15 @@
 //! `PUT .../{id}/egress` with `{"profiles":["rust"]}` replaces them (the proxy applies it to the
 //! next request). A create may carry `{"egress_profiles":[...]}`, which needs `egress:write` too.
 //! The API attaches only profiles that exist; it never defines hosts.
+//!
+//! MCP (ADR-017): `POST /api/v1/mcp` serves these routes, and the job and history ones, as tools
+//! ([`mcp`]).
 
 pub mod access;
 pub mod bind;
 pub mod egress;
 pub mod jobs;
+pub mod mcp;
 pub mod notify;
 pub mod tokens;
 pub mod viewer;
@@ -728,7 +732,8 @@ mod tests {
             let life = life.status != 405
                 && life.body != error(404, "not found").body
                 && !(life.status == 400 && empty);
-            viewer || job || life || (m == "GET" && p == web::WHOAMI)
+            let own = (m == "GET" && p == web::WHOAMI) || (m == "POST" && p == mcp::PATH);
+            viewer || job || life || own
         };
         let mut checked = 0;
         for m in ["GET", "POST", "DELETE", "PUT"] {

@@ -1196,3 +1196,130 @@ fn egress_routes_need_egress_write_and_are_audited() {
     assert_eq!(mode.ok(), Some((0o600, me)));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// One MCP tool call as `token`: `(isError, text)`.
+fn tool(addr: SocketAddr, token: &str, name: &str, args: &str) -> (bool, String) {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+    );
+    let (status, reply) = request_as(addr, token, "POST", "/api/v1/mcp", &[], &body);
+    assert_eq!(status, 200, "{reply}");
+    let v = rusty_json::Value::parse(&reply).unwrap_or_else(|e| panic!("{e}: {reply}"));
+    let text = v.pointer("/result/content/0/text").and_then(|t| t.as_str());
+    let error = v.pointer("/result/isError").and_then(|e| e.as_bool());
+    (
+        error.unwrap_or_else(|| panic!("{reply}")),
+        text.unwrap_or_default().to_owned(),
+    )
+}
+
+/// The MCP endpoint (ADR-017): a tool call is served as the REST route it names, with that
+/// route's scope, the token's agents and the audit; `tools/list` shows what the scopes allow.
+#[test]
+fn mcp_tools_follow_the_token_scopes() {
+    use std::os::unix::fs::MetadataExt;
+    let (fake, dir) = (Fake::new(), tmp("mcp"));
+    let _ = std::fs::create_dir_all(&dir);
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let file = TokenFile::new(dir.join("tokens"), me);
+    let scopes = Scopes::parse("jobs:read,jobs:write").unwrap_or_else(|e| panic!("{e}"));
+    let agents = Agents::parse("a1").unwrap_or_else(|e| panic!("{e}"));
+    let jobs = file
+        .create("worker", scopes, agents, 1)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let addr = serve_with(&fake, &dir, 4, 16, Keys::new(t));
+    let rpc = |token: &str, extra: &[&str], body: &str| {
+        request_as(addr, token, "POST", "/api/v1/mcp", extra, body)
+    };
+
+    let init = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let (status, body) = rpc(&jobs, &[], init);
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains(r#""protocolVersion":"2025-06-18""#) && body.contains(r#""tools":"#),
+        "{body}"
+    );
+    let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    assert_eq!(rpc(&jobs, &[], note).0, 202);
+
+    let names = |token: &str| {
+        let (_, body) = rpc(
+            token,
+            &[],
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        );
+        let v = rusty_json::Value::parse(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        let tools = v
+            .pointer("/result/tools")
+            .and_then(|t| t.as_array())
+            .cloned();
+        tools
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let worker = names(&jobs);
+    assert_eq!(
+        worker,
+        [
+            "whoami",
+            "list_jobs",
+            "get_job",
+            "get_job_output",
+            "submit_job",
+            "cancel_job"
+        ]
+    );
+    assert_eq!(names(TOKEN).len(), ac_gateway::mcp::TOOLS.len());
+
+    // Admin creates a1 over MCP; the call is audited like the REST one.
+    let (failed, text) = tool(addr, TOKEN, "create_agent", r#"{"agent_id":"a1"}"#);
+    assert!(!failed && text.contains(r#""state":"running""#), "{text}");
+    let (_, history) = tool(addr, TOKEN, "get_history", r#"{"agent_id":"a1"}"#);
+    assert!(
+        history.contains("audit token=legacy action=create status=201"),
+        "{history}"
+    );
+
+    // The jobs token: not its scope is 403, not its agent is 404. (This gateway has no task API,
+    // so its job routes are 404 for a1 too; whoami shows a call that passes.)
+    let (failed, text) = tool(addr, &jobs, "create_agent", r#"{"agent_id":"a1"}"#);
+    assert!(
+        failed && text.starts_with("HTTP 403") && text.contains("agents:write"),
+        "{text}"
+    );
+    let (failed, text) = tool(addr, &jobs, "list_jobs", r#"{"agent_id":"a2"}"#);
+    assert!(failed && text.starts_with("HTTP 404"), "{text}");
+    let (failed, text) = tool(addr, &jobs, "list_jobs", r#"{"agent_id":"a1/../a2"}"#);
+    assert!(failed && text.contains("agent_id:"), "{text}");
+    let (failed, text) = tool(addr, &jobs, "whoami", "{}");
+    assert!(!failed && text.contains(r#""name":"worker""#), "{text}");
+
+    // Protocol errors.
+    let (status, body) = rpc(
+        &jobs,
+        &[],
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}}"#,
+    );
+    assert!(status == 200 && body.contains("-32602"), "{body}");
+    assert_eq!(rpc(&jobs, &[], "{").0, 400);
+    assert_eq!(
+        rpc(&jobs, &["MCP-Protocol-Version: 1999-01-01"], init).0,
+        400
+    );
+    assert_eq!(
+        rpc(&jobs, &["MCP-Protocol-Version: 2025-06-18"], init).0,
+        200
+    );
+    assert_eq!(rpc("wrong", &[], init).0, 401);
+    assert_eq!(
+        request_as(addr, &jobs, "GET", "/api/v1/mcp", &[], "").0,
+        405
+    );
+    let cross = ["Origin: http://evil.example"];
+    assert_eq!(rpc(&jobs, &cross, init).0, 403);
+    let _ = std::fs::remove_dir_all(dir);
+}

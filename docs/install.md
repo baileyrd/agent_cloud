@@ -378,6 +378,15 @@ Every state-changing call is logged as `audit token=<name> action=<...> status=<
 history. A tokens file that is unreadable, not 0600, not root's or malformed stops the gateway at startup (and
 is ignored, with a log line, if it turns up later); fix it and start again.
 
+**MCP** (ADR-017): the same token drives the gateway from an MCP client at `http://<gateway>/api/v1/mcp`
+(Streamable HTTP, stateless). The client sees only the tools its token's scopes allow, and each call is checked
+and audited as the REST route it names. For Claude Code:
+
+```bash
+claude mcp add --transport http agent-cloud http://127.0.0.1:8780/api/v1/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
 *Migrating from `AC_TOKEN_FILE`* (hosts set up before ADR-011). Nothing breaks on upgrade: the old token keeps
 working as an `admin` token for every agent named `legacy`, and the gateway logs that it is deprecated. To move
 off it:

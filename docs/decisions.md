@@ -713,13 +713,12 @@ Origin check.
 - *Stateless, JSON only:* no `Mcp-Session-Id`, no SSE (`GET` is 405), single messages (batches are refused).
   Versions `2025-11-25`, `2025-06-18`, `2025-03-26`: `initialize` echoes the client's when served, else the
   newest; an unserved `MCP-Protocol-Version` header is 400. Notifications get 202.
-- *One tool per REST route* (`mcp::TOOLS`): `whoami`; `list_agents`, `get_agent`, `get_capacity`,
+- *One tool per REST route* (declared on the route in `access::ROUTES` since ADR-020): `whoami`; `list_agents`, `get_agent`, `get_capacity`,
   `list_egress_profiles`, `get_agent_egress` (`agents:read`); `create_agent`, `pause_agent`, `resume_agent`,
   `destroy_agent` (`agents:write`); `set_agent_egress` (`egress:write`); `list_jobs`, `get_job`,
   `get_job_output` (`jobs:read`); `submit_job`, `cancel_job` (`jobs:write`); `get_history` (`viewer:read`);
   `list_checkpoints` (`agents:read`); `create_checkpoint`, `delete_checkpoint`, `restore_checkpoint`,
-  `fork_agent` (`agents:write`, ADR-018). A tool names a method and a path of `access::ROUTES` and takes its
-  scope from there; a test checks every tool against the table.
+  `fork_agent` (`agents:write`, ADR-018). A tool takes its method, path and scope from the route that offers it.
 - *Same path as REST:* a call becomes that route's method, target and body, then goes through `access::check`
   (agents first, then scope), the handler and the audit line, exactly as an HTTP request. Arguments are checked
   by kind first (ids parsed as `AgentId`/`JobId`, query values only booleans, counts or lowercase words, unknown
@@ -810,7 +809,7 @@ list (`btrfs filesystem du` is slow on a rotational disk); an XFS reflink backen
 snapshots (the roadmap's separate item).
 
 ## ADR-020: One operation catalog for REST and MCP; `ac-ctl` stays local
-**Status:** proposed (2026-10-28).
+**Status:** proposed (2026-10-28); implemented on its branch for review.
 **Context:** The Ephemeral Sandbox comparison (2026-10-27) suggested generating the CLI and the MCP tools from one
 declaration, once there were two real consumers. There are now two tables that describe the same operations:
 `access::ROUTES` (method, path, scope, audit name) and `mcp::TOOLS` (name, description, method, path, arguments),
@@ -821,13 +820,13 @@ refuses while the gateway holds it (exit 3), so it works with the gateway stoppe
 **Decision (proposed):**
 - *One table for the gateway.* A route of `access::ROUTES` carries its MCP tool, if it has one (name, description,
   where arguments go, the arguments). `mcp::TOOLS` goes; `tools/list`, `tools/call` and the scope a tool gets all
-  read the route. Method and path are written once, so a tool cannot drift from its route and the cross-check
-  test becomes a test of argument placeholders only. Behaviour on the wire does not change: same tool names,
-  order, descriptions and schemas.
+  read the route. Method and path are written once, so a tool cannot drift from its route; the cross-check
+  test becomes a pinned list of tool names plus one id argument per path placeholder. On the wire only the
+  `tools/list` order changes (it now follows the route table); names, descriptions and schemas are the same.
 - *`ac-ctl` keeps its own parser.* Generating its commands from the route table would mean turning it into a
   REST client (a token on the host, an HTTP client, and no way to work with the gateway stopped) or giving the
   table a second, local dispatch path. Neither has a forcing function yet.
 **Revisit when:** `ac-ctl` needs to act while the gateway runs (then it becomes a client of the same table, and
 its fleet commands are generated from it), or a third front end (a web UI form, another protocol) appears.
-**Consequences:** one place to add an operation to REST and MCP; about 100 fewer lines; `ac-ctl` and the tools
+**Consequences:** one place to add an operation to REST and MCP, a little less code; `ac-ctl` and the tools
 can still differ in naming (`create` vs `create_agent`) and in what they offer.

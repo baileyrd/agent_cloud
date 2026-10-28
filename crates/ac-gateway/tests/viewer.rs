@@ -1267,13 +1267,13 @@ fn mcp_tools_follow_the_token_scopes() {
         [
             "whoami",
             "list_jobs",
+            "submit_job",
             "get_job",
             "get_job_output",
-            "submit_job",
             "cancel_job"
         ]
     );
-    assert_eq!(names(TOKEN).len(), ac_gateway::mcp::TOOLS.len());
+    assert_eq!(names(TOKEN).len(), ac_gateway::mcp::offers().count());
 
     // Admin creates a1 over MCP; the call is audited like the REST one.
     let (failed, text) = tool(addr, TOKEN, "create_agent", r#"{"agent_id":"a1"}"#);

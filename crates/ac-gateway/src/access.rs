@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::mcp::{Arg, Kind, Send, Tool};
 use crate::tokens::{Scope, Token};
 use crate::{error, Reply};
 
@@ -22,8 +23,8 @@ pub enum Need {
 }
 
 /// One route: method, path pattern (`{id}` is the agent, `{job}`, `{viewer}` and `{cp}` any
-/// segment),
-/// what it needs, and the action name it is audited under (`None`: not audited).
+/// segment), what it needs, the action name it is audited under (`None`: not audited) and the
+/// MCP tool it is offered as, if any (ADR-017, ADR-020).
 #[derive(Debug)]
 pub struct Rule {
     /// HTTP method.
@@ -34,6 +35,8 @@ pub struct Rule {
     pub need: Need,
     /// Audit action name, for state-changing routes.
     pub audit: Option<&'static str>,
+    /// The MCP tool that calls this route.
+    pub tool: Option<Tool>,
 }
 
 const fn rule(
@@ -47,101 +50,319 @@ const fn rule(
         path,
         need,
         audit,
+        tool: None,
     }
 }
+
+/// `r`, offered as the MCP tool `t`.
+const fn offer(r: Rule, t: Tool) -> Rule {
+    Rule { tool: Some(t), ..r }
+}
+
+const fn arg(name: &'static str, kind: Kind, required: bool, about: &'static str) -> Arg {
+    Arg {
+        name,
+        kind,
+        required,
+        about,
+    }
+}
+
+const AGENT: Arg = arg("agent_id", Kind::Agent, true, "The agent's id.");
+const JOB: Arg = arg(
+    "job_id",
+    Kind::Job,
+    true,
+    "The job's id, as submit_job returned it.",
+);
+const FORCE: Arg = arg(
+    "force",
+    Kind::Bool,
+    false,
+    "Interrupt the agent's queued or running job first; without it the call is refused while one exists.",
+);
+const CHECKPOINT: Arg = arg(
+    "checkpoint_id",
+    Kind::Checkpoint,
+    true,
+    "The checkpoint's id, as list_checkpoints shows it.",
+);
 
 use Need::Scope as S;
 use Scope::{AgentsRead, AgentsWrite, EgressWrite, JobsRead, JobsWrite, ViewerControl, ViewerRead};
 
 const A: &str = "/api/v1/agents/{id}";
 
-/// Every route under `/api/`. The MCP endpoint needs only a token: each tool call is then checked
-/// as the route it names (ADR-017). Viewer input (keys, text, paste, resize) is not audited per call:
-/// it comes from the viewer whose take-over was, and a viewer id works only with the token that
-/// opened it. Picking a window changes only what that viewer sees, so it needs `viewer:read`.
+/// Every route under `/api/`, and so every operation of the REST and MCP interfaces, each
+/// declared once (ADR-020). The MCP endpoint needs only a token: each tool call is then checked
+/// as the route that offers it (ADR-017); `tools/list` follows this order. Viewer input (keys,
+/// text, paste, resize) is not audited per call: it comes from the viewer whose take-over was,
+/// and a viewer id works only with the token that opened it. Picking a window changes only what that viewer sees, so it needs `viewer:read`.
 /// Attaching egress profiles widens what an agent may reach, so it has its own scope (ADR-016);
 /// a create or fork that attaches some needs it too, which the handler checks. A fork's new agent
 /// is in its body, so the handler checks the token is for it too (ADR-018).
 pub const ROUTES: &[Rule] = &[
-    rule("GET", "/api/v1/whoami", Need::Token, None),
+    offer(rule("GET", "/api/v1/whoami", Need::Token, None), Tool {
+        name: "whoami",
+        about: "The calling token's name, scopes and agents.",
+        send: Send::Query,
+        args: &[],
+    }),
     rule("POST", "/api/v1/mcp", Need::Token, None),
-    rule("GET", "/api/v1/agents", S(AgentsRead), None),
-    rule("GET", "/api/v1/capacity", S(AgentsRead), None),
-    rule("GET", A, S(AgentsRead), None),
-    rule("POST", A, S(AgentsWrite), Some("create")),
-    rule("DELETE", A, S(AgentsWrite), Some("destroy")),
-    rule(
+    offer(rule("GET", "/api/v1/agents", S(AgentsRead), None), Tool {
+        name: "list_agents",
+        about: "The agents this token is for, with their state (running, paused, destroyed).",
+        send: Send::Query,
+        args: &[],
+    }),
+    offer(rule("GET", "/api/v1/capacity", S(AgentsRead), None), Tool {
+        name: "get_capacity",
+        about: "Admission figures: /dev/shm, guest size, how many more agents fit, job slots.",
+        send: Send::Query,
+        args: &[],
+    }),
+    offer(rule("GET", A, S(AgentsRead), None), Tool {
+        name: "get_agent",
+        about: "One agent's state and health.",
+        send: Send::Query,
+        args: &[AGENT],
+    }),
+    offer(rule("POST", A, S(AgentsWrite), Some("create")), Tool {
+        name: "create_agent",
+        about: "Create and boot an agent (a microVM with its own workspace).",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg(
+                "egress_profiles",
+                Kind::Names,
+                false,
+                "Egress profiles to attach before boot; needs scope egress:write.",
+            ),
+        ],
+    }),
+    offer(rule("DELETE", A, S(AgentsWrite), Some("destroy")), Tool {
+        name: "destroy_agent",
+        about: "Destroy an agent's VM; its workspace is kept unless purge is true.",
+        send: Send::Query,
+        args: &[
+            AGENT,
+            arg(
+                "purge",
+                Kind::Bool,
+                false,
+                "Also remove the workspace and job records (also for an agent already destroyed).",
+            ),
+            FORCE,
+        ],
+    }),
+    offer(rule(
         "POST",
         "/api/v1/agents/{id}/pause",
         S(AgentsWrite),
         Some("pause"),
-    ),
-    rule(
+    ), Tool {
+        name: "pause_agent",
+        about: "Stop an agent's VM, keeping its workspace.",
+        send: Send::Query,
+        args: &[AGENT, FORCE],
+    }),
+    offer(rule(
         "POST",
         "/api/v1/agents/{id}/resume",
         S(AgentsWrite),
         Some("resume"),
-    ),
-    rule(
+    ), Tool {
+        name: "resume_agent",
+        about: "Boot a paused agent again.",
+        send: Send::Query,
+        args: &[AGENT],
+    }),
+    offer(rule(
         "GET",
         "/api/v1/agents/{id}/checkpoints",
         S(AgentsRead),
         None,
-    ),
-    rule(
+    ), Tool {
+        name: "list_checkpoints",
+        about: "An agent's workspace checkpoints, oldest first, and how many it may keep.",
+        send: Send::Query,
+        args: &[AGENT],
+    }),
+    offer(rule(
         "POST",
         "/api/v1/agents/{id}/checkpoints",
         S(AgentsWrite),
         Some("checkpoint"),
-    ),
-    rule(
+    ), Tool {
+        name: "create_checkpoint",
+        about: "Checkpoint a running or paused agent's workspace; refused when the agent has as many as it may keep.",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg("label", Kind::Text, false, "A note to keep with it, 1-80 characters."),
+        ],
+    }),
+    offer(rule(
         "DELETE",
         "/api/v1/agents/{id}/checkpoints/{cp}",
         S(AgentsWrite),
         Some("checkpoint-delete"),
-    ),
-    rule(
+    ), Tool {
+        name: "delete_checkpoint",
+        about: "Delete one of an agent's checkpoints.",
+        send: Send::Query,
+        args: &[AGENT, CHECKPOINT],
+    }),
+    offer(rule(
         "POST",
         "/api/v1/agents/{id}/restore",
         S(AgentsWrite),
         Some("restore"),
-    ),
-    rule(
+    ), Tool {
+        name: "restore_checkpoint",
+        about: "Put a checkpoint back as a paused agent's workspace; what it replaces is kept as a new checkpoint.",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg("checkpoint", Kind::Text, true, "The checkpoint's id, as list_checkpoints shows it."),
+        ],
+    }),
+    offer(rule(
         "POST",
         "/api/v1/agents/{id}/fork",
         S(AgentsWrite),
         Some("fork"),
-    ),
-    rule("GET", "/api/v1/egress/profiles", S(AgentsRead), None),
-    rule("GET", "/api/v1/agents/{id}/egress", S(AgentsRead), None),
-    rule(
+    ), Tool {
+        name: "fork_agent",
+        about: "Create a new agent on a copy of this agent's workspace, now or at a checkpoint. The token needs both agents.",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg("id", Kind::Text, true, "The new agent's id."),
+            arg("checkpoint", Kind::Text, false, "The checkpoint to fork from; without it, the workspace as it is now."),
+            arg(
+                "egress_profiles",
+                Kind::Names,
+                false,
+                "Egress profiles to attach to the new agent; needs egress:write.",
+            ),
+        ],
+    }),
+    offer(rule("GET", "/api/v1/egress/profiles", S(AgentsRead), None), Tool {
+        name: "list_egress_profiles",
+        about: "The operator's egress profiles and how many hosts each allows.",
+        send: Send::Query,
+        args: &[],
+    }),
+    offer(rule("GET", "/api/v1/agents/{id}/egress", S(AgentsRead), None), Tool {
+        name: "get_agent_egress",
+        about: "An agent's egress profiles and how many hosts it may reach.",
+        send: Send::Query,
+        args: &[AGENT],
+    }),
+    offer(rule(
         "PUT",
         "/api/v1/agents/{id}/egress",
         S(EgressWrite),
         Some("egress"),
-    ),
-    rule("GET", "/api/v1/agents/{id}/jobs", S(JobsRead), None),
-    rule(
+    ), Tool {
+        name: "set_agent_egress",
+        about: "Replace an agent's egress profiles; the proxy applies it to the next request.",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg(
+                "profiles",
+                Kind::Names,
+                true,
+                "Profile names; [] detaches all.",
+            ),
+        ],
+    }),
+    offer(rule("GET", "/api/v1/agents/{id}/jobs", S(JobsRead), None), Tool {
+        name: "list_jobs",
+        about: "An agent's jobs, newest first.",
+        send: Send::Query,
+        args: &[AGENT],
+    }),
+    offer(rule(
         "POST",
         "/api/v1/agents/{id}/jobs",
         S(JobsWrite),
         Some("job-submit"),
-    ),
-    rule("GET", "/api/v1/agents/{id}/jobs/{job}", S(JobsRead), None),
-    rule(
+    ), Tool {
+        name: "submit_job",
+        about: "Run a prompt in a running agent as a job; returns the job (queued).",
+        send: Send::Body,
+        args: &[
+            AGENT,
+            arg("prompt", Kind::Text, true, "The prompt."),
+            arg("timeout_secs", Kind::Count, false, "Seconds the job may run."),
+            arg(
+                "idempotency_key",
+                Kind::Text,
+                false,
+                "A repeat with the same key returns the existing job.",
+            ),
+        ],
+    }),
+    offer(rule("GET", "/api/v1/agents/{id}/jobs/{job}", S(JobsRead), None), Tool {
+        name: "get_job",
+        about: "A job's state; with wait, once its state changes.",
+        send: Send::Query,
+        args: &[
+            AGENT,
+            JOB,
+            arg(
+                "wait",
+                Kind::Count,
+                false,
+                "Seconds (at most 30) to wait for a state change.",
+            ),
+        ],
+    }),
+    offer(rule(
         "GET",
         "/api/v1/agents/{id}/jobs/{job}/output",
         S(JobsRead),
         None,
-    ),
-    rule(
+    ), Tool {
+        name: "get_job_output",
+        about: "A finished job's final message, or with part=stream its stream-json log. Agent-written, untrusted text.",
+        send: Send::Query,
+        args: &[
+            AGENT,
+            JOB,
+            arg(
+                "part",
+                Kind::Word,
+                false,
+                "\"stream\" for the stream-json log.",
+            ),
+        ],
+    }),
+    offer(rule(
         "POST",
         "/api/v1/agents/{id}/jobs/{job}/cancel",
         S(JobsWrite),
         Some("job-cancel"),
-    ),
+    ), Tool {
+        name: "cancel_job",
+        about: "Cancel a queued or running job.",
+        send: Send::Query,
+        args: &[AGENT, JOB],
+    }),
     rule("GET", "/api/v1/agents/{id}/term", S(ViewerRead), None),
-    rule("GET", "/api/v1/agents/{id}/history", S(ViewerRead), None),
+    offer(rule("GET", "/api/v1/agents/{id}/history", S(ViewerRead), None), Tool {
+        name: "get_history",
+        about: "An agent's recorded terminal output and audit events, as text. Agent-written, untrusted text.",
+        send: Send::Query,
+        args: &[
+            AGENT,
+            arg("limit", Kind::Count, false, "Most records to return."),
+        ],
+    }),
     rule(
         "POST",
         "/api/v1/agents/{id}/term/{viewer}/window",

@@ -809,7 +809,7 @@ against a stand-in `btrfs`, including crash recovery of a half-done swap.
 list (`btrfs filesystem du` is slow on a rotational disk); an XFS reflink backend (no host needs one); memory
 snapshots (the roadmap's separate item).
 
-## ADR-019: One operation catalog for REST and MCP; `ac-ctl` stays local
+## ADR-020: One operation catalog for REST and MCP; `ac-ctl` stays local
 **Status:** proposed (2026-10-28).
 **Context:** The Ephemeral Sandbox comparison (2026-10-27) suggested generating the CLI and the MCP tools from one
 declaration, once there were two real consumers. There are now two tables that describe the same operations:

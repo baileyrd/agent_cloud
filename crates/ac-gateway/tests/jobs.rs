@@ -15,7 +15,7 @@ use ac_domain::health::Pressure;
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
-use ac_gateway::jobs::{self, Answer, JobRunner, Jobs, Part, Probe, Route};
+use ac_gateway::jobs::{self, Answer, Changes, JobRunner, Jobs, Part, Probe, Route};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::web::App;
@@ -50,6 +50,10 @@ struct World {
     kills: Vec<String>,
     kill_fails: bool,
     start_fails: bool,
+    /// Jobs with a start snapshot, and what each changed.
+    snapshots: HashMap<String, Vec<String>>,
+    /// Jobs whose changes were asked for, in order.
+    ended: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -110,6 +114,25 @@ impl JobRunner for Fake {
             Part::Result => format!("result of {job} <script>").into_bytes(),
             Part::Stream => b"{\"type\":\"result\"}\n".to_vec(),
         })
+    }
+}
+
+impl Changes for Fake {
+    fn begin(&self, _: &AgentId, job: &JobId) -> Result<(), String> {
+        let paths = [
+            ".jobs/j/prompt.txt",
+            ".job-j.done",
+            "src/main.rs",
+            "src/.jobs",
+        ];
+        let paths = paths.map(str::to_owned).to_vec();
+        self.w().snapshots.insert(job.to_string(), paths);
+        Ok(())
+    }
+    fn end(&self, _: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+        let mut w = self.w();
+        w.ended.push(job.to_string());
+        Ok(w.snapshots.remove(job.as_str()))
     }
 }
 
@@ -207,7 +230,7 @@ fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limit
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let notes = Arc::new(Mutex::new(Vec::new()));
     let (c, n) = (Arc::clone(&clock), Arc::clone(&notes));
-    let mut jobs = jobs_over(&store, fake.clone(), &root);
+    let mut jobs = jobs_over(&store, fake.clone(), &root).with_changes(fake.clone());
     if let Some((limits, load)) = gate {
         jobs = jobs.with_gate(limits, load);
     }
@@ -394,7 +417,56 @@ fn history_notes_carry_ids_and_states_only() {
             format!("a1: job {id} queued"),
             format!("a1: job {id} started"),
             format!("a1: job {id} failed (exit 3)"),
+            format!("a1: job {id} changed 2 paths: src/main.rs src/.jobs"),
         ]
+    );
+}
+
+#[test]
+fn started_jobs_note_what_they_changed_and_drop_their_snapshot() {
+    let r = rig();
+    let done = r.ok("a1", "a");
+    let queued = r.ok("a1", "b");
+    r.jobs.tick();
+    assert!(
+        r.fake.w().snapshots.contains_key(&done),
+        "taken before it ran"
+    );
+    let cancel = |job: &str| r.json(Route::Cancel(agent("a1"), job_id(job)), "");
+    assert_eq!(cancel(&queued).0, 200);
+    r.fake.set(&done, Probe::Exited(Some(0)));
+    r.tick();
+    r.fake.w().start_fails = true;
+    let unstarted = r.ok("a1", "c");
+    r.jobs.tick();
+    let w = r.fake.w();
+    assert_eq!(w.ended, [done, unstarted], "a never-started job has none");
+    assert!(w.snapshots.is_empty(), "every snapshot dropped");
+}
+
+#[test]
+fn change_notes_leave_out_the_runner_and_are_capped() {
+    let id = job_id("j1");
+    let paths = |v: &[&str]| v.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        jobs::change_note(
+            &id,
+            &paths(&[".jobs", ".jobs/j1/stream.jsonl", ".job-j1.done"])
+        ),
+        "job j1 changed no paths"
+    );
+    assert_eq!(
+        jobs::change_note(&id, &paths(&["a/.job-x", r"b\ c"])),
+        r"job j1 changed 2 paths: a/.job-x b\ c"
+    );
+    let many: Vec<String> = (0..1000).map(|i| format!("dir/file{i:04}")).collect();
+    let note = jobs::change_note(&id, &many);
+    assert!(note.len() <= "job j1 changed 1000 paths:".len() + jobs::CHANGE_NOTE_CAP + 20);
+    assert!(note.starts_with("job j1 changed 1000 paths: dir/file0000 dir/file0001 "));
+    let shown = note.matches("dir/file").count();
+    assert!(
+        note.ends_with(&format!(" (and {} more)", 1000 - shown)),
+        "{note}"
     );
 }
 

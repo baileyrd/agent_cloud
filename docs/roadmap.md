@@ -99,6 +99,8 @@
   (ADR-017); verified 2026-10-28 with Claude Code as the client on BaileyServ
 - [x] Workspace checkpoints, restore and forks on btrfs subvolumes, through the gateway and `ac-ctl` (ADR-018;
   verified on BaileyServ with live VMs 2026-10-28: checkpoint mid-write, fork, restore and undo)
+- [x] Each job's changed paths in the agent's history, from btrfs snapshots at its start and end (ADR-019;
+  tested on a loopback btrfs; not yet on BaileyServ)
 
 ## Later
 - Local model option for an offline posture

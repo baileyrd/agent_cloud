@@ -484,6 +484,7 @@ fn run() -> Result<(), String> {
             claude,
         )
         .with_gate(gate, ProcPressure)
+        .with_changes(CtrRuntime::new(LinuxSpawner, cfg.clone()))
         .with_notes(move |id, text| notes.note(id, text)),
     );
     jobs.reconcile();

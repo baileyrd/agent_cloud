@@ -15,7 +15,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ac_domain::{AgentId, Checkpoint, CheckpointId, Label, Volume};
+use ac_domain::{changes, AgentId, Checkpoint, CheckpointId, JobId, Label, Volume};
 use ac_ports::{PortError, Snapshots};
 use platform::process::Spawner;
 
@@ -27,6 +27,10 @@ const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
 const SUBVOLUME_INO: u64 = 256;
 /// Where a checkpoint's label is kept: beside its snapshot, never inside it.
 const LABEL_SUFFIX: &str = "label";
+/// A job's snapshots beside the checkpoints, as `<job>.start` and `<job>.end`: names no checkpoint
+/// can have, so they are neither listed nor counted under the cap.
+const JOB_START: &str = "start";
+const JOB_END: &str = "end";
 
 /// How the adapter tells what is on disk. Tests swap in their own.
 #[derive(Clone, Copy)]
@@ -193,6 +197,28 @@ impl<S: Spawner> CtrRuntime<S> {
         self.remove_volume(op, &old)
     }
 
+    /// Job snapshots in `dir` (`<job>.start`, `<job>.end`) that a crash left behind.
+    fn job_snapshots(&self, op: &'static str, dir: &Path) -> Result<Vec<PathBuf>, PortError> {
+        let entries = match std::fs::read_dir(dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_fail(op, "list", dir, e)),
+            Ok(entries) => entries,
+        };
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| io_fail(op, "list", dir, e))?;
+            let name = entry.file_name();
+            let suffix = name
+                .to_str()
+                .and_then(|n| n.rsplit_once('.'))
+                .map(|(_, s)| s);
+            if matches!(suffix, Some(JOB_START | JOB_END)) {
+                found.push(entry.path());
+            }
+        }
+        Ok(found)
+    }
+
     /// `checkpoint_root/<id>`, made 0700 (and the root 0700) if missing.
     fn checkpoints_dir_made(&self, op: &'static str, id: &AgentId) -> Result<PathBuf, PortError> {
         let dir = self.checkpoints_dir(id);
@@ -269,6 +295,75 @@ impl<S: Spawner> CtrRuntime<S> {
         }
         plain.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(Some(plain))
+    }
+}
+
+impl<S: Spawner> CtrRuntime<S> {
+    /// Snapshot `id`'s workspace read-only as job `job` starts (ADR-019). A workspace that is not
+    /// a subvolume is skipped: its job gets no change summary.
+    pub fn job_begin(&self, id: &AgentId, job: &JobId) -> Result<(), PortError> {
+        let op = "job snapshot";
+        let ws = self.workspace(id);
+        if self.volume_at(op, &ws)? != Volume::Subvolume {
+            return Ok(());
+        }
+        let dir = self.checkpoints_dir_made(op, id)?;
+        self.snapshot(op, &ws, &sibling(&dir.join(job.as_str()), JOB_START), true)
+    }
+
+    /// The workspace paths job `job` changed ([`changes::paths`]): its start snapshot compared
+    /// with one taken now, by `btrfs send --no-data`, which reads metadata only and never opens a
+    /// path inside the workspace. Both snapshots are deleted, also on failure. `None` when the job
+    /// has no start snapshot.
+    pub fn job_changes(&self, id: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, PortError> {
+        let op = "job changes";
+        let base = self.checkpoints_dir(id).join(job.as_str());
+        let (start, end) = (sibling(&base, JOB_START), sibling(&base, JOB_END));
+        if self.volume_at(op, &start)? == Volume::Missing {
+            return Ok(None);
+        }
+        let stream = sibling(&base, "send");
+        let diffed = self.diff(op, &self.workspace(id), &start, &end, &stream);
+        let cleanup = [
+            self.remove_volume(op, &end),
+            self.remove_volume(op, &start),
+            match std::fs::remove_file(&stream) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_fail(op, "rm", &stream, e)),
+                _ => Ok(()),
+            },
+        ]
+        .into_iter()
+        .collect::<Result<(), _>>();
+        match diffed {
+            Ok(paths) => cleanup.map(|()| Some(paths)),
+            Err(e) => Err(crate::with_cleanup(e, cleanup)),
+        }
+    }
+
+    /// Snapshot `ws` to `end`, write the incremental send from its earlier snapshot `start` to
+    /// `stream`, and list what changed.
+    fn diff(
+        &self,
+        op: &'static str,
+        ws: &Path,
+        start: &Path,
+        end: &Path,
+        stream: &Path,
+    ) -> Result<Vec<String>, PortError> {
+        self.snapshot(op, ws, end, true)?;
+        let flags = ["send", "-q", "--no-data", "-p"].map(OsStr::new);
+        let mut args = flags.to_vec();
+        args.extend([
+            start.as_os_str(),
+            OsStr::new("-f"),
+            stream.as_os_str(),
+            end.as_os_str(),
+        ]);
+        self.btrfs(op, &args)?;
+        let mut dump = os(&["receive", "--dump", "-f"]);
+        dump.push(stream.as_os_str().to_owned());
+        let out = self.run(op, OsStr::new(&self.cfg.btrfs_bin), &dump, None)?;
+        Ok(changes::paths(&String::from_utf8_lossy(&out)))
     }
 }
 
@@ -376,10 +471,15 @@ impl<S: Spawner> Snapshots for CtrRuntime<S> {
     }
 
     fn purge(&self, id: &AgentId) -> Result<(), PortError> {
+        let op = "purge checkpoints";
         for c in self.checkpoints(id)? {
             self.delete(id, &c.id)?;
         }
-        remove_dir_if_present("purge checkpoints", &self.checkpoints_dir(id))
+        let dir = self.checkpoints_dir(id);
+        for snap in self.job_snapshots(op, &dir)? {
+            self.remove_volume(op, &snap)?;
+        }
+        remove_dir_if_present(op, &dir)
     }
 }
 
@@ -398,10 +498,16 @@ mod tests {
     use super::*;
     use crate::CtrConfig;
 
-    /// `btrfs subvolume create|snapshot [-r]|delete`, each call logged to `$LOG`.
+    /// `btrfs subvolume create|snapshot [-r]|delete`, each call logged to `$LOG`; `send` writes a
+    /// listing of `file` as written, which `receive --dump` prints.
     const FAKE_BTRFS: &str = r#"set -eu
 echo "$*" >> "$LOG"
-[ "$1" = subvolume ] || exit 2
+case "$1" in
+send) printf 'snapshot ./%s uuid=x\nwrite ./%s/file offset=0 len=1\n' "${8##*/}" "${8##*/}" > "$7"; exit ;;
+receive) cat "$4"; exit ;;
+subvolume) ;;
+*) exit 2 ;;
+esac
 case "$2" in
 create) mkdir "$3"; chmod +t "$3" ;;
 snapshot)
@@ -695,6 +801,39 @@ esac"#;
     }
 
     #[test]
+    fn job_changes_compare_snapshots_then_delete_them() {
+        let h = Host::new();
+        let (a1, job) = (agent("a1"), JobId::from_random([1; 8]));
+        h.workspace(&a1, "x");
+        assert_eq!(ok(h.rt.job_changes(&a1, &job)), None, "no start snapshot");
+        ok(h.rt.job_begin(&a1, &job));
+        assert!(ok(h.rt.checkpoints(&a1)).is_empty(), "not a checkpoint");
+        assert_eq!(ok(h.rt.job_changes(&a1, &job)), Some(vec!["file".into()]));
+        let dir = h.root.join("checkpoints/a1");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .map(|d| d.count())
+            .into_iter()
+            .collect();
+        assert_eq!(left, [0], "snapshots and stream deleted");
+        let start = dir.join(format!("{job}.start"));
+        let log = h.log();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with(&format!("send -q --no-data -p {} -f ", start.display()))),
+            "{log:?}"
+        );
+        // A plain-directory workspace has no snapshots; a crash's leftover is purged.
+        let mut plain = Host::new();
+        plain.rt.disk.btrfs = |_| Ok(false);
+        plain.workspace(&a1, "x");
+        ok(plain.rt.job_begin(&a1, &job));
+        assert_eq!(ok(plain.rt.job_changes(&a1, &job)), None);
+        ok(h.rt.job_begin(&a1, &job));
+        ok(h.rt.purge(&a1));
+        assert!(!dir.exists());
+    }
+
+    #[test]
     fn a_symlink_where_a_volume_should_be_is_refused() {
         let h = Host::new();
         let a1 = agent("a1");
@@ -761,6 +900,23 @@ esac"#;
             (file(&old), ok(rt.volume(&old))),
             ("plain".into(), Volume::Subvolume)
         );
+        // A job's change summary: what changed between its two snapshots, none of them kept.
+        let job = JobId::from_random([7; 8]);
+        ok(rt.job_begin(&a1, &job));
+        let _ = std::fs::write(ws.join("file"), "edited");
+        let _ = std::fs::create_dir(ws.join("new dir"));
+        let _ = std::fs::write(ws.join("new dir/f"), "n");
+        let changed = ok(rt.job_changes(&a1, &job));
+        assert_eq!(
+            changed,
+            Some(vec![
+                "file".into(),
+                r"new\ dir".into(),
+                r"new\ dir/f".into()
+            ])
+        );
+        assert_eq!(ok(rt.checkpoints(&a1)).len(), 2, "no job snapshot left");
+        ok(rt.job_begin(&a1, &job));
         for id in [&a1, &b1, &old] {
             ok(rt.purge(id));
             ok(rt.remove_volume("destroy", &rt.workspace(id)));

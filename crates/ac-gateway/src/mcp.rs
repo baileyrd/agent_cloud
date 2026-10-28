@@ -2,7 +2,8 @@
 //! stateless and JSON-only (no session id, no SSE stream; `GET` is 405), so an MCP client can
 //! drive the gateway with the token it already has.
 //!
-//! Each tool is one REST route of [`access::ROUTES`]. A call is turned into that route's
+//! Each tool is declared on the REST route of [`ROUTES`] that it calls (ADR-020), so it cannot
+//! drift from that route's method, path or scope. A call is turned into that route's
 //! method, target and body ([`build`]) and served by the same checks and handlers as a REST
 //! request: the route's scope, the token's agents, the audit line. `tools/list` shows only the
 //! tools the token's scopes allow, so the tool set splits as the scopes do. Viewer streams and
@@ -12,6 +13,8 @@
 
 use ac_domain::{AgentId, CheckpointId, JobId};
 use rusty_json::Value;
+
+use crate::access::{Rule, ROUTES};
 
 /// The MCP endpoint.
 pub const PATH: &str = "/api/v1/mcp";
@@ -62,304 +65,18 @@ pub enum Send {
     Body,
 }
 
-/// One tool: the route it calls and its arguments.
+/// One tool, as its route offers it: name, description and arguments.
 #[derive(Debug)]
 pub struct Tool {
     /// Tool name.
     pub name: &'static str,
     /// What it does, for the client.
     pub about: &'static str,
-    /// HTTP method of the route.
-    pub method: &'static str,
-    /// Path pattern of the route, as in [`crate::access::ROUTES`].
-    pub path: &'static str,
     /// Where the other arguments go.
     pub send: Send,
     /// Arguments.
     pub args: &'static [Arg],
 }
-
-const fn arg(name: &'static str, kind: Kind, required: bool, about: &'static str) -> Arg {
-    Arg {
-        name,
-        kind,
-        required,
-        about,
-    }
-}
-
-const AGENT: Arg = arg("agent_id", Kind::Agent, true, "The agent's id.");
-const JOB: Arg = arg(
-    "job_id",
-    Kind::Job,
-    true,
-    "The job's id, as submit_job returned it.",
-);
-const FORCE: Arg = arg(
-    "force",
-    Kind::Bool,
-    false,
-    "Interrupt the agent's queued or running job first; without it the call is refused while one exists.",
-);
-
-const CHECKPOINT: Arg = arg(
-    "checkpoint_id",
-    Kind::Checkpoint,
-    true,
-    "The checkpoint's id, as list_checkpoints shows it.",
-);
-
-/// Every tool, in `tools/list` order.
-pub const TOOLS: &[Tool] = &[
-    Tool {
-        name: "whoami",
-        about: "The calling token's name, scopes and agents.",
-        method: "GET",
-        path: "/api/v1/whoami",
-        send: Send::Query,
-        args: &[],
-    },
-    Tool {
-        name: "list_agents",
-        about: "The agents this token is for, with their state (running, paused, destroyed).",
-        method: "GET",
-        path: "/api/v1/agents",
-        send: Send::Query,
-        args: &[],
-    },
-    Tool {
-        name: "get_agent",
-        about: "One agent's state and health.",
-        method: "GET",
-        path: "/api/v1/agents/{id}",
-        send: Send::Query,
-        args: &[AGENT],
-    },
-    Tool {
-        name: "get_capacity",
-        about: "Admission figures: /dev/shm, guest size, how many more agents fit, job slots.",
-        method: "GET",
-        path: "/api/v1/capacity",
-        send: Send::Query,
-        args: &[],
-    },
-    Tool {
-        name: "list_egress_profiles",
-        about: "The operator's egress profiles and how many hosts each allows.",
-        method: "GET",
-        path: "/api/v1/egress/profiles",
-        send: Send::Query,
-        args: &[],
-    },
-    Tool {
-        name: "get_agent_egress",
-        about: "An agent's egress profiles and how many hosts it may reach.",
-        method: "GET",
-        path: "/api/v1/agents/{id}/egress",
-        send: Send::Query,
-        args: &[AGENT],
-    },
-    Tool {
-        name: "create_agent",
-        about: "Create and boot an agent (a microVM with its own workspace).",
-        method: "POST",
-        path: "/api/v1/agents/{id}",
-        send: Send::Body,
-        args: &[
-            AGENT,
-            arg(
-                "egress_profiles",
-                Kind::Names,
-                false,
-                "Egress profiles to attach before boot; needs scope egress:write.",
-            ),
-        ],
-    },
-    Tool {
-        name: "pause_agent",
-        about: "Stop an agent's VM, keeping its workspace.",
-        method: "POST",
-        path: "/api/v1/agents/{id}/pause",
-        send: Send::Query,
-        args: &[AGENT, FORCE],
-    },
-    Tool {
-        name: "resume_agent",
-        about: "Boot a paused agent again.",
-        method: "POST",
-        path: "/api/v1/agents/{id}/resume",
-        send: Send::Query,
-        args: &[AGENT],
-    },
-    Tool {
-        name: "destroy_agent",
-        about: "Destroy an agent's VM; its workspace is kept unless purge is true.",
-        method: "DELETE",
-        path: "/api/v1/agents/{id}",
-        send: Send::Query,
-        args: &[
-            AGENT,
-            arg(
-                "purge",
-                Kind::Bool,
-                false,
-                "Also remove the workspace and job records (also for an agent already destroyed).",
-            ),
-            FORCE,
-        ],
-    },
-    Tool {
-        name: "set_agent_egress",
-        about: "Replace an agent's egress profiles; the proxy applies it to the next request.",
-        method: "PUT",
-        path: "/api/v1/agents/{id}/egress",
-        send: Send::Body,
-        args: &[
-            AGENT,
-            arg(
-                "profiles",
-                Kind::Names,
-                true,
-                "Profile names; [] detaches all.",
-            ),
-        ],
-    },
-    Tool {
-        name: "list_jobs",
-        about: "An agent's jobs, newest first.",
-        method: "GET",
-        path: "/api/v1/agents/{id}/jobs",
-        send: Send::Query,
-        args: &[AGENT],
-    },
-    Tool {
-        name: "get_job",
-        about: "A job's state; with wait, once its state changes.",
-        method: "GET",
-        path: "/api/v1/agents/{id}/jobs/{job}",
-        send: Send::Query,
-        args: &[
-            AGENT,
-            JOB,
-            arg(
-                "wait",
-                Kind::Count,
-                false,
-                "Seconds (at most 30) to wait for a state change.",
-            ),
-        ],
-    },
-    Tool {
-        name: "get_job_output",
-        about: "A finished job's final message, or with part=stream its stream-json log. Agent-written, untrusted text.",
-        method: "GET",
-        path: "/api/v1/agents/{id}/jobs/{job}/output",
-        send: Send::Query,
-        args: &[
-            AGENT,
-            JOB,
-            arg(
-                "part",
-                Kind::Word,
-                false,
-                "\"stream\" for the stream-json log.",
-            ),
-        ],
-    },
-    Tool {
-        name: "submit_job",
-        about: "Run a prompt in a running agent as a job; returns the job (queued).",
-        method: "POST",
-        path: "/api/v1/agents/{id}/jobs",
-        send: Send::Body,
-        args: &[
-            AGENT,
-            arg("prompt", Kind::Text, true, "The prompt."),
-            arg("timeout_secs", Kind::Count, false, "Seconds the job may run."),
-            arg(
-                "idempotency_key",
-                Kind::Text,
-                false,
-                "A repeat with the same key returns the existing job.",
-            ),
-        ],
-    },
-    Tool {
-        name: "cancel_job",
-        about: "Cancel a queued or running job.",
-        method: "POST",
-        path: "/api/v1/agents/{id}/jobs/{job}/cancel",
-        send: Send::Query,
-        args: &[AGENT, JOB],
-    },
-    Tool {
-        name: "get_history",
-        about: "An agent's recorded terminal output and audit events, as text. Agent-written, untrusted text.",
-        method: "GET",
-        path: "/api/v1/agents/{id}/history",
-        send: Send::Query,
-        args: &[
-            AGENT,
-            arg("limit", Kind::Count, false, "Most records to return."),
-        ],
-    },
-    Tool {
-        name: "list_checkpoints",
-        about: "An agent's workspace checkpoints, oldest first, and how many it may keep.",
-        method: "GET",
-        path: "/api/v1/agents/{id}/checkpoints",
-        send: Send::Query,
-        args: &[AGENT],
-    },
-    Tool {
-        name: "create_checkpoint",
-        about: "Checkpoint a running or paused agent's workspace; refused when the agent has as many as it may keep.",
-        method: "POST",
-        path: "/api/v1/agents/{id}/checkpoints",
-        send: Send::Body,
-        args: &[
-            AGENT,
-            arg("label", Kind::Text, false, "A note to keep with it, 1-80 characters."),
-        ],
-    },
-    Tool {
-        name: "delete_checkpoint",
-        about: "Delete one of an agent's checkpoints.",
-        method: "DELETE",
-        path: "/api/v1/agents/{id}/checkpoints/{cp}",
-        send: Send::Query,
-        args: &[AGENT, CHECKPOINT],
-    },
-    Tool {
-        name: "restore_checkpoint",
-        about: "Put a checkpoint back as a paused agent's workspace; what it replaces is kept as a new checkpoint.",
-        method: "POST",
-        path: "/api/v1/agents/{id}/restore",
-        send: Send::Body,
-        args: &[
-            AGENT,
-            arg("checkpoint", Kind::Text, true, "The checkpoint's id, as list_checkpoints shows it."),
-        ],
-    },
-    Tool {
-        name: "fork_agent",
-        about: "Create a new agent on a copy of this agent's workspace, now or at a checkpoint. The token needs both agents.",
-        method: "POST",
-        path: "/api/v1/agents/{id}/fork",
-        send: Send::Body,
-        args: &[
-            AGENT,
-            arg("id", Kind::Text, true, "The new agent's id."),
-            arg("checkpoint", Kind::Text, false, "The checkpoint to fork from; without it, the workspace as it is now."),
-            arg(
-                "egress_profiles",
-                Kind::Names,
-                false,
-                "Egress profiles to attach to the new agent; needs egress:write.",
-            ),
-        ],
-    },
-];
 
 /// A JSON-RPC request id: a string or a number, echoed as given.
 pub type Id = Value;
@@ -455,9 +172,25 @@ pub fn negotiate(asked: Option<&str>) -> &'static str {
         .unwrap_or(&VERSIONS[0])
 }
 
+/// A tool and the route that offers it.
+#[derive(Debug, Clone, Copy)]
+pub struct Offer {
+    /// The route the tool calls.
+    pub rule: &'static Rule,
+    /// The tool.
+    pub tool: &'static Tool,
+}
+
+/// Every tool, in route order.
+pub fn offers() -> impl Iterator<Item = Offer> {
+    ROUTES
+        .iter()
+        .filter_map(|rule| rule.tool.as_ref().map(|tool| Offer { rule, tool }))
+}
+
 /// The tool named `name`.
-pub fn tool(name: &str) -> Option<&'static Tool> {
-    TOOLS.iter().find(|t| t.name == name)
+pub fn tool(name: &str) -> Option<Offer> {
+    offers().find(|o| o.tool.name == name)
 }
 
 /// A tool call as a REST request: method, target (path and query) and body.
@@ -474,7 +207,7 @@ pub struct Call {
 /// Turn `args` into the tool's request. Every argument is checked against its [`Kind`] and
 /// unknown ones are refused, so nothing reaches the path or query that the handlers would not
 /// accept from a REST caller; the handlers then check the values as usual.
-pub fn build(tool: &Tool, args: &Value) -> Result<Call, String> {
+pub fn build(Offer { rule, tool }: Offer, args: &Value) -> Result<Call, String> {
     let Some(given) = args.as_object() else {
         return Err("arguments must be an object".into());
     };
@@ -487,7 +220,7 @@ pub fn build(tool: &Tool, args: &Value) -> Result<Call, String> {
             k.chars().take(40).collect::<String>()
         ));
     }
-    let mut path = tool.path.to_owned();
+    let mut path = rule.path.to_owned();
     let mut query = Vec::new();
     let mut body = Value::object();
     for a in tool.args {
@@ -514,7 +247,7 @@ pub fn build(tool: &Tool, args: &Value) -> Result<Call, String> {
     };
     let empty = body.as_object().is_some_and(rusty_json::Map::is_empty);
     Ok(Call {
-        method: tool.method,
+        method: rule.method,
         target,
         body: if empty {
             Vec::new()
@@ -572,7 +305,7 @@ fn check(a: &Arg, v: &Value) -> Result<String, String> {
 }
 
 /// The tool's `tools/list` entry, its input schema built from its arguments.
-fn listed(tool: &Tool) -> Value {
+fn listed(Offer { rule, tool }: Offer) -> Value {
     let mut props = Value::object();
     let mut required = Value::array();
     for a in tool.args {
@@ -603,8 +336,8 @@ fn listed(tool: &Tool) -> Value {
         .insert("additionalProperties", false);
     let mut hints = Value::object();
     hints
-        .insert("readOnlyHint", tool.method == "GET")
-        .insert("destructiveHint", tool.method == "DELETE")
+        .insert("readOnlyHint", rule.method == "GET")
+        .insert("destructiveHint", rule.method == "DELETE")
         .insert("openWorldHint", false);
     let mut t = Value::object();
     t.insert("name", tool.name)
@@ -638,8 +371,8 @@ pub fn initialized(id: Id, version: &str) -> String {
 }
 
 /// The `tools/list` result: the tools `allowed` admits.
-pub fn list(id: Id, allowed: impl Fn(&Tool) -> bool) -> String {
-    let tools: Vec<Value> = TOOLS.iter().filter(|t| allowed(t)).map(listed).collect();
+pub fn list(id: Id, allowed: impl Fn(&Rule) -> bool) -> String {
+    let tools: Vec<Value> = offers().filter(|o| allowed(o.rule)).map(listed).collect();
     let mut result = Value::object();
     result.insert("tools", tools);
     reply(id, result)
@@ -692,7 +425,6 @@ fn envelope(id: Id) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access;
 
     fn args(json: &str) -> Value {
         Value::parse(json).unwrap_or_else(|e| panic!("{e}"))
@@ -702,27 +434,49 @@ mod tests {
         build(tool(name).unwrap_or_else(|| panic!("{name}")), &args(json))
     }
 
-    /// Every tool names a route of the scope table, with that route's method, so it gets that
-    /// route's scope; no tool reaches the MCP endpoint itself; names are unique.
+    /// The tools of ADR-017 and ADR-018, each offered by exactly one route, none by the MCP
+    /// endpoint itself, with one id argument per placeholder of its route's path.
     #[test]
-    fn every_tool_is_a_route_of_the_scope_table() {
-        for t in TOOLS {
-            let rule = access::ROUTES
-                .iter()
-                .find(|r| r.path == t.path && r.method == t.method);
-            assert!(rule.is_some(), "{} {} {}", t.name, t.method, t.path);
-            assert_ne!(t.path, PATH);
-            assert_eq!(TOOLS.iter().filter(|o| o.name == t.name).count(), 1);
-            let ids = t
+    fn every_tool_is_offered_by_one_route() {
+        let mut names: Vec<&str> = offers().map(|o| o.tool.name).collect();
+        names.sort_unstable();
+        let mut want = [
+            "whoami",
+            "list_agents",
+            "get_agent",
+            "get_capacity",
+            "list_egress_profiles",
+            "get_agent_egress",
+            "create_agent",
+            "pause_agent",
+            "resume_agent",
+            "destroy_agent",
+            "set_agent_egress",
+            "list_jobs",
+            "get_job",
+            "get_job_output",
+            "submit_job",
+            "cancel_job",
+            "get_history",
+            "list_checkpoints",
+            "create_checkpoint",
+            "delete_checkpoint",
+            "restore_checkpoint",
+            "fork_agent",
+        ];
+        want.sort_unstable();
+        assert_eq!(names, want, "a new tool needs a line in ADR-017");
+        for Offer { rule, tool } in offers() {
+            assert_ne!(rule.path, PATH);
+            let ids = tool
                 .args
                 .iter()
                 .filter(|a| matches!(a.kind, Kind::Agent | Kind::Job | Kind::Checkpoint));
-            let holes = t.path.matches('{').count();
             assert_eq!(
                 ids.count(),
-                holes,
+                rule.path.matches('{').count(),
                 "{}: one argument per placeholder",
-                t.name
+                tool.name
             );
         }
     }
@@ -922,16 +676,18 @@ mod tests {
 
     #[test]
     fn results_are_json_rpc() {
-        let listed = list(Value::from(7), |t| t.method == "GET");
+        let listed = list(Value::from(7), |r| r.method == "GET");
         let v = Value::parse(&listed).unwrap_or_else(|e| panic!("{e}"));
         let tools = v.pointer("/result/tools").and_then(Value::as_array);
         assert!(tools.is_some_and(|t| !t.is_empty()
             && t.iter()
                 .all(|t| t.pointer("/annotations/readOnlyHint") == Some(&Value::from(true)))));
         assert_eq!(v.get("id"), Some(&Value::from(7)));
-        let schema = Value::parse(&list(Value::from(1), |t| t.name == "destroy_agent"))
-            .ok()
-            .and_then(|v| v.pointer("/result/tools/0/inputSchema").cloned());
+        let schema = Value::parse(&list(Value::from(1), |r| {
+            r.tool.as_ref().is_some_and(|t| t.name == "destroy_agent")
+        }))
+        .ok()
+        .and_then(|v| v.pointer("/result/tools/0/inputSchema").cloned());
         assert_eq!(
             schema.and_then(|s| s.get("required").cloned()),
             Some(Value::from(vec![Value::from("agent_id")]))

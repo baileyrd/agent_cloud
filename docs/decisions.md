@@ -713,13 +713,12 @@ Origin check.
 - *Stateless, JSON only:* no `Mcp-Session-Id`, no SSE (`GET` is 405), single messages (batches are refused).
   Versions `2025-11-25`, `2025-06-18`, `2025-03-26`: `initialize` echoes the client's when served, else the
   newest; an unserved `MCP-Protocol-Version` header is 400. Notifications get 202.
-- *One tool per REST route* (`mcp::TOOLS`): `whoami`; `list_agents`, `get_agent`, `get_capacity`,
+- *One tool per REST route* (declared on the route in `access::ROUTES` since ADR-020): `whoami`; `list_agents`, `get_agent`, `get_capacity`,
   `list_egress_profiles`, `get_agent_egress` (`agents:read`); `create_agent`, `pause_agent`, `resume_agent`,
   `destroy_agent` (`agents:write`); `set_agent_egress` (`egress:write`); `list_jobs`, `get_job`,
   `get_job_output` (`jobs:read`); `submit_job`, `cancel_job` (`jobs:write`); `get_history` (`viewer:read`);
   `list_checkpoints` (`agents:read`); `create_checkpoint`, `delete_checkpoint`, `restore_checkpoint`,
-  `fork_agent` (`agents:write`, ADR-018). A tool names a method and a path of `access::ROUTES` and takes its
-  scope from there; a test checks every tool against the table.
+  `fork_agent` (`agents:write`, ADR-018). A tool takes its method, path and scope from the route that offers it.
 - *Same path as REST:* a call becomes that route's method, target and body, then goes through `access::check`
   (agents first, then scope), the handler and the audit line, exactly as an HTTP request. Arguments are checked
   by kind first (ids parsed as `AgentId`/`JobId`, query values only booleans, counts or lowercase words, unknown
@@ -845,5 +844,27 @@ without trusting the agent.
   A job interrupted by pause or destroy is diffed under the lifecycle lock, before the VM stops.
 - A change undone within the job (a file written then removed) can still be listed; a `touch` is not.
 
-**Not now:** a structured route for the summary (it waits for the shared operation catalog behind `ac-ctl` and
-MCP); keeping the start snapshot as a restorable checkpoint (ADR-018's "checkpoints before each job").
+**Not now:** a structured route for the summary (it would be one more `access::ROUTES` entry, ADR-020); keeping the start snapshot as a restorable checkpoint (ADR-018's "checkpoints before each job").
+
+## ADR-020: One operation catalog for REST and MCP; `ac-ctl` stays local
+**Status:** accepted (2026-10-28).
+**Context:** The Ephemeral Sandbox comparison (2026-10-27) suggested generating the CLI and the MCP tools from one
+declaration, once there were two real consumers. There are now two tables that describe the same operations:
+`access::ROUTES` (method, path, scope, audit name) and `mcp::TOOLS` (name, description, method, path, arguments),
+kept in step by a test. `ac-ctl` is not a third copy of them: it drives `Fleet` directly on the data directory and
+refuses while the gateway holds it (exit 3), so it works with the gateway stopped (`reconcile` after a reboot,
+`workspace migrate`, recovery), needs no token, and has commands with no route (`reconcile`, `migrate`, `doctor`,
+`tune`). Of the gateway's 22 tools, 10 have an `ac-ctl` twin; jobs, egress, history, capacity and whoami do not.
+**Decision:**
+- *One table for the gateway.* A route of `access::ROUTES` carries its MCP tool, if it has one (name, description,
+  where arguments go, the arguments). `mcp::TOOLS` goes; `tools/list`, `tools/call` and the scope a tool gets all
+  read the route. Method and path are written once, so a tool cannot drift from its route; the cross-check
+  test becomes a pinned list of tool names plus one id argument per path placeholder. On the wire only the
+  `tools/list` order changes (it now follows the route table); names, descriptions and schemas are the same.
+- *`ac-ctl` keeps its own parser.* Generating its commands from the route table would mean turning it into a
+  REST client (a token on the host, an HTTP client, and no way to work with the gateway stopped) or giving the
+  table a second, local dispatch path. Neither has a forcing function yet.
+**Revisit when:** `ac-ctl` needs to act while the gateway runs (then it becomes a client of the same table, and
+its fleet commands are generated from it), or a third front end (a web UI form, another protocol) appears.
+**Consequences:** one place to add an operation to REST and MCP, a little less code; `ac-ctl` and the tools
+can still differ in naming (`create` vs `create_agent`) and in what they offer.

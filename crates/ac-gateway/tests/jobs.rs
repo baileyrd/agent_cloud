@@ -906,7 +906,7 @@ fn scoped(root: &Path) -> Scoped {
     let make = |name: &str, scopes: &str, agents: &str| {
         let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
         let agents = Agents::parse(agents).unwrap_or_else(|e| panic!("{e}"));
-        file.create(name, scopes, agents, 1)
+        file.create(name, scopes, agents, 1, None)
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let jobs_a1 = make("jobs-a1", "jobs:read,jobs:write", "a1");
@@ -995,7 +995,7 @@ fn scoped_tokens_over_http() {
         (code, body.as_str()),
         (
             200,
-            r#"{"name":"jobs-a1","scopes":["jobs:read","jobs:write"],"agents":["a1"]}"#
+            r#"{"name":"jobs-a1","scopes":["jobs:read","jobs:write"],"agents":["a1"],"expires":null}"#
         )
     );
     assert!(!body.contains(&t.jobs_a1));
@@ -1021,7 +1021,7 @@ fn scoped_tokens_over_http() {
     let (_, _, body) = request_as(addr, &t.viewer, "GET", "/api/v1/whoami", "");
     assert_eq!(
         body,
-        r#"{"name":"watch","scopes":["viewer:read"],"agents":"*"}"#
+        r#"{"name":"watch","scopes":["viewer:read"],"agents":"*","expires":null}"#
     );
 
     // The list shows a restricted token only its agents.
@@ -1058,6 +1058,39 @@ fn scoped_tokens_over_http() {
     reload(&t.file, &t.keys);
     assert_eq!(status(&t.jobs_a1, "GET", &format!("{base}/jobs")), 401);
     assert_eq!(status(&t.viewer, "GET", &format!("{base}/history")), 200);
+}
+
+#[test]
+fn expired_tokens_are_refused_and_live_ones_say_when() {
+    let r = rig();
+    let t = scoped(&r.root);
+    let read = Scopes::parse("agents:read").unwrap_or_else(|e| panic!("{e}"));
+    let now = tokens::unix_now();
+    let make = |name: &str, created: u64| {
+        t.file
+            .create(name, read, Agents::All, created, Some(3_600))
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let live = make("live", now);
+    let old = make("old", now - 7_200);
+    reload(&t.file, &t.keys);
+    let addr = serve_with(&r, t.keys.clone());
+
+    let (code, _, body) = request_as(addr, &live, "GET", "/api/v1/whoami", "");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.ends_with(&format!(r#""expires":{}}}"#, now + 3_600)),
+        "{body}"
+    );
+    assert_eq!(request_as(addr, &live, "GET", "/api/v1/agents", "").0, 200);
+    for path in ["/api/v1/agents", "/api/v1/whoami", "/api/v1/agents/a1"] {
+        assert_eq!(request_as(addr, &old, "GET", path, "").0, 401, "{path}");
+    }
+    // Still in the file, so `token list` shows it, until revoked.
+    assert!(t
+        .file
+        .list()
+        .is_ok_and(|l| l.iter().any(|k| k.name == "old")));
 }
 
 #[test]

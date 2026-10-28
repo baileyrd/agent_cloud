@@ -365,10 +365,11 @@ the change up within a second (or at once with `sudo systemctl reload ac-gateway
 ```bash
 sudo ac-gateway token create ci-a1 --scopes jobs:read,jobs:write --agents a1   # prints the token once
 sudo ac-gateway token create watcher --scopes viewer:read                       # every agent (--agents '*')
-sudo ac-gateway token list          # NAME SCOPES AGENTS CREATED; never digests or tokens
+sudo ac-gateway token create ci-tmp --scopes jobs:read --expires 30d            # refused (401) after 30 days
+sudo ac-gateway token list          # NAME SCOPES AGENTS CREATED EXPIRES; never digests or tokens
 sudo ac-gateway token revoke ci-a1
 curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/whoami
-# {"name":"owner","scopes":["admin"],"agents":"*"}
+# {"name":"owner","scopes":["admin"],"agents":"*","expires":null}
 ```
 
 A token gets 403 for a route outside its scopes and 404 for an agent outside its list (so it cannot tell which

@@ -328,7 +328,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
 **Consequences:** a stolen jobs token runs prompts in its agents (which is code execution as the agent user in
 those VMs) but cannot pause, destroy, watch or type into them, nor see other agents. `admin` remains as
 powerful as the old token. Tokens do not expire; revoke them. There is still no TLS of the gateway's own.
-**Not now:** expiry and per-token rate limits; per-address failure limits (needs the peer address from
+**Not now:** expiry (since done: ADR-022) and per-token rate limits; per-address failure limits (needs the peer address from
 rusty_serve); scopes narrower than these.
 
 ## ADR-012: Admission against /dev/shm; a watchdog that tells slow from wedged
@@ -937,3 +937,24 @@ including a receive that fails half way.
 registry needs the gateway's cooperation, and agents and tokens can be recreated); checkpoints in backups; a
 gateway route or MCP tool; destinations that are not btrfs (stream files, or a remote over SSH with
 `btrfs receive` there); encryption at the destination (use an encrypted filesystem).
+
+## ADR-022: Token expiry, opt-in per token
+**Status:** proposed (2026-10-28; unit and HTTP tests, not yet on BaileyServ).
+**Context:** ADR-011 tokens last until revoked. A token handed to CI, a script or a short task outlives the need
+for it when nobody remembers to revoke it, and a leaked one works forever.
+**Decision:**
+- *Format:* an optional sixth field, `expires` (Unix seconds), after `created`:
+  `name scopes agents sha256 [created [expires]]`. It must be after `created`; old files parse unchanged.
+- *Opt-in:* `ac-gateway token create ... --expires <n>m|h|d` (at most 3650 days) writes `created + lifetime`.
+  Without it, a token still lasts until revoked: no default, so existing tokens, the legacy token and the
+  scripts that create their own keep working.
+- *Enforced per request:* from `expires` on, the token is refused like an unknown one (401, the failure limit,
+  one log line naming the token as expired), whatever the reload state. A viewer stream ends at its next
+  message or keep-alive after expiry, as it does on revoke.
+- *Kept in the file:* an expired token is not removed; `token list` shows it as `(expired)`, and `revoke` removes
+  it. The gateway never writes the tokens file, so it stays the only writer's (the CLI's) file.
+- *Visible to the caller:* `whoami` (REST and MCP) adds `"expires"`: Unix seconds or `null`.
+**Consequences:** a lifetime cannot be extended: create a new token and revoke the old one (rotation, the same
+step as today). Expiry trusts the host clock; a clock set back revives an expired token until it passes again.
+**Not now:** a default or maximum lifetime for every token (would break unattended callers made before it);
+`expires` on the legacy token (deprecated; drop it instead); a warning before expiry.

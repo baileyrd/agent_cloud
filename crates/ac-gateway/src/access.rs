@@ -104,7 +104,7 @@ const A: &str = "/api/v1/agents/{id}";
 pub const ROUTES: &[Rule] = &[
     offer(rule("GET", "/api/v1/whoami", Need::Token, None), Tool {
         name: "whoami",
-        about: "The calling token's name, scopes and agents.",
+        about: "The calling token's name, scopes, agents and expiry (Unix seconds, or null).",
         send: Send::Query,
         args: &[],
     }),

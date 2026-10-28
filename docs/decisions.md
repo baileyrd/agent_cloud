@@ -808,3 +808,26 @@ against a stand-in `btrfs`, including crash recovery of a half-done swap.
 **Not now:** checkpoints before each job (an opt-in on the job body, with its own rotating cap); sizes in the
 list (`btrfs filesystem du` is slow on a rotational disk); an XFS reflink backend (no host needs one); memory
 snapshots (the roadmap's separate item).
+
+## ADR-019: One operation catalog for REST and MCP; `ac-ctl` stays local
+**Status:** proposed (2026-10-28).
+**Context:** The Ephemeral Sandbox comparison (2026-10-27) suggested generating the CLI and the MCP tools from one
+declaration, once there were two real consumers. There are now two tables that describe the same operations:
+`access::ROUTES` (method, path, scope, audit name) and `mcp::TOOLS` (name, description, method, path, arguments),
+kept in step by a test. `ac-ctl` is not a third copy of them: it drives `Fleet` directly on the data directory and
+refuses while the gateway holds it (exit 3), so it works with the gateway stopped (`reconcile` after a reboot,
+`workspace migrate`, recovery), needs no token, and has commands with no route (`reconcile`, `migrate`, `doctor`,
+`tune`). Of the gateway's 22 tools, 10 have an `ac-ctl` twin; jobs, egress, history, capacity and whoami do not.
+**Decision (proposed):**
+- *One table for the gateway.* A route of `access::ROUTES` carries its MCP tool, if it has one (name, description,
+  where arguments go, the arguments). `mcp::TOOLS` goes; `tools/list`, `tools/call` and the scope a tool gets all
+  read the route. Method and path are written once, so a tool cannot drift from its route and the cross-check
+  test becomes a test of argument placeholders only. Behaviour on the wire does not change: same tool names,
+  order, descriptions and schemas.
+- *`ac-ctl` keeps its own parser.* Generating its commands from the route table would mean turning it into a
+  REST client (a token on the host, an HTTP client, and no way to work with the gateway stopped) or giving the
+  table a second, local dispatch path. Neither has a forcing function yet.
+**Revisit when:** `ac-ctl` needs to act while the gateway runs (then it becomes a client of the same table, and
+its fleet commands are generated from it), or a third front end (a web UI form, another protocol) appears.
+**Consequences:** one place to add an operation to REST and MCP; about 100 fewer lines; `ac-ctl` and the tools
+can still differ in naming (`create` vs `create_agent`) and in what they offer.

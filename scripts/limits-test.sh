@@ -27,12 +27,17 @@ trap cleanup EXIT
 gx() { ctr -n "$NS" task exec --exec-id "lim-$1-$$" "$AGENT" sh -c "$2" < "$HOLD" 2>&1; }
 
 echo "== cgroup $CG"
-if [ ! -s "$CG/cgroup.procs" ]; then
+# cgroupfs files report size 0, so test the content, not `-s`.
+if ! grep -q . "$CG/cgroup.procs" 2>/dev/null; then
     bad "no processes in $CG: $AGENT's VM is not running (resume it through the gateway, which applies the limits)"
     ctr -n "$NS" task ls 2>&1 | awk -v a="$AGENT" 'NR == 1 || $1 == a'
     exit 1
 fi
 ok "holds $(wc -l < "$CG/cgroup.procs") process(es)"
+if [ "$(cut -d' ' -f1 "$CG/cpu.max")" = max ] && [ ! -e "$CG/memory.max" ]; then
+    echo "note: no cpu or memory limit on this sandbox: it booted before the limits were set, or under"
+    echo "      a gateway without them; set AC_AGENT_* in $ENVFILE, restart the gateway, pause and resume"
+fi
 for f in cpu.max memory.max memory.current memory.peak; do
     printf '%-15s %s\n' "$f" "$(cat "$CG/$f" 2>&1)"
 done

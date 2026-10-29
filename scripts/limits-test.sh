@@ -22,7 +22,11 @@ bad() { echo "FAIL: $*"; fail=1; }
 HOLD=$(mktemp -u /tmp/ac-limits-stdin.XXXXXX) && mkfifo -m 600 "$HOLD"
 sleep 100000 > "$HOLD" &
 HOLDER=$!
-cleanup() { kill "$HOLDER" 2>/dev/null || true; rm -f "$HOLD"; }
+restore=  # the workspace limit to put back once the disk test has set its trial one
+cleanup() {
+    kill "$HOLDER" 2>/dev/null || true; rm -f "$HOLD"
+    [ -z "$restore" ] || btrfs qgroup limit "$restore" "$WS" || echo "FAIL: could not put the limit back to $restore"
+}
 trap cleanup EXIT
 gx() { ctr -n "$NS" task exec --exec-id "lim-$1-$$" "$AGENT" sh -c "$2" < "$HOLD" 2>&1; }
 
@@ -68,14 +72,14 @@ btrfs qgroup show -re --mbytes -f "$WS"
 configured=$(sed -n 's/^AC_AGENT_DISK_GIB=//p' "$ENVFILE" 2>/dev/null | tail -1)
 used=$(btrfs qgroup show -re --raw -f "$WS" | awk 'NR > 2 { print $2 }')
 trial=$((used + 256 * 1024 * 1024))
+restore=none; [ -z "$configured" ] || restore=${configured}G
 btrfs qgroup limit "$trial" "$WS"
 out=$(gx disk 'dd if=/dev/urandom of=/workspace/.ac-limit-test bs=1M count=512 conv=fsync 2>&1; echo rc=$?')
 gx rm 'rm -f /workspace/.ac-limit-test' > /dev/null || true
-btrfs qgroup limit "${configured:+${configured}G}${configured:-none}" "$WS"
 echo "$out" | tail -3
 case $out in
     *"quota exceeded"*|*"Disk quota"*) ok "a write past the quota was refused" ;;
     *) bad "512 MiB went past a limit 256 MiB above use" ;;
 esac
-echo "limit back to: ${configured:+${configured} GiB}${configured:-none}"
+echo "limit back to: $restore (on exit)"
 exit "$fail"

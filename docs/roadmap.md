@@ -49,10 +49,10 @@
   simple quota on its workspace, applied on every boot (ADR-023; verified on BaileyServ 2026-10-29 with
   `scripts/limits-test.sh`: held at 2.00 cores under load, a write past the quota refused)
 - [ ] Backups with a tested restore: workspaces as incremental `btrfs send` stream files in any directory (a share
-  on another machine), daily by `ac-backup.timer`, with `ac-ctl restore-backup` replaying a chain (ADR-021; tested
-  on loopback filesystems 2026-10-28). To do: verify on BaileyServ against a share on Beast (a full and an
-  incremental backup of a live agent, and a restore read back inside its VM); back up the registry, tokens and
-  egress agents file too
+  on another machine), daily by `ac-backup.timer`, with `ac-ctl restore-backup` replaying a chain (ADR-021; verified
+  on BaileyServ 2026-10-29 against an SMB share on Beast: full and incremental backups of a1 and a2, a restore of
+  a2). To do: boot a restored workspace and read it back inside the VM; back up the registry, tokens and egress
+  agents file too
 - [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
   (BaileyServ, 2026-10-22)
 - [x] The watchdog tells slow from wedged: it acts only on sustained failures on an idle host, through a logged

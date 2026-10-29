@@ -872,8 +872,9 @@ its fleet commands are generated from it), or a third front end (a web UI form, 
 can still differ in naming (`create` vs `create_agent`) and in what they offer.
 
 ## ADR-021: Workspace backups as btrfs send streams in files
-**Status:** proposed (2026-10-28; tested on loopback filesystems by `scripts/btrfs-backup-test.sh`, not yet on
-BaileyServ). Amended the same day, before any host ran it: the first version received each backup into a btrfs
+**Status:** accepted (2026-10-29; verified on BaileyServ against an encrypted SMB share on Beast: full and
+incremental backups of a1 (running) and a2, and a restore of a2 with the replaced workspace kept as a checkpoint;
+booting the restored workspace not yet checked; also tested on loopback filesystems by `scripts/btrfs-backup-test.sh`). Amended the same day, before any host ran it: the first version received each backup into a btrfs
 filesystem on a second disk (#15). BaileyServ has no second disk, so backups are now stream files in any
 directory, such as a share on another machine (Beast).
 **Context:** checkpoints (ADR-018) undo an agent's mistakes, but they sit on the same disk as the workspace: a

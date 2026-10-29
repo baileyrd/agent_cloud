@@ -29,6 +29,11 @@
 //! `AC_BTRFS` (the btrfs binary, default `btrfs`). Checkpoints live under `$AC_DATA/checkpoints`;
 //! at startup the gateway logs whether the workspace root is on btrfs and which workspaces are
 //! still plain directories.
+//! Per-agent limits (ADR-023; unset or empty is unlimited): `AC_AGENT_CPUS` (cores, such as 2 or
+//! 1.5: `cpu.max`), `AC_AGENT_MEMORY_MIB` (host memory, guest RAM included: `memory.max`; at least
+//! the guest plus 128 MiB, else the gateway refuses to start), `AC_AGENT_DISK_GIB` (a btrfs quota on
+//! the workspace subvolume). Applied on every create and resume; a boot whose limits cannot be
+//! applied is undone.
 //! Admission (ADR-012): `AC_SHM_MARGIN_MIB` (MiB of `/dev/shm` kept free, default 512),
 //! `AC_VM_MEMORY_MIB` (guest size, instead of `default_memory` in `AC_KATA_CONFIG`, default
 //! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
@@ -68,7 +73,7 @@ use ac_domain::health::Thresholds;
 use ac_domain::schedule::Limits;
 use ac_domain::tune::rules::drift;
 use ac_domain::tune::{recommend, Fact, Profile};
-use ac_domain::{GuestMemory, State};
+use ac_domain::{AgentLimits, GuestMemory, State};
 use ac_fleet::Fleet;
 use ac_gateway::egress::EgressStore;
 use ac_gateway::jobs::{self, Jobs};
@@ -181,6 +186,15 @@ fn host_capacity() -> Result<HostCapacity, String> {
     };
     eprintln!("ac-gateway: admission: guests count {mib} MiB each ({source})");
     Ok(host)
+}
+
+/// The limits every boot applies (ADR-023), from `AC_AGENT_*`, checked against the guest size.
+fn agent_limits(capacity: &HostCapacity) -> Result<AgentLimits, String> {
+    let limits = AgentLimits::from_lookup(|k| std::env::var(k).ok())?;
+    let (guest, _) = capacity.guest().map_err(|e| e.to_string())?;
+    limits.check(guest)?;
+    eprintln!("ac-gateway: per-agent limits: {limits}");
+    Ok(limits)
 }
 
 fn read_token(path: &str) -> Result<String, String> {
@@ -390,6 +404,7 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
+    let capacity = host_capacity()?;
     let cfg = CtrConfig {
         ctr_bin: env("AC_CTR", "ctr"),
         namespace: env("AC_NAMESPACE", "agents"),
@@ -405,6 +420,8 @@ fn run() -> Result<(), String> {
         task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
         command_timeout: Some(std::time::Duration::from_secs(120)),
         trace: std::env::var_os("AC_TRACE").is_some(),
+        limits: agent_limits(&capacity)?,
+        cgroup_root: "/sys/fs/cgroup".into(),
     };
     let interval: u64 = env("AC_PROBE_INTERVAL", "30")
         .parse()
@@ -430,7 +447,7 @@ fn run() -> Result<(), String> {
     let snapshots = CtrRuntime::new(LinuxSpawner, cfg.clone());
     log_volumes(&snapshots);
     let mut fleet = Fleet::new(runtime, Arc::clone(&store))
-        .with_admission(Box::new(host_capacity()?), margin)
+        .with_admission(Box::new(capacity), margin)
         .with_snapshots(Arc::new(snapshots), checkpoint_max()?);
     let egress = match networked {
         true => Some(Arc::new(egress_store()?)),

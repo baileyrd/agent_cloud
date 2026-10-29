@@ -10,6 +10,7 @@ pub mod health;
 pub mod id;
 pub mod job;
 pub mod lifecycle;
+pub mod limits;
 pub mod schedule;
 pub mod tune;
 
@@ -21,3 +22,4 @@ pub use egress::{Attachment, ProfileName};
 pub use id::{AgentId, IdError};
 pub use job::{Job, JobEvent, JobId, JobInputError, JobState, JobTransitionError};
 pub use lifecycle::{Command, State, TransitionError};
+pub use limits::{AgentLimits, Cpus};

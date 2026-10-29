@@ -20,6 +20,7 @@ calls the agents themselves make.
 - A single authenticated WebSocket for watching and taking over the desktop.
 - Persistent workspace volumes with checkpoints, restore and forks on btrfs, an embedded agent registry and append-only per-agent event history (no database server). Workspaces are backed up incrementally as `btrfs send` stream files to any directory, such as a share on another machine (`ac-ctl backup`, ADR-021).
 - Allowlisted egress: agents reach model APIs and Git hosts only, through `ac-egress` (ADR-007).
+- Per-agent CPU, memory and disk limits on the whole sandbox and its workspace (ADR-023).
 
 ## What this is not
 

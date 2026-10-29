@@ -6,8 +6,9 @@
 //! runs): use the gateway's API instead, or stop it. `reconcile` prints one `<id> paused` line
 //! per agent it changed. `create` and `resume` are refused when the guest would not fit `/dev/shm`
 //! (ADR-012; the gateway's `AC_SHM_MARGIN_MIB`, `AC_VM_MEMORY_MIB`, `AC_KATA_CONFIG` and
-//! `AC_SHM_LIMIT_MIB` apply here too). `doctor`: 0 all ok, 1 warnings, 4 errors found (2: bad
-//! usage, or it could not run). `tune`: 0 shown or applied, 1 refused or failed.
+//! `AC_SHM_LIMIT_MIB` apply here too, and so do the per-agent limits `AC_AGENT_CPUS`,
+//! `AC_AGENT_MEMORY_MIB` and `AC_AGENT_DISK_GIB`, ADR-023). `doctor`: 0 all ok, 1 warnings, 4
+//! errors found (2: bad usage, or it could not run). `tune`: 0 shown or applied, 1 refused or failed.
 
 mod args;
 mod backup;
@@ -26,6 +27,7 @@ use ac_ctr::facts::{collect, kata_sandboxes, HostRead, LinuxHost, Paths, Scope};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_domain::tune::edit::stamp;
 use ac_domain::tune::{recommend, HostFacts};
+use ac_domain::AgentLimits;
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::PortError;
 use ac_store::EngineStore;
@@ -75,6 +77,16 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let capacity = HostCapacity::new(CapacityConfig {
+        shm: "/dev/shm".into(),
+        kata_config: std::env::var("AC_KATA_CONFIG")
+            .unwrap_or_else(|_| "/etc/kata-containers/configuration.toml".to_owned())
+            .into(),
+        guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
+        shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
+    });
+    let limits = AgentLimits::from_lookup(|k| std::env::var(k).ok())?;
+    limits.check(capacity.guest()?.0)?;
     let cfg = CtrConfig {
         ctr_bin: cli.ctr.clone(),
         namespace: cli.namespace.clone(),
@@ -90,15 +102,9 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         task_root: "/run/containerd/io.containerd.runtime.v2.task".into(),
         command_timeout: Some(std::time::Duration::from_secs(120)),
         trace: std::env::var_os("AC_TRACE").is_some(),
+        limits,
+        cgroup_root: "/sys/fs/cgroup".into(),
     };
-    let capacity = HostCapacity::new(CapacityConfig {
-        shm: "/dev/shm".into(),
-        kata_config: std::env::var("AC_KATA_CONFIG")
-            .unwrap_or_else(|_| "/etc/kata-containers/configuration.toml".to_owned())
-            .into(),
-        guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
-        shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
-    });
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let max = checkpoint_max()?;
     let snapshots = std::sync::Arc::new(CtrRuntime::new(LinuxSpawner, cfg.clone()));

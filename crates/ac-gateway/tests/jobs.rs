@@ -1147,6 +1147,8 @@ fn ctr(
         task_root: root.join("task"),
         command_timeout: None,
         trace: false,
+        limits: Default::default(),
+        cgroup_root: "/sys/fs/cgroup".into(),
     };
     let _ = std::fs::create_dir_all(root.join("workspaces/a1"));
     (CtrRuntime::new(spawner, cfg), log)

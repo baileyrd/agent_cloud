@@ -526,6 +526,21 @@ on BaileyServ (2026-10-28): with a job in a1 writing a line and a 4 KiB file eac
 and the job kept writing; a fork from it booted in 4.8 s and read back 25 lines and 25 whole files inside its VM;
 restore (0.7 s) and the restore of what it kept both read back correctly inside a1 after resume.
 
+**Per-agent limits** (ADR-023): set in `gateway.env`, then restart the gateway. Each create and resume applies
+them; a running agent gets them at its next resume.
+
+| Setting | Limits | Applied as |
+|---|---|---|
+| `AC_AGENT_CPUS` | cores for the whole sandbox (QEMU, virtiofsd, the shim), such as `2` or `1.5` | `cpu.max` in `/sys/fs/cgroup/agents/kata_<id>` |
+| `AC_AGENT_MEMORY_MIB` | host memory for the whole sandbox, guest RAM included; at least `default_memory` + 128 (2560 for 2048 guests) | `memory.max` in the same cgroup |
+| `AC_AGENT_DISK_GIB` | data the workspace may hold, checkpointed data it wrote included | `btrfs qgroup limit` on the workspace subvolume |
+
+CPU and memory need Kata's `sandbox_cgroup_only = true` (in `[runtime]`; set on BaileyServ). The disk limit needs
+subvolume workspaces and simple quotas on their filesystem, enabled once:
+`sudo scripts/limits-test.sh --enable-quota <agent>` enables them and then checks a running agent (cgroup values,
+throttling under load, a write refused past a temporary quota). Without `--enable-quota` it only checks. In the
+guest a full quota is `Disk quota exceeded`; deleting files frees nothing a checkpoint still holds.
+
 **Backups** (ADR-021): `ac-ctl backup` writes each workspace as `btrfs send` stream files into a directory,
 best on another machine. Mount it at `/mnt/agent-backups` (another path: `sudo systemctl edit ac-backup.service`
 and override `ExecStart` and `RequiresMountsFor`). The share can be any filesystem; only the workspaces need btrfs,

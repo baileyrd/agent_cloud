@@ -21,7 +21,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 | Network attacker reaches the API | Gateway on a private bind only (loopback, RFC 1918, tailnet), scoped bearer tokens ([API tokens](#api-tokens)); no public port |
 | A jobs token is stolen (`jobs:read,jobs:write` for some agents) | It runs prompts, so code as the agent user, in those agents only; it cannot pause, destroy, watch or type into them, and other agents answer 404. Revoke it alone (`ac-gateway token revoke`); see [API tokens](#api-tokens) |
 | The admin token is stolen | Full control of every agent (create, destroy, purge, jobs, take-over), not the host. Keep it on the host (root, 0600), give every other caller a narrower token, revoke and re-issue it if it leaks |
-| Runaway agent starves the host | Per-agent CPU/memory caps, disk quotas, concurrent-build limit |
+| Runaway agent starves the host | Per-agent `cpu.max` and `memory.max` on the whole sandbox, a btrfs quota on its workspace (ADR-023), the job gate (ADR-013) |
 | Destructive commands | Command guard in the shell container (a backstop, not a boundary) |
 
 ## Hardening checklist
@@ -40,8 +40,10 @@ may execute untrusted code or be steered by prompt injection from web content.
   TCP 1025-3388 removed: a1 still reached the proxy, and failed with `acbr0` taken out of the zone)
 - [x] Proxy allowlist limited to the model APIs and Git hosts actually in use (measured
   2026-10-19: `api.anthropic.com`, `platform.claude.com` for token refresh, GitHub)
-- [ ] Per-agent memory and CPU limits; cap on concurrent builds
-- [ ] Per-agent disk quota on the workspace volume
+- [ ] Per-agent memory and CPU limits (ADR-023: `AC_AGENT_CPUS`, `AC_AGENT_MEMORY_MIB`; built, to verify on
+  BaileyServ); cap on concurrent builds (the job gate, ADR-013)
+- [ ] Per-agent disk quota on the workspace volume (ADR-023: `AC_AGENT_DISK_GIB`, a btrfs simple quota; built, to
+  verify on BaileyServ)
 - [ ] Secrets in 0600 root-owned files; never in images, repo, prompts or logs
 - [ ] Agent user has no sudo and no access to the containerd socket
 - [ ] No git remotes with embedded tokens in workspaces

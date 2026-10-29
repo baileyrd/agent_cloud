@@ -13,6 +13,7 @@ pub mod capacity;
 pub mod exec;
 pub mod facts;
 pub mod host;
+mod limits;
 pub mod snap;
 
 use std::collections::BTreeMap;
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ac_domain::AgentId;
+use ac_domain::{AgentId, AgentLimits};
 use ac_ports::{Boot, PortError, Runtime};
 use platform::process::{Command, EnvSpec, ExitStatus, Spawner, Stdio};
 
@@ -138,6 +139,11 @@ pub struct CtrConfig {
     pub command_timeout: Option<Duration>,
     /// Print each external command to stderr before running it.
     pub trace: bool,
+    /// Limits every boot applies (ADR-023); the default limits nothing.
+    pub limits: AgentLimits,
+    /// Where cgroup v2 is mounted (`/sys/fs/cgroup`). Each sandbox's cgroup is
+    /// `<cgroup_root>/<namespace>/<id>`.
+    pub cgroup_root: PathBuf,
 }
 
 /// Runs each agent as a detached Kata container with a bind-mounted workspace.
@@ -534,6 +540,7 @@ impl<S: Spawner> CtrRuntime<S> {
         // reaches a live VM; it only clears what a shim that died uncleanly left behind.
         self.remove_stale(op, id)?;
         self.kill_sandbox(op, id)?;
+        self.limit_disk(op, dir)?;
         let net = self.cfg.network.as_ref();
         if let Some(net) = net {
             // A VM that died without `pause` leaves a namespace (`ip netns add` would fail) or,
@@ -542,6 +549,7 @@ impl<S: Spawner> CtrRuntime<S> {
             self.network_up(op, net, id)?;
         }
         self.start_container(op, id, dir, net, boot)
+            .and_then(|()| self.limit_cgroup(op, id))
             .map_err(|e| with_cleanup(e, self.undo_start(op, id, net)))
     }
 
@@ -763,6 +771,8 @@ impl<S: Spawner> CtrRuntime<S> {
             workspace,
             "--hostname".to_owned(),
             id.to_string(),
+            "--cgroup".to_owned(),
+            self.cgroup_path(id),
         ];
         if let Some(net) = net {
             args.extend([
@@ -814,6 +824,7 @@ mod tests {
             // 1 is pkill's "nothing matched", which cleanup must accept.
             .script("pkill", ExitStatus::Code(1))
             .script("timeout", ExitStatus::Code(0))
+            .script("btrfs", ExitStatus::Code(0))
     }
 
     fn cfg(root: &Path) -> CtrConfig {
@@ -832,6 +843,8 @@ mod tests {
             task_root: root.join("task"),
             command_timeout: None,
             trace: false,
+            limits: AgentLimits::default(),
+            cgroup_root: root.join("cgroup"),
         }
     }
 
@@ -1021,6 +1034,112 @@ mod tests {
         assert!(calls[5].windows(2).any(|w| w == ["--hostname", "a1"]));
         assert_eq!(calls[5].last().map(String::as_str), Some("a1"));
         assert!(root.join("a1").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Limits of 1.5 cores, 2560 MiB and 20 GiB, and the sandbox cgroup Kata would make, holding
+    /// `procs`.
+    fn limited(rt: &mut CtrRuntime<MockSpawner>, root: &Path, procs: &str) -> PathBuf {
+        rt.cfg.limits = AgentLimits {
+            cpus: ac_domain::Cpus::parse("1.5").ok(),
+            memory_mib: Some(2560),
+            disk_gib: None,
+        };
+        let cg = root.join("cgroup/agents/kata_a1");
+        let _ = std::fs::create_dir_all(&cg);
+        let _ = std::fs::write(cg.join("cgroup.procs"), procs);
+        cg
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    #[test]
+    fn create_names_the_cgroup_parent_and_limits_nothing_by_default() {
+        let (rt, log, root) = rt(ExitStatus::Code(0));
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
+        assert!(argv(&log)[5]
+            .windows(2)
+            .any(|w| w == ["--cgroup", "/agents/a1"]));
+        assert!(!root.join("cgroup").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cpu_and_memory_limits_go_on_the_sandbox_cgroup_after_start() {
+        let (mut rt, log, root) = rt(ExitStatus::Code(0));
+        let cg = limited(&mut rt, &root, "13401\n13411\n");
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
+        assert_eq!(read(&cg.join("cpu.max")), "150000 100000");
+        assert_eq!(read(&cg.join("memory.max")), (2560u64 << 20).to_string());
+        assert_eq!(
+            read(&root.join("cgroup/agents/cgroup.subtree_control")),
+            "+cpu +memory"
+        );
+        assert_eq!(programs(&log).last().map(String::as_str), Some("ctr"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_empty_or_missing_cgroup_fails_the_boot_and_undoes_it() {
+        for procs in [Some(""), None] {
+            let (mut rt, log, root) = rt(ExitStatus::Code(0));
+            let cg = limited(&mut rt, &root, procs.unwrap_or_default());
+            if procs.is_none() {
+                let _ = std::fs::remove_dir_all(&cg);
+            }
+            let err = rt.create(&id(), &Boot::default()).err();
+            let cause = err.map(|e| e.cause).unwrap_or_default();
+            let want = procs.map_or("cgroup.procs", |_| "sandbox_cgroup_only = true");
+            assert!(cause.contains(want), "{cause}");
+            assert!(!cg.join("cpu.max").exists());
+            // The VM that started is killed: pkill and container removal follow `ctr run`.
+            let progs = programs(&log);
+            let run = argv(&log).iter().position(|a| a.iter().any(|x| x == "run"));
+            assert!(run.is_some_and(|r| progs[r + 1..].iter().any(|p| p == "pkill")));
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn disk_limit_sets_a_quota_on_the_subvolume_before_start() {
+        let (mut rt, log, root) = rt(ExitStatus::Code(0));
+        rt.cfg.limits.disk_gib = Some(20);
+        rt.disk = snap::Disk {
+            btrfs: |_| Ok(true),
+            subvolume: |_| Ok(true),
+        };
+        let _ = std::fs::create_dir_all(root.join("a1"));
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
+        let calls = argv(&log);
+        let quota = calls
+            .iter()
+            .position(|a| a.first().is_some_and(|p| p == "qgroup"));
+        let run = calls.iter().position(|a| a.iter().any(|x| x == "run"));
+        assert!(quota < run && quota.is_some(), "{calls:?}");
+        let ws = root.join("a1").display().to_string();
+        assert_eq!(
+            calls[quota.unwrap_or_default()],
+            ["qgroup", "limit", "21474836480", ws.as_str()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disk_limit_refuses_a_plain_directory_workspace_before_booting() {
+        let (mut rt, log, root) = rt(ExitStatus::Code(0));
+        rt.cfg.limits.disk_gib = Some(20);
+        let err = rt.resume(&id(), &Boot::default()).err();
+        assert!(err.is_some(), "no workspace at all");
+        let _ = std::fs::create_dir_all(root.join("a1"));
+        let cause = rt
+            .resume(&id(), &Boot::default())
+            .err()
+            .map(|e| e.cause)
+            .unwrap_or_default();
+        assert!(cause.contains("ac-ctl workspace migrate"), "{cause}");
+        assert!(!argv(&log).iter().any(|a| a.iter().any(|x| x == "run")));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -654,6 +654,8 @@ esac"#;
                 task_root: root.join("task"),
                 command_timeout: None,
                 trace: false,
+                limits: Default::default(),
+                cgroup_root: "/sys/fs/cgroup".into(),
             };
             let mut rt = CtrRuntime::new(
                 Fake {
@@ -930,6 +932,8 @@ esac"#;
             task_root: dir.join("task"),
             command_timeout: Some(std::time::Duration::from_secs(60)),
             trace: true,
+            limits: Default::default(),
+            cgroup_root: "/sys/fs/cgroup".into(),
         };
         let rt = CtrRuntime::new(LinuxSpawner, cfg);
         let (a1, b1, old) = (agent("a1"), agent("b1"), agent("old"));

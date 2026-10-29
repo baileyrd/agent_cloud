@@ -27,11 +27,16 @@ trap cleanup EXIT
 gx() { ctr -n "$NS" task exec --exec-id "lim-$1-$$" "$AGENT" sh -c "$2" < "$HOLD" 2>&1; }
 
 echo "== cgroup $CG"
-[ -s "$CG/cgroup.procs" ] && ok "holds $(wc -l < "$CG/cgroup.procs") process(es)" || bad "no processes in $CG"
+if [ ! -s "$CG/cgroup.procs" ]; then
+    bad "no processes in $CG: $AGENT's VM is not running (resume it through the gateway, which applies the limits)"
+    ctr -n "$NS" task ls 2>&1 | awk -v a="$AGENT" 'NR == 1 || $1 == a'
+    exit 1
+fi
+ok "holds $(wc -l < "$CG/cgroup.procs") process(es)"
 for f in cpu.max memory.max memory.current memory.peak; do
     printf '%-15s %s\n' "$f" "$(cat "$CG/$f" 2>&1)"
 done
-grep -E '^(oom|oom_kill|max) ' "$CG/memory.events" 2>/dev/null | tr '\n' ' '; echo
+{ grep -E '^(oom|oom_kill|max) ' "$CG/memory.events" 2>/dev/null || true; } | tr '\n' ' '; echo
 
 echo "== cpu: $LOAD_SECS s of 4 busy loops in the guest"
 stat() { awk -v k="$1" '$1 == k { print $2 }' "$CG/cpu.stat"; }

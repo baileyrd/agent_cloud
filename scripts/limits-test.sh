@@ -66,16 +66,20 @@ if ! btrfs qgroup show -re "$WS" > /dev/null 2>&1; then
 fi
 btrfs qgroup show -re --mbytes -f "$WS"
 configured=$(sed -n 's/^AC_AGENT_DISK_GIB=//p' "$ENVFILE" 2>/dev/null | tail -1)
+restore=none
+[ -n "$configured" ] && restore=${configured}G
 used=$(btrfs qgroup show -re --raw -f "$WS" | awk 'NR > 2 { print $2 }')
 trial=$((used + 256 * 1024 * 1024))
 btrfs qgroup limit "$trial" "$WS"
+# Put the configured limit back whatever happens next.
+trap 'btrfs qgroup limit "$restore" "$WS"; cleanup' EXIT
 out=$(gx disk 'dd if=/dev/urandom of=/workspace/.ac-limit-test bs=1M count=512 conv=fsync 2>&1; echo rc=$?')
 gx rm 'rm -f /workspace/.ac-limit-test' > /dev/null || true
-btrfs qgroup limit "${configured:+${configured}G}${configured:-none}" "$WS"
+btrfs qgroup limit "$restore" "$WS"
 echo "$out" | tail -3
 case $out in
     *"quota exceeded"*|*"Disk quota"*) ok "a write past the quota was refused" ;;
     *) bad "512 MiB went past a limit 256 MiB above use" ;;
 esac
-echo "limit back to: ${configured:+${configured} GiB}${configured:-none}"
+echo "limit back to: $restore"
 exit "$fail"

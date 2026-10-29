@@ -975,8 +975,12 @@ step as today). Expiry trusts the host clock; a clock set back revives an expire
 `expires` on the legacy token (deprecated; drop it instead); a warning before expiry.
 
 ## ADR-023: Per-agent CPU, memory and disk limits
-**Status:** proposed (2026-10-29; unit tests; the Kata cgroup layout was read on BaileyServ the same day, the limits
-themselves are not yet verified there).
+**Status:** accepted (2026-10-29; verified on BaileyServ the same day with a1 at `AC_AGENT_CPUS=2`,
+`AC_AGENT_MEMORY_MIB=2560`, `AC_AGENT_DISK_GIB=50`: `cpu.max` `200000 100000` and `memory.max` 2684354560 on
+`agents/kata_a1` holding its 4 processes; 4 busy loops in the guest used 2.00 cores, throttled in 117 periods;
+the guest's memory was charged to `kata_a1` (peak 497 MiB); with a trial quota 256 MiB above use, a 512 MiB `dd`
+stopped at 255 MiB with an error; the 50 GiB limit was put back). Order matters: simple quotas must be on before
+a disk limit is set, or the resume fails (`quota not enabled`), as it did once here.
 **Context:** A guest is bounded by its own size (`default_vcpus`, `default_memory`), but what runs for it on the host
 is not: QEMU's I/O threads, virtiofsd and the host page cache virtiofsd fills are outside the guest's vCPUs and RAM,
 and a workspace can fill the data disk, which on BaileyServ is the root filesystem. Admission (ADR-012) and the job

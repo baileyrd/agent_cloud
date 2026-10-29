@@ -973,3 +973,62 @@ for it when nobody remembers to revoke it, and a leaked one works forever.
 step as today). Expiry trusts the host clock; a clock set back revives an expired token until it passes again.
 **Not now:** a default or maximum lifetime for every token (would break unattended callers made before it);
 `expires` on the legacy token (deprecated; drop it instead); a warning before expiry.
+
+## ADR-023: Per-agent CPU, memory and disk limits
+**Status:** proposed (2026-10-29; unit tests; the Kata cgroup layout was read on BaileyServ the same day, the limits
+themselves are not yet verified there).
+**Context:** A guest is bounded by its own size (`default_vcpus`, `default_memory`), but what runs for it on the host
+is not: QEMU's I/O threads, virtiofsd and the host page cache virtiofsd fills are outside the guest's vCPUs and RAM,
+and a workspace can fill the data disk, which on BaileyServ is the root filesystem. Admission (ADR-012) and the job
+gate (ADR-013) bound how many agents and jobs start, not what one of them uses afterwards.
+
+**Facts (BaileyServ, 2026-10-29; Kata 3.26, containerd 2.3.5, kernel 7.2, btrfs-progs 7.1).**
+`sandbox_cgroup_only = true` is already set. With cgroupfs, Kata puts the shim, QEMU (all 9 threads) and both
+virtiofsd processes of agent a1 in `/sys/fs/cgroup/agents/kata_a1`; there is no `kata_overhead` cgroup. The
+`agents` cgroup passes only `cpuset cpu` to its children, so `kata_a1` has no `memory.max`, and guest RAM (shared
+memory in `/dev/shm`) is charged to `agents` as file pages. Workspaces sit on the root btrfs filesystem. Swap is
+8 GiB of zram.
+
+**Decision.**
+- *Three settings, the same for every agent,* in `gateway.env` (and read by `ac-ctl` too): `AC_AGENT_CPUS` (cores,
+  to two decimals, such as `2` or `1.5`), `AC_AGENT_MEMORY_MIB` (host memory for the whole sandbox, guest RAM
+  included) and `AC_AGENT_DISK_GIB` (data the workspace may hold). Unset or empty means unlimited, so a host that
+  sets none behaves as before. Zero or anything malformed refuses the start.
+- *CPU and memory on the sandbox cgroup.* `ctr run` gets `--cgroup /<namespace>/<id>` (ctr's default, now explicit);
+  Kata makes `<namespace>/kata_<id>` beside it. Once `ctr run -d` returns, the adapter writes `+cpu +memory` (only
+  those limited) to `<namespace>/cgroup.subtree_control`, then `cpu.max` (`<cores × 100000> 100000`) and
+  `memory.max` (bytes) in `kata_<id>`. A sandbox cgroup that is missing or holds no process is an error, never a
+  silent no-op: the boot is undone like any failed start, naming `sandbox_cgroup_only = true`.
+- *A memory limit must cover the guest.* Guest RAM is host memory, so `AC_AGENT_MEMORY_MIB` below the guest size
+  plus 128 MiB (QEMU, virtiofsd and the shim: the VM's PSS ran ~120 MiB above its `/dev/shm` pages in sizing.md's
+  real builds) refuses the gateway's start. 2560 for a 2048 MiB guest leaves 512 MiB for the VMM, virtiofsd and the
+  page cache it fills, which the limit then reclaims instead of letting it grow.
+- *Disk as a btrfs simple quota.* `btrfs qgroup limit <bytes> <workspace>` before the VM starts, on every create and
+  resume. Re-applying each boot covers agents made before the limit and the new subvolumes that restore, fork and
+  migrate (ADR-018) put in place, with no hook in each. Simple quotas (`btrfs quota enable --simple`, kernel 6.7+)
+  charge each extent to the subvolume that wrote it and skip the shared-extent walk that made full qgroups slow with
+  many snapshots, the reason ADR-018 left quotas off. A disk limit on a plain-directory workspace, or with quotas
+  off, fails the boot with what to do.
+- *Code.* `ac_domain::limits` is pure: parsing, the guest check and the cgroup values. `ac_ctr`'s `limits` module
+  applies them inside `boot`, so create and resume (and therefore fork and restore) share one path. The gateway
+  logs `per-agent limits: cpu 2 cores, memory 2560 MiB, disk 50 GiB` at startup.
+- *Root steps,* once per host: `btrfs quota enable --simple` on the workspace filesystem.
+  `sudo scripts/limits-test.sh [--enable-quota] <agent>` does that and then checks a running agent: the cgroup
+  values, throttling under four busy loops in the guest, and a write refused past a temporary limit 256 MiB above
+  current use, the configured limit put back after.
+
+**Consequences:**
+- Recommended on BaileyServ: `AC_AGENT_CPUS=2` (the guest's vCPUs; the cap then also holds QEMU's I/O threads and
+  virtiofsd), `AC_AGENT_MEMORY_MIB=2560`, and a disk limit chosen against the free space of the root filesystem.
+- At its memory limit a sandbox's pages go to zram swap first, so it slows down; when swap cannot take more, the
+  kernel's OOM killer ends QEMU and the VM dies. The watchdog and reconcile then treat it as any VM that died
+  (`memory.events` `oom_kill` in the cgroup says why). The gateway does not report it yet.
+- In the guest a full quota is `EDQUOT` (`Disk quota exceeded`). Data a checkpoint still holds stays charged to the
+  workspace that wrote it, so deleting files does not free quota while a checkpoint keeps them: delete the
+  checkpoint. A restore swaps in a new subvolume whose shared extents stay charged to the deleted one, so a restore
+  resets what counts against the limit. Only a caller with `agents:write` can restore, not the agent.
+- Extents written before quotas were enabled are not counted (simple quotas track only new extents).
+- *Rollback:* unset the three variables and restart the gateway; `btrfs quota disable <mount>` removes the quotas.
+
+**Not now:** a different limit per agent or per token (no caller needs one yet); `io.max` (it needs a device and
+per-disk numbers); reporting usage and OOM kills in the agent's JSON; `ac-ctl doctor` rules for the limits.

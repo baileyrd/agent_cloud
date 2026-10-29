@@ -45,9 +45,9 @@
 - [ ] Verify the `python` and `node` profiles with a real `pip install` and `npm install` (only `curl -I` so far)
 - [x] `tini` as the agent image's PID 1, so killed jobs leave no zombies; no Claude Code self-update
   (`DISABLE_AUTOUPDATER=1`) (verified on BaileyServ 2026-10-22)
-- [ ] Per-agent CPU, memory and disk limits: `cpu.max` and `memory.max` on each sandbox's cgroup and a btrfs
-  simple quota on its workspace, applied on every boot (ADR-023; unit tests). To do: enable simple quotas and run
-  `scripts/limits-test.sh` on BaileyServ
+- [x] Per-agent CPU, memory and disk limits: `cpu.max` and `memory.max` on each sandbox's cgroup and a btrfs
+  simple quota on its workspace, applied on every boot (ADR-023; verified on BaileyServ 2026-10-29 with
+  `scripts/limits-test.sh`: held at 2.00 cores under load, a write past the quota refused)
 - [ ] Backups with a tested restore: workspaces as incremental `btrfs send` stream files in any directory (a share
   on another machine), daily by `ac-backup.timer`, with `ac-ctl restore-backup` replaying a chain (ADR-021; tested
   on loopback filesystems 2026-10-28). To do: verify on BaileyServ against a share on Beast (a full and an

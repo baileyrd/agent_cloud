@@ -40,10 +40,10 @@ may execute untrusted code or be steered by prompt injection from web content.
   TCP 1025-3388 removed: a1 still reached the proxy, and failed with `acbr0` taken out of the zone)
 - [x] Proxy allowlist limited to the model APIs and Git hosts actually in use (measured
   2026-10-19: `api.anthropic.com`, `platform.claude.com` for token refresh, GitHub)
-- [ ] Per-agent memory and CPU limits (ADR-023: `AC_AGENT_CPUS`, `AC_AGENT_MEMORY_MIB`; built, to verify on
-  BaileyServ); cap on concurrent builds (the job gate, ADR-013)
-- [ ] Per-agent disk quota on the workspace volume (ADR-023: `AC_AGENT_DISK_GIB`, a btrfs simple quota; built, to
-  verify on BaileyServ)
+- [x] Per-agent memory and CPU limits (ADR-023: `AC_AGENT_CPUS`, `AC_AGENT_MEMORY_MIB`; verified on BaileyServ
+  2026-10-29); cap on concurrent builds (the job gate, ADR-013)
+- [x] Per-agent disk quota on the workspace volume (ADR-023: `AC_AGENT_DISK_GIB`, a btrfs simple quota; verified
+  on BaileyServ 2026-10-29)
 - [ ] Secrets in 0600 root-owned files; never in images, repo, prompts or logs
 - [ ] Agent user has no sudo and no access to the containerd socket
 - [ ] No git remotes with embedded tokens in workspaces

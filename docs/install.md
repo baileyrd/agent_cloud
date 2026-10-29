@@ -537,8 +537,10 @@ them; a running agent gets them at its next resume.
 
 CPU and memory need Kata's `sandbox_cgroup_only = true` (in `[runtime]`; set on BaileyServ). The disk limit needs
 subvolume workspaces and simple quotas on their filesystem, enabled once:
-`sudo scripts/limits-test.sh --enable-quota <agent>` enables them and then checks a running agent (cgroup values,
-throttling under load, a write refused past a temporary quota). Without `--enable-quota` it only checks. In the
+`sudo btrfs quota enable --simple /var/lib/agent-cloud`. Do it before `AC_AGENT_DISK_GIB` is set (or before the
+next resume): with the limit set and quotas off, every create and resume fails. Then, with the agent resumed
+under the new settings, `sudo scripts/limits-test.sh <agent>` checks it (cgroup values, throttling under load, a
+write refused past a temporary quota); `--enable-quota` enables quotas first when they are not on yet. In the
 guest a full quota is `Disk quota exceeded`; deleting files frees nothing a checkpoint still holds.
 
 **Backups** (ADR-021): `ac-ctl backup` writes each workspace as `btrfs send` stream files into a directory,

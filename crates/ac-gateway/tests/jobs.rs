@@ -54,10 +54,14 @@ struct World {
     snapshots: HashMap<String, Vec<String>>,
     /// Jobs whose end snapshot was taken, in order.
     sealed: Vec<String>,
+    /// Jobs whose compare began, in order (before the gate).
+    listing: Vec<String>,
     /// Jobs whose changes were compared, in order.
     ended: Vec<String>,
     /// Jobs whose snapshots were dropped uncompared.
     discarded: Vec<String>,
+    /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
+    leftovers: Vec<(AgentId, JobId)>,
 }
 
 #[derive(Clone, Default)]
@@ -166,10 +170,14 @@ impl Changes for Fake {
         Ok(w.snapshots.contains_key(job.as_str()))
     }
     fn diff(&self, _: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+        self.w().listing.push(job.to_string());
         self.gate().pass();
         let mut w = self.w();
         w.ended.push(job.to_string());
         Ok(w.snapshots.remove(job.as_str()))
+    }
+    fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String> {
+        Ok(self.w().leftovers.clone())
     }
     fn discard(&self, _: &AgentId, job: &JobId) -> Result<(), String> {
         let mut w = self.w();
@@ -594,7 +602,7 @@ fn interrupt_returns_while_the_change_listing_is_stuck() {
     r.fake.gate().hold();
     let lifecycle = {
         let r = Arc::clone(&r);
-        std::thread::spawn(move || r.jobs.interrupt(&agent("a1"), false))
+        std::thread::spawn(move || r.jobs.interrupt(&agent("a1")))
     };
     let returned = within_5s(|| lifecycle.is_finished());
     r.fake.gate().release();
@@ -610,31 +618,68 @@ fn interrupt_returns_while_the_change_listing_is_stuck() {
     assert_eq!(r.fake.w().ended, [running]);
 }
 
-/// A purge deletes every job snapshot itself: the job it interrupts gets no end snapshot or
-/// compare, and compares still queued for that agent are dropped, so none races the purge. Other
-/// agents' queued compares stay.
+/// A purge deletes the snapshots a compare reads, and btrfs refuses to delete one that `send`
+/// reads. So while one of the agent's compares runs the purge is refused (409, nothing changed),
+/// and while the purge runs the agent's queued compares wait; other agents' do not. Red if the
+/// route purges without holding the agent's compares (`vacate` before this fix).
 #[test]
-fn a_purge_interrupt_compares_nothing_and_drops_the_agents_queue() {
-    let r = rig();
-    let first = r.ok("a1", "a");
-    let other = r.ok("a2", "b");
-    r.jobs.tick();
-    r.fake.set(&first, Probe::Exited(Some(0)));
-    r.fake.set(&other, Probe::Exited(Some(0)));
-    r.tick();
-    let second = r.ok("a1", "c");
-    r.jobs.tick();
-    assert_eq!(r.state("a1", &second), "running");
-    r.jobs.interrupt(&agent("a1"), true);
-    assert_eq!(r.state("a1", &second), "interrupted");
-    r.diff_all();
-    let w = r.fake.w();
+fn a_purge_waits_for_no_listing_and_holds_the_agents_queue() {
+    let r = Arc::new(rig());
+    let addr = serve(&r);
+    let end = |agent: &str| {
+        let id = r.ok(agent, "x");
+        r.jobs.tick();
+        r.fake.set(&id, Probe::Exited(Some(0)));
+        r.tick();
+        id
+    };
+    let first = end("a1");
+    r.fake.gate().hold();
+    let differ = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || r.jobs.diff_next(Duration::ZERO))
+    };
     assert!(
-        !w.sealed.contains(&second),
-        "no end snapshot: {:?}",
-        w.sealed
+        within_5s(|| !r.fake.w().listing.is_empty()),
+        "a1's compare began"
     );
-    assert_eq!(w.ended, [other], "a1's queued compare dropped, a2's kept");
+    let (status, _, body) = request(
+        addr,
+        "DELETE",
+        "/api/v1/agents/a1?purge=true&force=true",
+        "",
+    );
+    r.fake.gate().release();
+    let _ = differ.join();
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("still being listed"), "{body}");
+    assert_eq!(
+        r.store.state(&agent("a1")).ok().flatten(),
+        Some(State::Running)
+    );
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&first));
+    // Held: a1's queued compare waits out the purge, a2's runs.
+    let (held, other) = (end("a1"), end("a2"));
+    assert!(r.jobs.hold(&agent("a1")));
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [first.clone(), other.clone()]);
+    r.jobs.release(&agent("a1"));
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [first, other, held]);
+}
+
+/// Issue #26: compares still queued when the gateway stopped are queued again at the next start,
+/// so their snapshots do not stay until a purge; a job still running keeps its start snapshot.
+#[test]
+fn leftover_snapshots_of_ended_jobs_are_compared_at_start() {
+    let r = rig();
+    let running = r.ok("a1", "x");
+    r.jobs.tick();
+    let gone = job_id("00000000000000aa");
+    r.fake.w().leftovers = vec![(agent("a1"), job_id(&running)), (agent("a2"), gone.clone())];
+    r.jobs.queue_leftovers();
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [gone.to_string()]);
 }
 
 #[test]
@@ -762,7 +807,7 @@ fn stopped_agent_interrupts_running_and_cancels_queued() {
     let other = r.ok("a2", "c");
     r.jobs.tick();
     assert!(r.jobs.busy(&agent("a1")));
-    r.jobs.interrupt(&agent("a1"), false);
+    r.jobs.interrupt(&agent("a1"));
     assert_eq!(
         r.fake.w().kills,
         std::slice::from_ref(&running),

@@ -27,7 +27,7 @@
 //! before the gateway is ready: ended jobs queue for [`Jobs::diff_next`], which the gateway runs
 //! on a thread of its own, one compare at a time.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -232,6 +232,9 @@ pub trait Changes: Send + Sync + 'static {
     fn diff(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String>;
     /// Delete the job's snapshots without comparing them.
     fn discard(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
+    /// Every job with snapshots on disk, of any agent: ended jobs whose compare a stopped gateway
+    /// never ran, besides the running ones.
+    fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String>;
 }
 
 impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
@@ -249,6 +252,10 @@ impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
 
     fn discard(&self, agent: &AgentId, job: &JobId) -> Result<(), String> {
         self.job_discard(agent, job).map_err(|e| e.to_string())
+    }
+
+    fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String> {
+        self.job_leftovers().map_err(|e| e.to_string())
     }
 }
 
@@ -564,9 +571,28 @@ pub struct Jobs {
     book: Mutex<HashMap<String, u64>>,
     changed: Condvar,
     waiters: AtomicUsize,
-    /// Ended jobs whose changes are still to be compared, oldest first ([`Jobs::diff_next`]).
-    diffs: Mutex<VecDeque<(AgentId, JobId)>>,
+    /// Ended jobs whose changes are still to be compared ([`Jobs::diff_next`]).
+    diffs: Mutex<Diffs>,
     queued: Condvar,
+}
+
+/// The compares to run, and which agents' are off limits to them.
+#[derive(Default)]
+struct Diffs {
+    /// Ended jobs, oldest first.
+    queue: VecDeque<(AgentId, JobId)>,
+    /// The agent whose job is being compared now.
+    listing: Option<AgentId>,
+    /// Agents being purged ([`Busy::hold`]): their compares wait, since the purge deletes the
+    /// snapshots they read.
+    held: HashSet<AgentId>,
+}
+
+impl Diffs {
+    /// Where the oldest compare of an agent not held is.
+    fn next(&self) -> Option<usize> {
+        self.queue.iter().position(|(a, _)| !self.held.contains(a))
+    }
 }
 
 impl Jobs {
@@ -595,7 +621,7 @@ impl Jobs {
             book: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
             waiters: AtomicUsize::new(0),
-            diffs: Mutex::new(VecDeque::new()),
+            diffs: Mutex::new(Diffs::default()),
             queued: Condvar::new(),
         }
     }
@@ -981,18 +1007,6 @@ impl Jobs {
         event: JobEvent,
         reason: Option<&str>,
     ) -> Result<Job, Reply> {
-        self.step(agent, id, event, reason, Ending::Compare)
-    }
-
-    /// [`Jobs::transition`], with what to do about a started job's snapshots if it ends.
-    fn step(
-        &self,
-        agent: &AgentId,
-        id: &JobId,
-        event: JobEvent,
-        reason: Option<&str>,
-        ending: Ending,
-    ) -> Result<Job, Reply> {
         let mut book = self.lock();
         let mut j = self.find(agent, id)?;
         let was = j.state;
@@ -1021,7 +1035,7 @@ impl Jobs {
         }
         drop(book);
         self.changed.notify_all();
-        if was == JobState::Running && j.state.is_terminal() && ending == Ending::Compare {
+        if was == JobState::Running && j.state.is_terminal() {
             self.seal(&j);
         }
         Ok(j)
@@ -1038,22 +1052,61 @@ impl Jobs {
             Ok(true) => {}
             Err(e) => eprintln!("ac-gateway: jobs: {}/{}: end snapshot: {e}", j.agent, j.id),
         }
-        self.queue().push_back((j.agent.clone(), j.id.clone()));
-        self.queued.notify_one();
+        self.queue()
+            .queue
+            .push_back((j.agent.clone(), j.id.clone()));
+        self.queued.notify_all();
+    }
+
+    /// Queue the compare of every ended job whose snapshots are still on disk: a gateway stopped
+    /// with compares queued leaves them, and nothing else would delete them before a purge. Jobs
+    /// still queued or running keep theirs. Run once at startup, off the startup path; a job the
+    /// first tick ends in the meantime may be queued twice, and its second compare finds nothing.
+    pub fn queue_leftovers(&self) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let found = match changes.leftovers() {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!("ac-gateway: jobs: leftover job snapshots: {e}");
+                return;
+            }
+        };
+        let live = |agent: &AgentId, id: &JobId| {
+            self.store
+                .jobs(agent)
+                .is_ok_and(|jobs| jobs.iter().any(|j| j.id == *id && !j.state.is_terminal()))
+        };
+        let ended: Vec<_> = found.into_iter().filter(|(a, j)| !live(a, j)).collect();
+        if ended.is_empty() {
+            return;
+        }
+        eprintln!(
+            "ac-gateway: jobs: comparing {} ended job(s) left from an earlier run",
+            ended.len()
+        );
+        self.queue().queue.extend(ended);
+        self.queued.notify_all();
     }
 
     /// Compare the oldest ended job's snapshots and note in its agent's history which paths it
     /// changed, waiting up to `wait` for one to be queued. Whether there was one. The gateway
     /// calls this in a loop on a thread of its own, so one job's large compare delays only the
     /// notes queued behind it.
+    /// Compares of an agent being purged wait until [`Busy::release`].
     pub fn diff_next(&self, wait: Duration) -> bool {
         let next = {
-            let queue = self.queue();
-            let (mut queue, _) = self
+            let mut diffs = self.queue();
+            // Cleared here too, in case the last compare panicked.
+            diffs.listing = None;
+            let (mut diffs, _) = self
                 .queued
-                .wait_timeout_while(queue, wait, |q| q.is_empty())
+                .wait_timeout_while(diffs, wait, |d| d.next().is_none())
                 .unwrap_or_else(|e| e.into_inner());
-            queue.pop_front()
+            let next = diffs.next().and_then(|i| diffs.queue.remove(i));
+            diffs.listing = next.as_ref().map(|(agent, _)| agent.clone());
+            next
         };
         let (Some((agent, id)), Some(changes)) = (next, &self.changes) else {
             return false;
@@ -1063,10 +1116,11 @@ impl Jobs {
             Ok(None) => {}
             Err(e) => eprintln!("ac-gateway: jobs: {agent}/{id}: changes: {e}"),
         }
+        self.queue().listing = None;
         true
     }
 
-    fn queue(&self) -> MutexGuard<'_, VecDeque<(AgentId, JobId)>> {
+    fn queue(&self) -> MutexGuard<'_, Diffs> {
         self.diffs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1139,16 +1193,7 @@ impl Busy for Jobs {
             .is_ok_and(|jobs| jobs.iter().any(|j| !j.state.is_terminal()))
     }
 
-    fn interrupt(&self, id: &AgentId, purge: bool) {
-        // A purge deletes every job snapshot of the agent itself: compares still queued for it
-        // would only race that, and the jobs ended here get none.
-        let ending = match purge {
-            true => {
-                self.queue().retain(|(agent, _)| agent != id);
-                Ending::Discard
-            }
-            false => Ending::Compare,
-        };
+    fn interrupt(&self, id: &AgentId) {
         let Ok(jobs) = self.store.jobs(id) else {
             return;
         };
@@ -1158,17 +1203,31 @@ impl Busy for Jobs {
                     eprintln!("ac-gateway: jobs: {id}/{}: interrupt kill: {e}", j.id);
                 }
             }
-            let _ = self.step(
+            let _ = self.transition(
                 id,
                 &j.id,
                 JobEvent::Interrupt,
                 Some("agent paused or destroyed"),
-                ending,
             );
         }
     }
 
+    fn hold(&self, id: &AgentId) -> bool {
+        let mut diffs = self.queue();
+        if diffs.listing.as_ref() == Some(id) {
+            return false;
+        }
+        diffs.held.insert(id.clone());
+        true
+    }
+
+    fn release(&self, id: &AgentId) {
+        self.queue().held.remove(id);
+        self.queued.notify_all();
+    }
+
     fn forget(&self, id: &AgentId) {
+        self.queue().queue.retain(|(agent, _)| agent != id);
         let _book = self.lock();
         if let Ok(jobs) = self.store.jobs(id) {
             for j in jobs {
@@ -1177,15 +1236,6 @@ impl Busy for Jobs {
         }
         let _ = std::fs::remove_dir_all(self.dir.join(id.as_str()));
     }
-}
-
-/// What becomes of a started job's snapshots when it ends.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Ending {
-    /// Take the end snapshot and queue the compare (ADR-019).
-    Compare,
-    /// Leave them to the purge that follows.
-    Discard,
 }
 
 /// The value of `name` in a query string.

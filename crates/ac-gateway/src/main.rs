@@ -49,13 +49,14 @@
 //!
 //! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
 //! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
-//! logged and the gateway serves anyway. The job supervisor then starts on its own thread and ticks
-//! at once and every second after: its first tick ends the jobs of agents that are not running
-//! (`Jobs::reconcile`) and re-attaches running jobs of running agents. No job work runs before
-//! `READY=1`, so the startup's external commands stay within `TimeoutStartSec` however many jobs
-//! a reboot interrupted. Each ended job's changes are compared on a thread of their own
-//! (`Jobs::diff_next`, ADR-019). It then SIGKILLs `ctr` clients an earlier gateway left
-//! and detaches their tmux control clients in every running agent.
+//! logged and the gateway serves anyway. It then SIGKILLs `ctr` clients an earlier gateway left
+//! and detaches their tmux control clients in every running agent. The job supervisor then starts
+//! on its own thread and ticks at once and every second after: its first tick ends the jobs of
+//! agents that are not running (`Jobs::reconcile`) and re-attaches running jobs of running agents.
+//! No job work runs before `READY=1` or is waited for, so the startup's external commands stay
+//! within `TimeoutStartSec` however many jobs a reboot interrupted. Each ended job's changes are
+//! compared on another thread (`Jobs::diff_next`, ADR-019), which first queues the compares an
+//! earlier run left (`Jobs::queue_leftovers`).
 //!
 //! The watchdog ([`ac_gateway::watchdog`]) probes each running agent. It acts only on sustained
 //! failures while the host is not busy, then kills the gateway's own exec clients, then stale
@@ -526,8 +527,18 @@ fn run() -> Result<(), String> {
     }
     let app = Arc::new(App::new(api, hub.clone(), keys.clone()).with_jobs(Arc::clone(&jobs)));
     let differ = Arc::clone(&jobs);
-    std::thread::spawn(move || loop {
-        differ.diff_next(Duration::from_secs(60));
+    std::thread::spawn(move || {
+        differ.queue_leftovers();
+        loop {
+            // A panic in one compare is logged and the next runs, so snapshots never pile up
+            // behind a dead thread.
+            let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                differ.diff_next(Duration::from_secs(60))
+            }));
+            if next.is_err() {
+                eprintln!("ac-gateway: jobs: a change compare panicked; carrying on");
+            }
+        }
     });
     std::thread::spawn(move || loop {
         jobs.tick();

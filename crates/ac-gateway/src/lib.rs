@@ -89,9 +89,17 @@ pub trait Busy: Send + Sync {
     /// Whether the agent has a queued or running job.
     fn busy(&self, id: &AgentId) -> bool;
     /// The agent's VM is about to go away: kill its running job and mark it interrupted; cancel the
-    /// queued ones. With `purge`, its workspace and every job snapshot go too, so no job's
-    /// changes are compared (ADR-019).
-    fn interrupt(&self, id: &AgentId, purge: bool);
+    /// queued ones.
+    fn interrupt(&self, id: &AgentId);
+    /// The agent is about to be purged, which deletes its job snapshots: hold its jobs' change
+    /// compares (ADR-019) until [`Busy::release`]. `false`, holding nothing, while one of them
+    /// runs, since deleting a snapshot that `btrfs send` reads fails.
+    fn hold(&self, _: &AgentId) -> bool {
+        true
+    }
+    /// The purge is over, however it went: the agent's held compares may run (they find nothing
+    /// after a purge that succeeded).
+    fn release(&self, _: &AgentId) {}
     /// The agent's workspace was purged: forget its jobs.
     fn forget(&self, id: &AgentId);
 }
@@ -103,7 +111,7 @@ impl Busy for NoJobs {
     fn busy(&self, _: &AgentId) -> bool {
         false
     }
-    fn interrupt(&self, _: &AgentId, _: bool) {}
+    fn interrupt(&self, _: &AgentId) {}
     fn forget(&self, _: &AgentId) {}
 }
 
@@ -522,16 +530,38 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         purge: bool,
         act: impl FnOnce() -> Result<State, FleetError>,
     ) -> Reply {
-        let busy = self.jobs.busy(id);
-        if busy && !force {
+        if !purge {
+            return self.stop(id, force, act);
+        }
+        if !self.jobs.hold(id) {
             return error(
                 409,
-                &format!("agent {id} has a queued or running job; ?force=true interrupts it"),
+                &format!(
+                    "agent {id}: what its last job changed is still being listed; retry the purge \
+                     in a minute"
+                ),
             );
         }
-        // A purge also drops compares still queued for the agent's ended jobs.
-        if busy || purge {
-            self.jobs.interrupt(id, purge);
+        let reply = self.stop(id, force, act);
+        self.jobs.release(id);
+        reply
+    }
+
+    /// Interrupt the agent's jobs (with `force`; else 409 if it has any), then `act`.
+    fn stop(
+        &self,
+        id: &AgentId,
+        force: bool,
+        act: impl FnOnce() -> Result<State, FleetError>,
+    ) -> Reply {
+        if self.jobs.busy(id) {
+            if !force {
+                return error(
+                    409,
+                    &format!("agent {id} has a queued or running job; ?force=true interrupts it"),
+                );
+            }
+            self.jobs.interrupt(id);
         }
         self.done(id, act(), 200)
     }
@@ -1260,7 +1290,7 @@ mod tests {
         fn busy(&self, _: &AgentId) -> bool {
             false
         }
-        fn interrupt(&self, _: &AgentId, _: bool) {}
+        fn interrupt(&self, _: &AgentId) {}
         fn forget(&self, _: &AgentId) {}
     }
 

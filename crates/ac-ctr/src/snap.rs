@@ -386,6 +386,45 @@ impl<S: Spawner> CtrRuntime<S> {
         self.drop_job_snapshots("job discard", &base)
     }
 
+    /// Every job with a `<job>.start`, `<job>.end` or `<job>.send` under the checkpoint root, by
+    /// agent: what a stopped gateway's queued compares left. Names that are no agent or job id
+    /// are skipped.
+    pub fn job_leftovers(&self) -> Result<Vec<(AgentId, JobId)>, PortError> {
+        let (op, root) = ("job leftovers", &self.cfg.checkpoint_root);
+        let agents = match std::fs::read_dir(root) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_fail(op, "list", root, e)),
+            Ok(entries) => entries,
+        };
+        let mut found: Vec<(AgentId, JobId)> = Vec::new();
+        for entry in agents {
+            let entry = entry.map_err(|e| io_fail(op, "list", root, e))?;
+            let Some(agent) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| AgentId::parse(n).ok())
+            else {
+                continue;
+            };
+            let dir = entry.path();
+            for name in std::fs::read_dir(&dir).map_err(|e| io_fail(op, "list", &dir, e))? {
+                let name = name.map_err(|e| io_fail(op, "list", &dir, e))?.file_name();
+                let job = name
+                    .to_str()
+                    .and_then(|n| n.rsplit_once('.'))
+                    .filter(|(_, s)| matches!(*s, JOB_START | JOB_END | "send"))
+                    .and_then(|(j, _)| JobId::parse(j).ok());
+                let Some(job) = job else {
+                    continue;
+                };
+                if !found.iter().any(|(a, j)| *a == agent && *j == job) {
+                    found.push((agent.clone(), job));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     fn drop_job_snapshots(&self, op: &'static str, base: &Path) -> Result<(), PortError> {
         let stream = sibling(base, "send");
         [
@@ -951,6 +990,31 @@ esac"#;
         );
         let left = std::fs::read_dir(h.root.join("checkpoints/a1")).map(|d| d.count());
         assert_eq!(left.ok(), Some(0), "snapshots and stream deleted");
+    }
+
+    /// What a stopped gateway's queued compares left is found by agent and job; other names in
+    /// the checkpoint directories (checkpoints, labels, names that are no job id) are not.
+    #[test]
+    fn job_leftovers_lists_each_job_with_snapshots_once() {
+        let h = Host::new();
+        let (a1, a2) = (agent("a1"), agent("a2"));
+        let (j1, j2) = (JobId::from_random([4; 8]), JobId::from_random([5; 8]));
+        assert!(
+            ok(h.rt.job_leftovers()).is_empty(),
+            "no checkpoint root yet"
+        );
+        for id in [&a1, &a2] {
+            h.workspace(id, "x");
+        }
+        ok(h.rt.job_begin(&a1, &j1));
+        assert!(ok(h.rt.job_end(&a1, &j1)));
+        ok(h.rt.job_begin(&a2, &j2));
+        ok(h.rt.checkpoint(&a1, Some(&label("kept"))));
+        let _ = std::fs::write(h.root.join("checkpoints/a1/Not.A.Job.start"), "");
+        let _ = std::fs::create_dir_all(h.root.join("checkpoints/.hidden"));
+        let mut found = ok(h.rt.job_leftovers());
+        found.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        assert_eq!(found, [(a1, j1), (a2, j2)]);
     }
 
     /// Without an end snapshot (its creation failed) the compare is refused and the start one is

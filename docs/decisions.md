@@ -846,9 +846,11 @@ without trusting the agent.
   pipe is closed, the job gets no note and the journal says why. A purge (`DELETE ...?purge=true`) deletes
   every job snapshot itself, and btrfs refuses to delete a snapshot `send` reads: while one of the agent's
   listings runs the purge is refused (409, retry), and while the purge runs the agent's queued listings
-  wait (they find nothing after it). At start the listing thread queues the ended jobs whose snapshots a
-  stopped gateway left (`Jobs::queue_leftovers`); a job still queued or running keeps its own.
-- *Code:* `jobs::Changes` (begin, end, diff, discard) is a seam beside `JobRunner`, implemented by
+  wait (they find nothing after it); `ac-ctl destroy --purge` runs with the gateway stopped and needs no
+  hold. The supervisor's first tick, after its reconcile, queues the ended jobs whose snapshots a stopped
+  gateway left; a job still queued or running keeps its own, and an end snapshot or stream left without a
+  start one is deleted.
+- *Code:* `jobs::Changes` (begin, end, diff, discard, leftovers) is a seam beside `JobRunner`, implemented by
   `CtrRuntime` over `ac_ctr::snap` and faked in the job tests.
 
 **Consequences:**

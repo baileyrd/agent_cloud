@@ -364,12 +364,13 @@ impl<S: Spawner> CtrRuntime<S> {
     /// and never opens a path inside the workspace. Costs as much as the job made (an agent can
     /// make millions of empty files), so the gateway runs it on its own worker; the listing read
     /// in is capped at [`DUMP_CAP`]. Both snapshots and the stream are deleted, also on failure.
-    /// `None` when the job has no start snapshot.
+    /// `None` when the job has no start snapshot; an end snapshot or stream left without one (a
+    /// stop or a race cut a cleanup short) is deleted then too.
     pub fn job_changes(&self, id: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, PortError> {
         let op = "job changes";
         let base = self.checkpoints_dir(id).join(job.as_str());
         if self.volume_at(op, &sibling(&base, JOB_START))? == Volume::Missing {
-            return Ok(None);
+            return self.drop_job_snapshots(op, &base).map(|()| None);
         }
         let diffed = self.diff(op, &base);
         let cleanup = self.drop_job_snapshots(op, &base);
@@ -1015,6 +1016,30 @@ esac"#;
         let mut found = ok(h.rt.job_leftovers());
         found.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         assert_eq!(found, [(a1, j1), (a2, j2)]);
+    }
+
+    /// An end snapshot or stream left without its start snapshot is deleted by the compare that
+    /// finds no start, so a restart does not find it again forever. Red when `job_changes` returns
+    /// before cleaning up.
+    #[test]
+    fn a_lone_end_snapshot_or_stream_is_deleted() {
+        let h = Host::new();
+        let (a1, j1, j2) = (
+            agent("a1"),
+            JobId::from_random([6; 8]),
+            JobId::from_random([7; 8]),
+        );
+        h.workspace(&a1, "x");
+        ok(h.rt.job_begin(&a1, &j1));
+        assert!(ok(h.rt.job_end(&a1, &j1)));
+        let dir = h.root.join("checkpoints/a1");
+        ok(h.rt.remove_volume("test", &dir.join(format!("{j1}.start"))));
+        let _ = std::fs::write(dir.join(format!("{j2}.send")), "stream");
+        for (agent, job) in ok(h.rt.job_leftovers()) {
+            assert_eq!(ok(h.rt.job_changes(&agent, &job)), None);
+        }
+        assert!(ok(h.rt.job_leftovers()).is_empty());
+        assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).ok(), Some(0));
     }
 
     /// Without an end snapshot (its creation failed) the compare is refused and the start one is

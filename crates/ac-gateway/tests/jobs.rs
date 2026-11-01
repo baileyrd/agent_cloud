@@ -668,18 +668,57 @@ fn a_purge_waits_for_no_listing_and_holds_the_agents_queue() {
     assert_eq!(r.fake.w().ended, [first, other, held]);
 }
 
-/// Issue #26: compares still queued when the gateway stopped are queued again at the next start,
-/// so their snapshots do not stay until a purge; a job still running keeps its start snapshot.
+/// Issue #26: compares still queued when the gateway stopped are queued again by the next
+/// gateway's first tick, so their snapshots do not stay until a purge. A job still running keeps
+/// its start snapshot. A job that tick ends (its agent stopped with the host) is sealed first and
+/// noted once: the sweep runs after the reconcile on the same thread, never beside it, so no
+/// compare reads a job before its end snapshot exists.
 #[test]
-fn leftover_snapshots_of_ended_jobs_are_compared_at_start() {
+fn leftovers_are_compared_after_the_first_ticks_reconcile() {
     let r = rig();
-    let running = r.ok("a1", "x");
+    let (interrupted, running) = (r.ok("a1", "x"), r.ok("a2", "y"));
     r.jobs.tick();
+    let fake = r.fake.clone();
+    let mut r = r;
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    // The host restarts: a1's VM is gone, a2 is running again, and an ended job's snapshots
+    // were left behind by the stopped gateway.
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let _ = store.set_state(&agent("a1"), State::Paused);
     let gone = job_id("00000000000000aa");
-    r.fake.w().leftovers = vec![(agent("a1"), job_id(&running)), (agent("a2"), gone.clone())];
-    r.jobs.queue_leftovers();
+    fake.w()
+        .snapshots
+        .insert(gone.to_string(), vec!["old".into()]);
+    fake.w().leftovers = vec![
+        (agent("a1"), job_id(&interrupted)),
+        (agent("a2"), job_id(&running)),
+        (agent("a2"), gone.clone()),
+    ];
+    let r = with_store(store, fake, root);
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &interrupted), "interrupted");
     r.diff_all();
-    assert_eq!(r.fake.w().ended, [gone.to_string()]);
+    let w = r.fake.w();
+    assert_eq!(
+        w.sealed,
+        std::slice::from_ref(&interrupted),
+        "sealed before any compare"
+    );
+    assert!(
+        !w.ended.contains(&running),
+        "a running job keeps its snapshot"
+    );
+    assert!(w.snapshots.contains_key(&running));
+    assert!(w.ended.contains(&gone.to_string()));
+    drop(w);
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    let noted = notes
+        .iter()
+        .filter(|n| n.starts_with(&format!("a1: job {interrupted} changed")))
+        .count();
+    assert_eq!(noted, 1, "{notes:?}");
+    assert!(notes.contains(&"a2: job 00000000000000aa changed 1 path: old".to_owned()));
 }
 
 #[test]

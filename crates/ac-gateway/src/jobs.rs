@@ -563,6 +563,8 @@ pub struct Jobs {
     clock: Clock,
     limits: Limits,
     load: Option<Box<dyn HostLoad + Send + Sync>>,
+    /// The first tick has queued what an earlier run left ([`Jobs::queue_leftovers`]).
+    swept: AtomicBool,
     /// Why each queued job waited at the last tick (by job id).
     waits: Mutex<HashMap<String, Wait>>,
     /// The last pressure read failed (logged once per failure streak).
@@ -616,6 +618,7 @@ impl Jobs {
             clock: Box::new(now_ms),
             limits: Limits::OPEN,
             load: None,
+            swept: AtomicBool::new(false),
             waits: Mutex::new(HashMap::new()),
             blind: AtomicBool::new(false),
             book: Mutex::new(HashMap::new()),
@@ -815,9 +818,13 @@ impl Jobs {
     /// One supervisor step: end jobs of agents that stopped, poll or time out the running jobs,
     /// then start what the gate allows, oldest first ([`schedule::plan`]). Decisions use the
     /// snapshot taken at the start of the tick, so a job that just ended frees its agent and its
-    /// slot at the next tick. Called every second by the gateway.
+    /// slot at the next tick. Called every second by the gateway. The first tick also queues the
+    /// compares an earlier run left.
     pub fn tick(&self) {
         self.reconcile();
+        if !self.swept.swap(true, Ordering::SeqCst) {
+            self.queue_leftovers();
+        }
         let mut active = match self.store.active_jobs() {
             Ok(all) => all,
             Err(e) => {
@@ -1060,9 +1067,10 @@ impl Jobs {
 
     /// Queue the compare of every ended job whose snapshots are still on disk: a gateway stopped
     /// with compares queued leaves them, and nothing else would delete them before a purge. Jobs
-    /// still queued or running keep theirs. Run once at startup, off the startup path; a job the
-    /// first tick ends in the meantime may be queued twice, and its second compare finds nothing.
-    pub fn queue_leftovers(&self) {
+    /// still queued or running keep theirs. Run by the first tick after its reconcile, so every job
+    /// that tick ended already has its end snapshot; such a job is queued twice, and its second
+    /// compare finds nothing.
+    fn queue_leftovers(&self) {
         let Some(changes) = &self.changes else {
             return;
         };

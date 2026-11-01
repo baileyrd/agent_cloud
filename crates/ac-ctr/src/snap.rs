@@ -31,6 +31,10 @@ const LABEL_SUFFIX: &str = "label";
 /// can have, so they are neither listed nor counted under the cap.
 const JOB_START: &str = "start";
 const JOB_END: &str = "end";
+/// Most bytes of `btrfs receive --dump` read for a job's changes. A metadata-only listing takes a
+/// few hundred bytes a path, so this is some hundred thousand paths; a job that changed more gets
+/// no note (logged) rather than the gateway holding a listing of any size.
+pub const DUMP_CAP: usize = 64 << 20;
 
 /// How the adapter tells what is on disk. Tests swap in their own.
 #[derive(Clone, Copy)]
@@ -342,46 +346,71 @@ impl<S: Spawner> CtrRuntime<S> {
         self.snapshot(op, &ws, &sibling(&dir.join(job.as_str()), JOB_START), true)
     }
 
+    /// Snapshot `id`'s workspace read-only as job `job` ends, for [`Self::job_changes`]. One
+    /// snapshot, whatever the job made, so it may run on the job supervisor's thread. `false`
+    /// when the job has no start snapshot, so there is nothing to compare.
+    pub fn job_end(&self, id: &AgentId, job: &JobId) -> Result<bool, PortError> {
+        let op = "job end snapshot";
+        let base = self.checkpoints_dir(id).join(job.as_str());
+        if self.volume_at(op, &sibling(&base, JOB_START))? == Volume::Missing {
+            return Ok(false);
+        }
+        self.snapshot(op, &self.workspace(id), &sibling(&base, JOB_END), true)?;
+        Ok(true)
+    }
+
     /// The workspace paths job `job` changed ([`changes::paths`]): its start snapshot compared
-    /// with one taken now, by `btrfs send --no-data`, which reads metadata only and never opens a
-    /// path inside the workspace. Both snapshots are deleted, also on failure. `None` when the job
-    /// has no start snapshot.
+    /// with its end one ([`Self::job_end`]), by `btrfs send --no-data`, which reads metadata only
+    /// and never opens a path inside the workspace. Costs as much as the job made (an agent can
+    /// make millions of empty files), so the gateway runs it on its own worker; the listing read
+    /// in is capped at [`DUMP_CAP`]. Both snapshots and the stream are deleted, also on failure.
+    /// `None` when the job has no start snapshot.
     pub fn job_changes(&self, id: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, PortError> {
         let op = "job changes";
         let base = self.checkpoints_dir(id).join(job.as_str());
-        let (start, end) = (sibling(&base, JOB_START), sibling(&base, JOB_END));
-        if self.volume_at(op, &start)? == Volume::Missing {
+        if self.volume_at(op, &sibling(&base, JOB_START))? == Volume::Missing {
             return Ok(None);
         }
-        let stream = sibling(&base, "send");
-        let diffed = self.diff(op, &self.workspace(id), &start, &end, &stream);
-        let cleanup = [
-            self.remove_volume(op, &end),
-            self.remove_volume(op, &start),
-            match std::fs::remove_file(&stream) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_fail(op, "rm", &stream, e)),
-                _ => Ok(()),
-            },
-        ]
-        .into_iter()
-        .collect::<Result<(), _>>();
+        let diffed = self.diff(op, &base);
+        let cleanup = self.drop_job_snapshots(op, &base);
         match diffed {
             Ok(paths) => cleanup.map(|()| Some(paths)),
             Err(e) => Err(crate::with_cleanup(e, cleanup)),
         }
     }
 
-    /// Snapshot `ws` to `end`, write the incremental send from its earlier snapshot `start` to
-    /// `stream`, and list what changed.
-    fn diff(
-        &self,
-        op: &'static str,
-        ws: &Path,
-        start: &Path,
-        end: &Path,
-        stream: &Path,
-    ) -> Result<Vec<String>, PortError> {
-        self.snapshot(op, ws, end, true)?;
+    /// Delete job `job`'s snapshots and stream, if any, without comparing them (a job that was
+    /// refused its start).
+    pub fn job_discard(&self, id: &AgentId, job: &JobId) -> Result<(), PortError> {
+        let base = self.checkpoints_dir(id).join(job.as_str());
+        self.drop_job_snapshots("job discard", &base)
+    }
+
+    fn drop_job_snapshots(&self, op: &'static str, base: &Path) -> Result<(), PortError> {
+        let stream = sibling(base, "send");
+        [
+            self.remove_volume(op, &sibling(base, JOB_END)),
+            self.remove_volume(op, &sibling(base, JOB_START)),
+            match std::fs::remove_file(&stream) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_fail(op, "rm", &stream, e)),
+                _ => Ok(()),
+            },
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Write the incremental send from `<base>.start` to `<base>.end` to `<base>.send`, and list
+    /// what changed.
+    fn diff(&self, op: &'static str, base: &Path) -> Result<Vec<String>, PortError> {
+        let (start, end) = (sibling(base, JOB_START), sibling(base, JOB_END));
+        let stream = sibling(base, "send");
+        if self.volume_at(op, &end)? == Volume::Missing {
+            return Err(PortError {
+                op,
+                cause: format!("no end snapshot {}", end.display()),
+            });
+        }
         let flags = ["send", "-q", "--no-data", "-p"].map(OsStr::new);
         let mut args = flags.to_vec();
         args.extend([
@@ -393,7 +422,8 @@ impl<S: Spawner> CtrRuntime<S> {
         self.btrfs(op, &args)?;
         let mut dump = os(&["receive", "--dump", "-f"]);
         dump.push(stream.as_os_str().to_owned());
-        let out = self.run(op, OsStr::new(&self.cfg.btrfs_bin), &dump, None)?;
+        let btrfs = OsStr::new(&self.cfg.btrfs_bin);
+        let out = self.run_capped(op, btrfs, &dump, None, self.dump_cap)?;
         Ok(changes::paths(&String::from_utf8_lossy(&out)))
     }
 }
@@ -870,8 +900,13 @@ esac"#;
         let (a1, job) = (agent("a1"), JobId::from_random([1; 8]));
         h.workspace(&a1, "x");
         assert_eq!(ok(h.rt.job_changes(&a1, &job)), None, "no start snapshot");
+        assert!(
+            !ok(h.rt.job_end(&a1, &job)),
+            "nothing to end without a start"
+        );
         ok(h.rt.job_begin(&a1, &job));
         assert!(ok(h.rt.checkpoints(&a1)).is_empty(), "not a checkpoint");
+        assert!(ok(h.rt.job_end(&a1, &job)));
         assert_eq!(ok(h.rt.job_changes(&a1, &job)), Some(vec!["file".into()]));
         let dir = h.root.join("checkpoints/a1");
         let left: Vec<_> = std::fs::read_dir(&dir)
@@ -895,6 +930,69 @@ esac"#;
         ok(h.rt.job_begin(&a1, &job));
         ok(h.rt.purge(&a1));
         assert!(!dir.exists());
+    }
+
+    /// Issue #26: a job that changed more than the cap allows gets an error, not a listing of any
+    /// size in the gateway, and its snapshots and stream are still deleted. Red without the cap
+    /// (the whole dump read in, as on 9368efb).
+    #[test]
+    fn job_changes_refuse_a_listing_over_the_cap_and_still_clean_up() {
+        let mut h = Host::new();
+        h.rt.dump_cap = 10;
+        let (a1, job) = (agent("a1"), JobId::from_random([2; 8]));
+        h.workspace(&a1, "x");
+        ok(h.rt.job_begin(&a1, &job));
+        assert!(ok(h.rt.job_end(&a1, &job)));
+        let err = h.rt.job_changes(&a1, &job).err().map(|e| e.cause);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("output over 10 bytes")),
+            "{err:?}"
+        );
+        let left = std::fs::read_dir(h.root.join("checkpoints/a1")).map(|d| d.count());
+        assert_eq!(left.ok(), Some(0), "snapshots and stream deleted");
+    }
+
+    /// Without an end snapshot (its creation failed) the compare is refused and the start one is
+    /// deleted anyway; a discard deletes both without comparing.
+    #[test]
+    fn job_changes_without_an_end_and_discard_clean_up() {
+        let h = Host::new();
+        let (a1, job) = (agent("a1"), JobId::from_random([3; 8]));
+        h.workspace(&a1, "x");
+        ok(h.rt.job_begin(&a1, &job));
+        let err = h.rt.job_changes(&a1, &job).err().map(|e| e.cause);
+        assert!(err.is_some_and(|e| e.contains("no end snapshot")));
+        let dir = h.root.join("checkpoints/a1");
+        assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).ok(), Some(0));
+        ok(h.rt.job_begin(&a1, &job));
+        assert!(ok(h.rt.job_end(&a1, &job)));
+        ok(h.rt.job_discard(&a1, &job));
+        assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).ok(), Some(0));
+        assert!(
+            !h.log().iter().any(|l| l.starts_with("send")),
+            "never compared"
+        );
+        ok(h.rt.job_discard(&a1, &job));
+    }
+
+    /// A capped run stops reading at the cap and the program ends (on SIGPIPE) instead of the
+    /// read going on for as long as the program writes. Bounded: `yes` never stops by itself.
+    #[test]
+    fn a_capped_run_closes_the_pipe_and_returns() {
+        let h = Host::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = h.rt.run_capped("t", OsStr::new("yes"), &[], None, 1 << 16);
+            let _ = tx.send(r.err().map(|e| e.cause));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(
+            got.as_ref().is_ok_and(|e| e
+                .as_deref()
+                .is_some_and(|e| e.contains("output over 65536"))),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -973,6 +1071,8 @@ esac"#;
         let _ = std::fs::write(ws.join("file"), "edited");
         let _ = std::fs::create_dir(ws.join("new dir"));
         let _ = std::fs::write(ws.join("new dir/f"), "n");
+        assert!(ok(rt.job_end(&a1, &job)));
+        let _ = std::fs::write(ws.join("after"), "not this job's");
         let changed = ok(rt.job_changes(&a1, &job));
         assert_eq!(
             changed,

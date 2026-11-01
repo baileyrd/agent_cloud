@@ -22,9 +22,12 @@
 //!
 //! What a started job changed (ADR-019) is noted in the agent's history when it ends: [`Changes`]
 //! compares workspace snapshots from its start and end, which btrfs does without root opening a
-//! path inside the workspace.
+//! path inside the workspace. Only the end snapshot is taken as the job ends. The compare costs as
+//! much as the job made, so it never runs on the supervisor's thread, under the lifecycle lock or
+//! before the gateway is ready: ended jobs queue for [`Jobs::diff_next`], which the gateway runs
+//! on a thread of its own, one compare at a time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -220,9 +223,15 @@ pub trait JobRunner: Send + Sync + 'static {
 pub trait Changes: Send + Sync + 'static {
     /// Snapshot the agent's workspace as `job` starts; nothing, and `Ok`, where it cannot be.
     fn begin(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
-    /// The paths changed since [`Changes::begin`], whose snapshot is then deleted; `None` if it
-    /// took none.
-    fn end(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String>;
+    /// Snapshot it as `job` ends: one snapshot, whatever the job made. `false` if [`Changes::begin`]
+    /// took none, so there is nothing to compare.
+    fn end(&self, agent: &AgentId, job: &JobId) -> Result<bool, String>;
+    /// The paths changed between the two, which are then deleted, also on failure; `None` if
+    /// there was no start snapshot. Costs as much as the job made: never on the supervisor's
+    /// thread or under a lock.
+    fn diff(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String>;
+    /// Delete the job's snapshots without comparing them.
+    fn discard(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
 }
 
 impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
@@ -230,8 +239,16 @@ impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
         self.job_begin(agent, job).map_err(|e| e.to_string())
     }
 
-    fn end(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+    fn end(&self, agent: &AgentId, job: &JobId) -> Result<bool, String> {
+        self.job_end(agent, job).map_err(|e| e.to_string())
+    }
+
+    fn diff(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
         self.job_changes(agent, job).map_err(|e| e.to_string())
+    }
+
+    fn discard(&self, agent: &AgentId, job: &JobId) -> Result<(), String> {
+        self.job_discard(agent, job).map_err(|e| e.to_string())
     }
 }
 
@@ -547,6 +564,9 @@ pub struct Jobs {
     book: Mutex<HashMap<String, u64>>,
     changed: Condvar,
     waiters: AtomicUsize,
+    /// Ended jobs whose changes are still to be compared, oldest first ([`Jobs::diff_next`]).
+    diffs: Mutex<VecDeque<(AgentId, JobId)>>,
+    queued: Condvar,
 }
 
 impl Jobs {
@@ -575,6 +595,8 @@ impl Jobs {
             book: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
             waiters: AtomicUsize::new(0),
+            diffs: Mutex::new(VecDeque::new()),
+            queued: Condvar::new(),
         }
     }
 
@@ -585,7 +607,7 @@ impl Jobs {
     }
 
     /// Note in the agent's history which paths each started job changed, found by `changes`
-    /// (ADR-019). Without this, no change notes.
+    /// (ADR-019) on whichever thread calls [`Jobs::diff_next`]. Without this, no change notes.
     pub fn with_changes(mut self, changes: impl Changes) -> Self {
         self.changes = Some(Box::new(changes));
         self
@@ -914,7 +936,7 @@ impl Jobs {
             .transition(&j.agent, &j.id, JobEvent::Start, None)
             .is_err()
         {
-            if let Some(Err(e)) = self.changes.as_ref().map(|c| c.end(&j.agent, &j.id)) {
+            if let Some(Err(e)) = self.changes.as_ref().map(|c| c.discard(&j.agent, &j.id)) {
                 eprintln!("ac-gateway: jobs: {}/{}: drop snapshot: {e}", j.agent, j.id);
             }
             return;
@@ -950,14 +972,26 @@ impl Jobs {
     }
 
     /// Apply `event` to a job under the lock, persist it, prune old jobs if it ended, note it in
-    /// the agent's history and wake long-polls. A started job that ended then gets its change
-    /// note, outside the lock.
+    /// the agent's history and wake long-polls. A started job that ended then gets its end
+    /// snapshot, outside the lock, and is queued for its change note.
     fn transition(
         &self,
         agent: &AgentId,
         id: &JobId,
         event: JobEvent,
         reason: Option<&str>,
+    ) -> Result<Job, Reply> {
+        self.step(agent, id, event, reason, Ending::Compare)
+    }
+
+    /// [`Jobs::transition`], with what to do about a started job's snapshots if it ends.
+    fn step(
+        &self,
+        agent: &AgentId,
+        id: &JobId,
+        event: JobEvent,
+        reason: Option<&str>,
+        ending: Ending,
     ) -> Result<Job, Reply> {
         let mut book = self.lock();
         let mut j = self.find(agent, id)?;
@@ -987,22 +1021,53 @@ impl Jobs {
         }
         drop(book);
         self.changed.notify_all();
-        if was == JobState::Running && j.state.is_terminal() {
-            self.note_changes(&j);
+        if was == JobState::Running && j.state.is_terminal() && ending == Ending::Compare {
+            self.seal(&j);
         }
         Ok(j)
     }
 
-    /// Note in `j`'s agent's history which paths it changed, if a start snapshot was taken.
-    fn note_changes(&self, j: &Job) {
+    /// Take `j`'s end snapshot and queue it for its change note, if a start snapshot was taken.
+    /// A failed end snapshot is queued too, so the compare deletes the start one.
+    fn seal(&self, j: &Job) {
         let Some(changes) = &self.changes else {
             return;
         };
         match changes.end(&j.agent, &j.id) {
-            Ok(Some(paths)) => (self.notes)(&j.agent, &change_note(&j.id, &paths)),
-            Ok(None) => {}
-            Err(e) => eprintln!("ac-gateway: jobs: {}/{}: changes: {e}", j.agent, j.id),
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(e) => eprintln!("ac-gateway: jobs: {}/{}: end snapshot: {e}", j.agent, j.id),
         }
+        self.queue().push_back((j.agent.clone(), j.id.clone()));
+        self.queued.notify_one();
+    }
+
+    /// Compare the oldest ended job's snapshots and note in its agent's history which paths it
+    /// changed, waiting up to `wait` for one to be queued. Whether there was one. The gateway
+    /// calls this in a loop on a thread of its own, so one job's large compare delays only the
+    /// notes queued behind it.
+    pub fn diff_next(&self, wait: Duration) -> bool {
+        let next = {
+            let queue = self.queue();
+            let (mut queue, _) = self
+                .queued
+                .wait_timeout_while(queue, wait, |q| q.is_empty())
+                .unwrap_or_else(|e| e.into_inner());
+            queue.pop_front()
+        };
+        let (Some((agent, id)), Some(changes)) = (next, &self.changes) else {
+            return false;
+        };
+        match changes.diff(&agent, &id) {
+            Ok(Some(paths)) => (self.notes)(&agent, &change_note(&id, &paths)),
+            Ok(None) => {}
+            Err(e) => eprintln!("ac-gateway: jobs: {agent}/{id}: changes: {e}"),
+        }
+        true
+    }
+
+    fn queue(&self) -> MutexGuard<'_, VecDeque<(AgentId, JobId)>> {
+        self.diffs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keep the newest [`KEEP`] finished jobs of `agent`. Called with the lock held.
@@ -1074,7 +1139,16 @@ impl Busy for Jobs {
             .is_ok_and(|jobs| jobs.iter().any(|j| !j.state.is_terminal()))
     }
 
-    fn interrupt(&self, id: &AgentId) {
+    fn interrupt(&self, id: &AgentId, purge: bool) {
+        // A purge deletes every job snapshot of the agent itself: compares still queued for it
+        // would only race that, and the jobs ended here get none.
+        let ending = match purge {
+            true => {
+                self.queue().retain(|(agent, _)| agent != id);
+                Ending::Discard
+            }
+            false => Ending::Compare,
+        };
         let Ok(jobs) = self.store.jobs(id) else {
             return;
         };
@@ -1084,11 +1158,12 @@ impl Busy for Jobs {
                     eprintln!("ac-gateway: jobs: {id}/{}: interrupt kill: {e}", j.id);
                 }
             }
-            let _ = self.transition(
+            let _ = self.step(
                 id,
                 &j.id,
                 JobEvent::Interrupt,
                 Some("agent paused or destroyed"),
+                ending,
             );
         }
     }
@@ -1102,6 +1177,15 @@ impl Busy for Jobs {
         }
         let _ = std::fs::remove_dir_all(self.dir.join(id.as_str()));
     }
+}
+
+/// What becomes of a started job's snapshots when it ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// Take the end snapshot and queue the compare (ADR-019).
+    Compare,
+    /// Leave them to the purge that follows.
+    Discard,
 }
 
 /// The value of `name` in a query string.

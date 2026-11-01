@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ac_ctr::{CtrConfig, CtrRuntime};
@@ -52,16 +52,47 @@ struct World {
     start_fails: bool,
     /// Jobs with a start snapshot, and what each changed.
     snapshots: HashMap<String, Vec<String>>,
-    /// Jobs whose changes were asked for, in order.
+    /// Jobs whose end snapshot was taken, in order.
+    sealed: Vec<String>,
+    /// Jobs whose changes were compared, in order.
     ended: Vec<String>,
+    /// Jobs whose snapshots were dropped uncompared.
+    discarded: Vec<String>,
 }
 
 #[derive(Clone, Default)]
-struct Fake(Arc<Mutex<World>>);
+struct Fake(Arc<Mutex<World>>, Arc<Gate>);
+
+/// Holds the fake's change listing until released, standing in for a `btrfs send` and dump of a
+/// job that made millions of files. Bounded, so a test that never releases it cannot hang.
+#[derive(Default)]
+struct Gate {
+    held: Mutex<bool>,
+    open: Condvar,
+}
+
+impl Gate {
+    fn hold(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    fn release(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.open.notify_all();
+    }
+    fn pass(&self) {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .open
+            .wait_timeout_while(held, Duration::from_secs(10), |h| *h);
+    }
+}
 
 impl Fake {
     fn w(&self) -> std::sync::MutexGuard<'_, World> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn gate(&self) -> &Gate {
+        &self.1
     }
     fn set(&self, job: &str, p: Probe) {
         self.w().status.insert(job.to_owned(), p);
@@ -129,10 +160,22 @@ impl Changes for Fake {
         self.w().snapshots.insert(job.to_string(), paths);
         Ok(())
     }
-    fn end(&self, _: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+    fn end(&self, _: &AgentId, job: &JobId) -> Result<bool, String> {
+        let mut w = self.w();
+        w.sealed.push(job.to_string());
+        Ok(w.snapshots.contains_key(job.as_str()))
+    }
+    fn diff(&self, _: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+        self.gate().pass();
         let mut w = self.w();
         w.ended.push(job.to_string());
         Ok(w.snapshots.remove(job.as_str()))
+    }
+    fn discard(&self, _: &AgentId, job: &JobId) -> Result<(), String> {
+        let mut w = self.w();
+        w.discarded.push(job.to_string());
+        w.snapshots.remove(job.as_str());
+        Ok(())
     }
 }
 
@@ -289,6 +332,11 @@ impl Rig {
         self.clock.fetch_add(ms, Ordering::SeqCst);
     }
 
+    /// Compare every queued job's changes, as the gateway's diff thread does.
+    fn diff_all(&self) {
+        while self.jobs.diff_next(Duration::ZERO) {}
+    }
+
     /// Tick past the least time between marker-prompted probes.
     fn tick(&self) {
         self.advance(5_000);
@@ -410,6 +458,7 @@ fn history_notes_carry_ids_and_states_only() {
     r.jobs.tick();
     r.fake.set(&id, Probe::Exited(Some(3)));
     r.tick();
+    r.diff_all();
     let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
     assert_eq!(
         notes,
@@ -436,10 +485,22 @@ fn started_jobs_note_what_they_changed_and_drop_their_snapshot() {
     assert_eq!(cancel(&queued).0, 200);
     r.fake.set(&done, Probe::Exited(Some(0)));
     r.tick();
+    assert_eq!(
+        r.fake.w().sealed,
+        std::slice::from_ref(&done),
+        "end snapshot taken as it ends"
+    );
+    assert!(
+        r.fake.w().ended.is_empty(),
+        "compared off the supervisor's thread"
+    );
     r.fake.w().start_fails = true;
     let unstarted = r.ok("a1", "c");
     r.jobs.tick();
+    r.diff_all();
+    assert!(!r.jobs.diff_next(Duration::ZERO), "queue drained");
     let w = r.fake.w();
+    assert_eq!(w.sealed, [done.clone(), unstarted.clone()]);
     assert_eq!(w.ended, [done, unstarted], "a never-started job has none");
     assert!(w.snapshots.is_empty(), "every snapshot dropped");
 }
@@ -468,6 +529,112 @@ fn change_notes_leave_out_the_runner_and_are_capped() {
         note.ends_with(&format!(" (and {} more)", 1000 - shown)),
         "{note}"
     );
+}
+
+/// Wait up to 5 s for `done`; whether it came.
+fn within_5s(done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Issue #26: listing what a job changed costs as much as the job made (an agent can make 10^6
+/// empty files), so it must not run on the supervisor's thread. While a1's listing is stuck, a2's
+/// job still times out on the next tick. Red when `transition` lists the changes inline, as on
+/// 9368efb: the first tick never returns, so the second never comes.
+#[test]
+fn a_stuck_change_listing_does_not_stall_other_agents_jobs() {
+    let r = Arc::new(rig());
+    let slow = r.ok("a1", "make a million files");
+    let (_, body) = r.submit("a2", r#"{"prompt":"x","timeout_secs":20}"#);
+    let other = field(&body, "job_id");
+    r.jobs.tick();
+    r.fake.gate().hold();
+    r.fake.set(&slow, Probe::Exited(Some(0)));
+    let supervisor = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || {
+            r.tick();
+            r.advance(21_000);
+            r.jobs.tick();
+        })
+    };
+    let timed_out = within_5s(|| r.state("a2", &other) == "timed_out");
+    let seen = r.get("a2", &other);
+    let differ = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || r.diff_all())
+    };
+    r.fake.gate().release();
+    let _ = (supervisor.join(), differ.join());
+    assert!(timed_out, "a2's job while a1's listing was stuck: {seen}");
+    assert_eq!(r.state("a1", &slow), "succeeded");
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    assert!(
+        notes.contains(&format!(
+            "a1: job {slow} changed 2 paths: src/main.rs src/.jobs"
+        )),
+        "noted once listed: {notes:?}"
+    );
+}
+
+/// Issue #26: a forced pause or destroy interrupts the agent's job under the lifecycle lock, so
+/// the interrupt must return without listing the job's changes, or every lifecycle call and the
+/// watchdog wait for it. Red when the listing runs inside `interrupt`, as on 9368efb.
+#[test]
+fn interrupt_returns_while_the_change_listing_is_stuck() {
+    let r = Arc::new(rig());
+    let running = r.ok("a1", "make a million files");
+    r.jobs.tick();
+    r.fake.gate().hold();
+    let lifecycle = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || r.jobs.interrupt(&agent("a1"), false))
+    };
+    let returned = within_5s(|| lifecycle.is_finished());
+    r.fake.gate().release();
+    let _ = lifecycle.join();
+    assert!(returned, "interrupt waited for the change listing");
+    assert_eq!(r.state("a1", &running), "interrupted");
+    assert_eq!(
+        r.fake.w().sealed,
+        std::slice::from_ref(&running),
+        "end snapshot taken before the VM goes"
+    );
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [running]);
+}
+
+/// A purge deletes every job snapshot itself: the job it interrupts gets no end snapshot or
+/// compare, and compares still queued for that agent are dropped, so none races the purge. Other
+/// agents' queued compares stay.
+#[test]
+fn a_purge_interrupt_compares_nothing_and_drops_the_agents_queue() {
+    let r = rig();
+    let first = r.ok("a1", "a");
+    let other = r.ok("a2", "b");
+    r.jobs.tick();
+    r.fake.set(&first, Probe::Exited(Some(0)));
+    r.fake.set(&other, Probe::Exited(Some(0)));
+    r.tick();
+    let second = r.ok("a1", "c");
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &second), "running");
+    r.jobs.interrupt(&agent("a1"), true);
+    assert_eq!(r.state("a1", &second), "interrupted");
+    r.diff_all();
+    let w = r.fake.w();
+    assert!(
+        !w.sealed.contains(&second),
+        "no end snapshot: {:?}",
+        w.sealed
+    );
+    assert_eq!(w.ended, [other], "a1's queued compare dropped, a2's kept");
 }
 
 #[test]
@@ -595,7 +762,7 @@ fn stopped_agent_interrupts_running_and_cancels_queued() {
     let other = r.ok("a2", "c");
     r.jobs.tick();
     assert!(r.jobs.busy(&agent("a1")));
-    r.jobs.interrupt(&agent("a1"));
+    r.jobs.interrupt(&agent("a1"), false);
     assert_eq!(
         r.fake.w().kills,
         std::slice::from_ref(&running),

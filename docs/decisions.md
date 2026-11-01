@@ -600,6 +600,10 @@ failed with connection refused, and every script and `ac-ctl tune --restart-gate
   0.18 s. The slower case is a1's VM killed too, so the reconcile pauses it and cleans up: 0.51, 0.66, 0.77 and
   1.11 s. 180 s outlasts one external command (`ctr`, `ip`, CNI) at its 120 s `command_timeout`, which the
   reconcile logs and serves through.
+- No job work before READY (issue #26): ending the jobs of agents a reboot stopped takes an end snapshot per
+  job (ADR-019), one external command each, so the job supervisor does it on its first tick, on its own thread,
+  started before READY and not waited for. Until that tick (well under a second) such a job can still read
+  `running`.
 
 **Evidence (2026-10-24, BaileyServ).** Before: `time systemctl restart ac-gateway && curl .../capacity` 0.04 s,
 then `curl: (7) ... Could not connect`. After: 0.88 s, then the capacity JSON. With systemd at debug level:
@@ -834,8 +838,16 @@ without trusting the agent.
   then `(and <k> more)`. It is shown by `GET .../history` and the `get_history` tool, with no new route.
 - *Where it cannot:* a plain-directory workspace takes no snapshot and gets no note; a failed snapshot or diff
   is logged to the journal and the job is unaffected.
-- *Code:* `jobs::Changes` (begin, end) is a seam beside `JobRunner`, implemented by `CtrRuntime` over
-  `ac_ctr::snap` and faked in the job tests.
+- *Off the supervisor (issue #26):* only the `<job>.end` snapshot is taken as the job ends, one snapshot
+  whatever the job made. The send, the dump and the deletes cost as much as the job made (an agent can make
+  10⁶ empty files), so the ended job is queued and a thread of the gateway's own lists it, one at a time
+  (`Jobs::diff_next`); never the job supervisor's thread, the lifecycle lock or startup before `READY=1`. The
+  dump read in is capped at 64 MiB (`ac_ctr::snap::DUMP_CAP`, some hundred thousand paths); past it the
+  pipe is closed, the job gets no note and the journal says why. A purge (`DELETE ...?purge=true`) deletes
+  every job snapshot itself, so the job it interrupts takes no end snapshot and listings still queued for
+  that agent are dropped.
+- *Code:* `jobs::Changes` (begin, end, diff, discard) is a seam beside `JobRunner`, implemented by
+  `CtrRuntime` over `ac_ctr::snap` and faked in the job tests.
 
 **Consequences:**
 - What a job did is known from the filesystem, not from the agent's account of it. The names are still
@@ -843,7 +855,10 @@ without trusting the agent.
 - A start snapshot keeps what the job deletes or rewrites on disk until it ends; the end snapshot lives only for
   the diff.
 - Each started job costs two snapshot creations and deletions, and a metadata send proportional to what changed.
-  A job interrupted by pause or destroy is diffed under the lifecycle lock, before the VM stops.
+  A job interrupted by pause or destroy gets its end snapshot under the lifecycle lock, before the VM stops;
+  it is listed afterwards, off the lock.
+- A note comes after the job's end state, by up to the listings queued ahead of it. A gateway stopped with
+  listings queued leaves their snapshots until a purge, as a crash mid-diff always did.
 - A change undone within the job (a file written then removed) can still be listed; a `touch` is not.
 
 **Not now:** a structured route for the summary (it would be one more `access::ROUTES` entry, ADR-020); keeping the start snapshot as a restorable checkpoint (ADR-018's "checkpoints before each job").

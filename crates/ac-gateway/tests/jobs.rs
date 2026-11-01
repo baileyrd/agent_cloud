@@ -727,6 +727,84 @@ fn a_purge_waits_for_no_listing_and_holds_the_agents_queue() {
     assert_eq!(r.fake.w().ended, [first, other, held]);
 }
 
+/// Issue #26 follow-up: change listings take turns per agent, so an agent with many large
+/// listings queued (a btrfs send takes about 44 s per million files) cannot delay another agent's
+/// note, or keep that agent's snapshots on disk, behind all of its own.
+#[test]
+fn change_listings_take_turns_per_agent() {
+    let r = rig();
+    let end = |agent: &str| {
+        let id = r.ok(agent, "x");
+        r.jobs.tick();
+        r.fake.set(&id, Probe::Exited(Some(0)));
+        r.tick();
+        id
+    };
+    let ones: Vec<String> = (0..3).map(|_| end("a1")).collect();
+    let two = end("a2");
+    r.diff_all();
+    assert_eq!(
+        r.fake.w().ended,
+        [ones[0].clone(), two, ones[1].clone(), ones[2].clone()],
+        "a2's one listing runs before a1's second"
+    );
+}
+
+/// PR #33 review: the turns repeat, so an agent's older listings still come before a later
+/// agent's later ones: [a1, a1, a1, a2, a2, a2] lists a1, a2, a1, a2, a1, a2.
+#[test]
+fn change_listings_alternate_over_several_turns() {
+    let r = rig();
+    let end = |agent: &str| {
+        let id = r.ok(agent, "x");
+        r.jobs.tick();
+        r.fake.set(&id, Probe::Exited(Some(0)));
+        r.tick();
+        id
+    };
+    let ones: Vec<String> = (0..3).map(|_| end("a1")).collect();
+    let twos: Vec<String> = (0..3).map(|_| end("a2")).collect();
+    r.diff_all();
+    let turns: Vec<String> = ones
+        .into_iter()
+        .zip(twos)
+        .flat_map(|(one, two)| [one, two])
+        .collect();
+    assert_eq!(r.fake.w().ended, turns);
+}
+
+/// PR #33 review (Codex): a job queued while another agent's listing runs gets the next turn: it
+/// waits for that listing only, not for another of that agent's queued ones.
+#[test]
+fn a_listing_queued_during_another_agents_gets_the_next_turn() {
+    let r = Arc::new(rig());
+    let end = |agent: &str| {
+        let id = r.ok(agent, "x");
+        r.jobs.tick();
+        r.fake.set(&id, Probe::Exited(Some(0)));
+        r.tick();
+        id
+    };
+    let ones: Vec<String> = (0..3).map(|_| end("a1")).collect();
+    r.fake.gate().hold();
+    let differ = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || r.jobs.diff_next(Duration::ZERO))
+    };
+    assert!(
+        within_5s(|| !r.fake.w().listing.is_empty()),
+        "a1's first listing began"
+    );
+    let two = end("a2");
+    r.fake.gate().release();
+    let _ = differ.join();
+    r.diff_all();
+    assert_eq!(
+        r.fake.w().ended,
+        [ones[0].clone(), two, ones[1].clone(), ones[2].clone()]
+    );
+}
+
 /// Issue #26: compares still queued when the gateway stopped are queued again by the next
 /// gateway's first tick, so their snapshots do not stay until a purge. A job still running keeps
 /// its start snapshot. A job that tick ends (its agent stopped with the host) is sealed first and

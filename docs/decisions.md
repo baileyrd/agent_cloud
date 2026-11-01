@@ -836,8 +836,9 @@ without trusting the agent.
 - *Note:* one history line after the job's end state, `job <id> changed <n> paths: <path> <path> ...`, the
   runner's own files (`.jobs/`, the root's `.job-*`) left out, at most `CHANGE_NOTE_CAP` (2 KiB) of paths and
   then `(and <k> more)`. It is shown by `GET .../history` and the `get_history` tool, with no new route.
-- *Where it cannot:* a plain-directory workspace takes no snapshot and gets no note; a failed snapshot or diff
-  is logged to the journal and the job is unaffected.
+- *Where it cannot:* a plain-directory workspace takes no snapshot and gets no note; a failed diff is logged to
+  the journal with its cause and noted as `job <id> changes could not be listed`, so a job cannot hide what it
+  did by making its listing fail; the job is unaffected.
 - *Off the supervisor (issue #26):* only the `<job>.end` snapshot is taken as the job ends, one snapshot
   whatever the job made. The send, the dump and the deletes cost as much as the job made (an agent can make
   10⁶ empty files), so the ended job is queued and a thread of the gateway's own lists it, one at a time

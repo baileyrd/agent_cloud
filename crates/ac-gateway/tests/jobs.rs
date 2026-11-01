@@ -63,6 +63,8 @@ struct World {
     discarded: Vec<String>,
     /// Every compare finds more than the listing cap holds.
     too_many: bool,
+    /// Every compare fails (a `btrfs send` that timed out).
+    diff_fails: bool,
     /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
     leftovers: Vec<(AgentId, JobId)>,
 }
@@ -177,6 +179,10 @@ impl Changes for Fake {
         self.gate().pass();
         let mut w = self.w();
         w.ended.push(job.to_string());
+        if w.diff_fails {
+            w.snapshots.remove(job.as_str());
+            return Err("btrfs send: timed out after 120 s".into());
+        }
         let too_many = w.too_many;
         Ok(w.snapshots
             .remove(job.as_str())
@@ -539,6 +545,24 @@ fn a_listing_over_the_cap_is_noted_as_too_many() {
         notes.contains(&format!("a1: job {id} changed too many paths to list")),
         "{notes:?}"
     );
+}
+
+/// Issue #26 review: a listing that fails (a `btrfs send` that a job's millions of files pushed
+/// past its timeout) still gets a history line, so a job cannot hide what it did by making the
+/// listing fail. The error itself (host paths, btrfs text) stays in the journal. Red at 055b803,
+/// where a failed listing was only logged.
+#[test]
+fn a_failed_listing_is_noted() {
+    let r = rig();
+    let id = r.ok("a1", "make the listing time out");
+    r.jobs.tick();
+    r.fake.w().diff_fails = true;
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    let last = notes.last().cloned().unwrap_or_default();
+    assert_eq!(last, format!("a1: job {id} changes could not be listed"));
 }
 
 #[test]

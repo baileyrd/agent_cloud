@@ -1221,7 +1221,12 @@ impl Jobs {
             Ok(Some(Changed::Paths(paths))) => (self.notes)(&agent, &change_note(&id, &paths)),
             Ok(Some(Changed::TooMany)) => (self.notes)(&agent, &too_many_note(&id)),
             Ok(None) => {}
-            Err(e) => eprintln!("ac-gateway: jobs: {agent}/{id}: changes: {e}"),
+            // Noted too, so a job cannot hide what it did by making its listing fail (a send
+            // timed out on millions of files); the cause, host paths and all, only in the log.
+            Err(e) => {
+                eprintln!("ac-gateway: jobs: {agent}/{id}: changes: {e}");
+                (self.notes)(&agent, &format!("job {id} changes could not be listed"));
+            }
         }
         self.queue().listing = None;
         true

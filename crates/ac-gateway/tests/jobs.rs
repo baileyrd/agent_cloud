@@ -7,10 +7,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ac_ctr::{CtrConfig, CtrRuntime};
+use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
@@ -52,16 +53,57 @@ struct World {
     start_fails: bool,
     /// Jobs with a start snapshot, and what each changed.
     snapshots: HashMap<String, Vec<String>>,
-    /// Jobs whose changes were asked for, in order.
+    /// Jobs whose end snapshot was taken, in order.
+    sealed: Vec<String>,
+    /// Jobs whose compare began, in order (before the gate).
+    listing: Vec<String>,
+    /// Jobs whose changes were compared, in order.
     ended: Vec<String>,
+    /// Jobs whose snapshots were dropped uncompared.
+    discarded: Vec<String>,
+    /// Every compare finds more than the listing cap holds.
+    too_many: bool,
+    /// Every compare fails (a `btrfs send` that timed out).
+    diff_fails: bool,
+    /// How many `leftovers` calls fail before one succeeds.
+    leftovers_fail: usize,
+    /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
+    leftovers: Vec<(AgentId, JobId)>,
 }
 
 #[derive(Clone, Default)]
-struct Fake(Arc<Mutex<World>>);
+struct Fake(Arc<Mutex<World>>, Arc<Gate>);
+
+/// Holds the fake's change listing until released, standing in for a `btrfs send` and dump of a
+/// job that made millions of files. Bounded, so a test that never releases it cannot hang.
+#[derive(Default)]
+struct Gate {
+    held: Mutex<bool>,
+    open: Condvar,
+}
+
+impl Gate {
+    fn hold(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    fn release(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.open.notify_all();
+    }
+    fn pass(&self) {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .open
+            .wait_timeout_while(held, Duration::from_secs(10), |h| *h);
+    }
+}
 
 impl Fake {
     fn w(&self) -> std::sync::MutexGuard<'_, World> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn gate(&self) -> &Gate {
+        &self.1
     }
     fn set(&self, job: &str, p: Probe) {
         self.w().status.insert(job.to_owned(), p);
@@ -129,10 +171,41 @@ impl Changes for Fake {
         self.w().snapshots.insert(job.to_string(), paths);
         Ok(())
     }
-    fn end(&self, _: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+    fn end(&self, _: &AgentId, job: &JobId) -> Result<bool, String> {
+        let mut w = self.w();
+        w.sealed.push(job.to_string());
+        Ok(w.snapshots.contains_key(job.as_str()))
+    }
+    fn diff(&self, _: &AgentId, job: &JobId) -> Result<Option<Changed>, String> {
+        self.w().listing.push(job.to_string());
+        self.gate().pass();
         let mut w = self.w();
         w.ended.push(job.to_string());
-        Ok(w.snapshots.remove(job.as_str()))
+        if w.diff_fails {
+            w.snapshots.remove(job.as_str());
+            return Err("btrfs send: timed out after 120 s".into());
+        }
+        let too_many = w.too_many;
+        Ok(w.snapshots
+            .remove(job.as_str())
+            .map(|paths| match too_many {
+                true => Changed::TooMany,
+                false => Changed::Paths(paths),
+            }))
+    }
+    fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String> {
+        let mut w = self.w();
+        if w.leftovers_fail > 0 {
+            w.leftovers_fail -= 1;
+            return Err("list checkpoints: Permission denied".into());
+        }
+        Ok(w.leftovers.clone())
+    }
+    fn discard(&self, _: &AgentId, job: &JobId) -> Result<(), String> {
+        let mut w = self.w();
+        w.discarded.push(job.to_string());
+        w.snapshots.remove(job.as_str());
+        Ok(())
     }
 }
 
@@ -289,6 +362,11 @@ impl Rig {
         self.clock.fetch_add(ms, Ordering::SeqCst);
     }
 
+    /// Compare every queued job's changes, as the gateway's diff thread does.
+    fn diff_all(&self) {
+        while self.jobs.diff_next(Duration::ZERO) {}
+    }
+
     /// Tick past the least time between marker-prompted probes.
     fn tick(&self) {
         self.advance(5_000);
@@ -410,6 +488,7 @@ fn history_notes_carry_ids_and_states_only() {
     r.jobs.tick();
     r.fake.set(&id, Probe::Exited(Some(3)));
     r.tick();
+    r.diff_all();
     let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
     assert_eq!(
         notes,
@@ -436,12 +515,61 @@ fn started_jobs_note_what_they_changed_and_drop_their_snapshot() {
     assert_eq!(cancel(&queued).0, 200);
     r.fake.set(&done, Probe::Exited(Some(0)));
     r.tick();
+    assert_eq!(
+        r.fake.w().sealed,
+        std::slice::from_ref(&done),
+        "end snapshot taken as it ends"
+    );
+    assert!(
+        r.fake.w().ended.is_empty(),
+        "compared off the supervisor's thread"
+    );
     r.fake.w().start_fails = true;
     let unstarted = r.ok("a1", "c");
     r.jobs.tick();
+    r.diff_all();
+    assert!(!r.jobs.diff_next(Duration::ZERO), "queue drained");
     let w = r.fake.w();
+    assert_eq!(w.sealed, [done.clone(), unstarted.clone()]);
     assert_eq!(w.ended, [done, unstarted], "a never-started job has none");
     assert!(w.snapshots.is_empty(), "every snapshot dropped");
+}
+
+/// Issue #26 review: a job whose listing is over the cap (a few hundred thousand files) still gets
+/// a history line saying it changed too many paths to list, so it cannot hide what it did by
+/// making many files. Red at 4c674da, where the over-cap listing was an error and only logged.
+#[test]
+fn a_listing_over_the_cap_is_noted_as_too_many() {
+    let r = rig();
+    let id = r.ok("a1", "make a million files");
+    r.jobs.tick();
+    r.fake.w().too_many = true;
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    assert!(
+        notes.contains(&format!("a1: job {id} changed too many paths to list")),
+        "{notes:?}"
+    );
+}
+
+/// Issue #26 review: a listing that fails (a `btrfs send` that a job's millions of files pushed
+/// past its timeout) still gets a history line, so a job cannot hide what it did by making the
+/// listing fail. The error itself (host paths, btrfs text) stays in the journal. Red at 055b803,
+/// where a failed listing was only logged.
+#[test]
+fn a_failed_listing_is_noted() {
+    let r = rig();
+    let id = r.ok("a1", "make the listing time out");
+    r.jobs.tick();
+    r.fake.w().diff_fails = true;
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    let last = notes.last().cloned().unwrap_or_default();
+    assert_eq!(last, format!("a1: job {id} changes could not be listed"));
 }
 
 #[test]
@@ -468,6 +596,302 @@ fn change_notes_leave_out_the_runner_and_are_capped() {
         note.ends_with(&format!(" (and {} more)", 1000 - shown)),
         "{note}"
     );
+}
+
+/// Wait up to 5 s for `done`; whether it came.
+fn within_5s(done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Issue #26: listing what a job changed costs as much as the job made (an agent can make 10^6
+/// empty files), so it must not run on the supervisor's thread. While a1's listing is stuck, a2's
+/// job still times out on the next tick. Red when `transition` lists the changes inline, as on
+/// 9368efb: the first tick never returns, so the second never comes.
+#[test]
+fn a_stuck_change_listing_does_not_stall_other_agents_jobs() {
+    let r = Arc::new(rig());
+    let slow = r.ok("a1", "make a million files");
+    let (_, body) = r.submit("a2", r#"{"prompt":"x","timeout_secs":20}"#);
+    let other = field(&body, "job_id");
+    r.jobs.tick();
+    r.fake.gate().hold();
+    r.fake.set(&slow, Probe::Exited(Some(0)));
+    let supervisor = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || {
+            r.tick();
+            r.advance(21_000);
+            r.jobs.tick();
+        })
+    };
+    let timed_out = within_5s(|| r.state("a2", &other) == "timed_out");
+    let seen = r.get("a2", &other);
+    let differ = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || r.diff_all())
+    };
+    r.fake.gate().release();
+    let _ = (supervisor.join(), differ.join());
+    assert!(timed_out, "a2's job while a1's listing was stuck: {seen}");
+    assert_eq!(r.state("a1", &slow), "succeeded");
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    assert!(
+        notes.contains(&format!(
+            "a1: job {slow} changed 2 paths: src/main.rs src/.jobs"
+        )),
+        "noted once listed: {notes:?}"
+    );
+}
+
+/// Issue #26: a forced pause or destroy interrupts the agent's job under the lifecycle lock, so
+/// the interrupt must return without listing the job's changes, or every lifecycle call and the
+/// watchdog wait for it. Red when the listing runs inside `interrupt`, as on 9368efb.
+#[test]
+fn interrupt_returns_while_the_change_listing_is_stuck() {
+    let r = Arc::new(rig());
+    let running = r.ok("a1", "make a million files");
+    r.jobs.tick();
+    r.fake.gate().hold();
+    let lifecycle = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || r.jobs.interrupt(&agent("a1")))
+    };
+    let returned = within_5s(|| lifecycle.is_finished());
+    r.fake.gate().release();
+    let _ = lifecycle.join();
+    assert!(returned, "interrupt waited for the change listing");
+    assert_eq!(r.state("a1", &running), "interrupted");
+    assert_eq!(
+        r.fake.w().sealed,
+        std::slice::from_ref(&running),
+        "end snapshot taken before the VM goes"
+    );
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [running]);
+}
+
+/// A purge deletes the snapshots a compare reads, and btrfs refuses to delete one that `send`
+/// reads. So while one of the agent's compares runs the purge is refused (409, nothing changed),
+/// and while the purge runs the agent's queued compares wait; other agents' do not. Red if the
+/// route purges without holding the agent's compares (`vacate` before this fix).
+#[test]
+fn a_purge_waits_for_no_listing_and_holds_the_agents_queue() {
+    let r = Arc::new(rig());
+    let addr = serve(&r);
+    let end = |agent: &str| {
+        let id = r.ok(agent, "x");
+        r.jobs.tick();
+        r.fake.set(&id, Probe::Exited(Some(0)));
+        r.tick();
+        id
+    };
+    let first = end("a1");
+    r.fake.gate().hold();
+    let differ = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || r.jobs.diff_next(Duration::ZERO))
+    };
+    assert!(
+        within_5s(|| !r.fake.w().listing.is_empty()),
+        "a1's compare began"
+    );
+    let (status, _, body) = request(
+        addr,
+        "DELETE",
+        "/api/v1/agents/a1?purge=true&force=true",
+        "",
+    );
+    r.fake.gate().release();
+    let _ = differ.join();
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("still being listed"), "{body}");
+    assert_eq!(
+        r.store.state(&agent("a1")).ok().flatten(),
+        Some(State::Running)
+    );
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&first));
+    // Held: a1's queued compare waits out the purge, a2's runs.
+    let (held, other) = (end("a1"), end("a2"));
+    assert!(r.jobs.hold(&agent("a1")));
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [first.clone(), other.clone()]);
+    r.jobs.release(&agent("a1"));
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [first, other, held]);
+}
+
+/// Issue #26: compares still queued when the gateway stopped are queued again by the next
+/// gateway's first tick, so their snapshots do not stay until a purge. A job still running keeps
+/// its start snapshot. A job that tick ends (its agent stopped with the host) is sealed first and
+/// noted once. A guard, not a regression test: the race it rules out needed the sweep on another
+/// thread, beside the reconcile.
+#[test]
+fn leftovers_are_compared_after_the_first_ticks_reconcile() {
+    let r = rig();
+    let (interrupted, running) = (r.ok("a1", "x"), r.ok("a2", "y"));
+    r.jobs.tick();
+    let fake = r.fake.clone();
+    let mut r = r;
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    // The host restarts: a1's VM is gone, a2 is running again, and an ended job's snapshots
+    // were left behind by the stopped gateway.
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let _ = store.set_state(&agent("a1"), State::Paused);
+    let gone = job_id("00000000000000aa");
+    fake.w()
+        .snapshots
+        .insert(gone.to_string(), vec!["old".into()]);
+    fake.w().leftovers = vec![
+        (agent("a1"), job_id(&interrupted)),
+        (agent("a2"), job_id(&running)),
+        (agent("a2"), gone.clone()),
+    ];
+    let r = with_store(store, fake, root);
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &interrupted), "interrupted");
+    r.diff_all();
+    let w = r.fake.w();
+    assert_eq!(
+        w.sealed,
+        std::slice::from_ref(&interrupted),
+        "sealed before any compare"
+    );
+    assert!(
+        !w.ended.contains(&running),
+        "a running job keeps its snapshot"
+    );
+    assert!(w.snapshots.contains_key(&running));
+    assert!(w.ended.contains(&gone.to_string()));
+    drop(w);
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    let noted = notes
+        .iter()
+        .filter(|n| n.starts_with(&format!("a1: job {interrupted} changed")))
+        .count();
+    assert_eq!(noted, 1, "{notes:?}");
+    assert!(notes.contains(&"a2: job 00000000000000aa changed 1 path: old".to_owned()));
+}
+
+/// A job a caller ends while the first tick sweeps leftovers is this run's: its own transition
+/// seals and queues it, so the sweep leaves it alone. Red when the sweep queues every ended job
+/// (ce9eec6): the job is compared twice, and had the cancel still been taking its end snapshot,
+/// the sweep's compare would have deleted its start one and lost the note.
+#[test]
+fn the_sweep_leaves_jobs_ended_in_this_run() {
+    let r = rig();
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    let fake = r.fake.clone();
+    let mut r = r;
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let r = with_store(store, fake, root);
+    let (status, body) = r.json(Route::Cancel(agent("a1"), job_id(&id)), "");
+    assert_eq!(status, 200, "{body}");
+    r.fake.w().leftovers = vec![(agent("a1"), job_id(&id))];
+    r.jobs.tick();
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&id), "compared once");
+}
+
+/// A host reboot leaves a1's job recorded running with no VM. A resume that comes after READY
+/// but before the supervisor's first tick (as `post-reboot-check.sh` does) must find the job
+/// already interrupted, and its end snapshot taken before the VM boots, so the note holds only
+/// the job's own changes. Red at 4c674da, which ended such jobs only on the first tick: the job
+/// stayed `running`, then failed once probed, and was sealed after the resumed agent wrote.
+#[test]
+fn a_resume_before_the_first_tick_finds_the_job_interrupted_and_sealed() {
+    let r = rig();
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    let (fake, mut r) = (r.fake.clone(), r);
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let _ = store.set_state(&agent("a1"), State::Paused);
+    let r = with_store(store, fake, root);
+    r.jobs.startup();
+    let addr = serve(&r);
+    assert_eq!(r.state("a1", &id), "interrupted", "ended before READY");
+    assert!(r.fake.w().sealed.is_empty(), "no host command before READY");
+    let (status, _, body) = request(addr, "POST", "/api/v1/agents/a1/resume", "");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        r.fake.w().sealed,
+        std::slice::from_ref(&id),
+        "sealed before it boots"
+    );
+    r.fake.set(&id, Probe::Gone);
+    r.tick();
+    r.diff_all();
+    assert_eq!(r.state("a1", &id), "interrupted");
+    assert_eq!(r.fake.w().sealed, std::slice::from_ref(&id), "sealed once");
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&id), "compared once");
+}
+
+/// The clock can go back across a restart (a wrong RTC fixed by NTP). Leftovers of the earlier
+/// run must still be compared, so the sweep cannot tell "this run's" jobs by time. Red at
+/// 4c674da, which skipped jobs whose `finished_ms` was not before this run's start.
+#[test]
+fn leftovers_are_compared_when_the_clock_went_back() {
+    let r = rig();
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    r.advance(1_000_000);
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    assert_eq!(r.state("a1", &id), "succeeded");
+    let (fake, mut r) = (r.fake.clone(), r);
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    // Stopped with the compare queued; the new run's clock starts 1000 s earlier.
+    fake.w().leftovers = vec![(agent("a1"), job_id(&id))];
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let r = with_store(store, fake, root);
+    r.jobs.tick();
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&id));
+}
+
+/// A sweep whose listing fails is retried on the next tick rather than given up, and the
+/// leftovers it then finds are compared once; a job this run ended meanwhile is still left to
+/// its own seal. Red at a2ee05a, where a failed sweep was never retried.
+#[test]
+fn a_failed_leftover_sweep_is_retried_on_the_next_tick() {
+    let r = rig();
+    let gone = job_id("00000000000000bb");
+    {
+        let mut w = r.fake.w();
+        w.leftovers_fail = 1;
+        w.snapshots.insert(gone.to_string(), vec!["old".into()]);
+        w.leftovers = vec![(agent("a2"), gone.clone())];
+    }
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    r.diff_all();
+    assert!(r.fake.w().ended.is_empty(), "the first sweep failed");
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.fake.w().leftovers.push((agent("a1"), job_id(&id)));
+    r.tick();
+    r.diff_all();
+    r.tick();
+    r.diff_all();
+    let ended = r.fake.w().ended.clone();
+    assert_eq!(
+        ended.iter().filter(|j| **j == gone.to_string()).count(),
+        1,
+        "{ended:?}"
+    );
+    assert_eq!(ended.iter().filter(|j| **j == id).count(), 1, "{ended:?}");
 }
 
 #[test]

@@ -49,10 +49,16 @@
 //!
 //! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
 //! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
-//! logged and the gateway serves anyway. Jobs of agents that are not running are then ended
-//! (`Jobs::reconcile`); running jobs of running agents are re-attached by the job supervisor,
-//! which ticks every second. It then SIGKILLs `ctr` clients an earlier gateway left
-//! and detaches their tmux control clients in every running agent.
+//! logged and the gateway serves anyway. It then SIGKILLs `ctr` clients an earlier gateway left
+//! and detaches their tmux control clients in every running agent. The job supervisor then starts
+//! on its own thread and ticks at once and every second after: it re-attaches running jobs of
+//! running agents. Before that, still before `READY=1`, the jobs of agents that are not running
+//! are ended in the registry only (`Jobs::startup`), so no caller sees them `running` and a resume
+//! cannot race them; their end snapshots are taken by the first tick, or before the agent boots
+//! if a resume comes first. No host command for jobs runs before `READY=1`, so the startup's
+//! external commands stay within `TimeoutStartSec` however many jobs a reboot interrupted. Each ended job's changes are
+//! compared on another thread (`Jobs::diff_next`, ADR-019); the first tick also queues the
+//! compares an earlier run left.
 //!
 //! The watchdog ([`ac_gateway::watchdog`]) probes each running agent. It acts only on sustained
 //! failures while the host is not busy, then kills the gateway's own exec clients, then stale
@@ -505,7 +511,7 @@ fn run() -> Result<(), String> {
         .with_changes(CtrRuntime::new(LinuxSpawner, cfg.clone()))
         .with_notes(move |id, text| notes.note(id, text)),
     );
-    jobs.reconcile();
+    jobs.startup();
     let unhealthy = Unhealthy::default();
     let mut api = Api::new(fleet)
         .with_unhealthy(Arc::clone(&unhealthy))
@@ -523,9 +529,20 @@ fn run() -> Result<(), String> {
         }
     }
     let app = Arc::new(App::new(api, hub.clone(), keys.clone()).with_jobs(Arc::clone(&jobs)));
+    let differ = Arc::clone(&jobs);
     std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(1));
+        // A panic in one compare is logged and the next runs, so snapshots never pile up behind
+        // a dead thread.
+        let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            differ.diff_next(Duration::from_secs(60))
+        }));
+        if next.is_err() {
+            eprintln!("ac-gateway: jobs: a change compare panicked; carrying on");
+        }
+    });
+    std::thread::spawn(move || loop {
         jobs.tick();
+        std::thread::sleep(Duration::from_secs(1));
     });
     if interval > 0 {
         let app = Arc::clone(&app);

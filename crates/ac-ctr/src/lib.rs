@@ -151,6 +151,8 @@ pub struct CtrRuntime<S> {
     spawner: S,
     cfg: CtrConfig,
     disk: snap::Disk,
+    /// Most bytes of a job's change listing read in ([`snap::DUMP_CAP`]; tests lower it).
+    dump_cap: usize,
 }
 
 impl<S: Spawner> CtrRuntime<S> {
@@ -160,6 +162,7 @@ impl<S: Spawner> CtrRuntime<S> {
             spawner,
             cfg,
             disk: snap::Disk::LINUX,
+            dump_cap: snap::DUMP_CAP,
         }
     }
 
@@ -186,9 +189,26 @@ impl<S: Spawner> CtrRuntime<S> {
         args: &[OsString],
         env: Option<BTreeMap<OsString, OsString>>,
     ) -> Result<Vec<u8>, PortError> {
-        match self.exec(op, program, args, env)? {
-            (status, stdout, _) if status.success() => Ok(stdout),
-            (status, stdout, stderr) => Err(failure(op, status, &stdout, &stderr)),
+        self.run_capped(op, program, args, env, usize::MAX)
+    }
+
+    /// [`Self::run`], refusing stdout past `cap` bytes: the pipe is closed there, so the program
+    /// ends on `SIGPIPE` instead of the gateway holding whatever a tenant made it print.
+    fn run_capped(
+        &self,
+        op: &'static str,
+        program: &OsStr,
+        args: &[OsString],
+        env: Option<BTreeMap<OsString, OsString>>,
+        cap: usize,
+    ) -> Result<Vec<u8>, PortError> {
+        match self.exec_capped(op, program, args, env, cap)? {
+            (_, Output::Over, _) => Err(PortError {
+                op,
+                cause: format!("{}: output over {cap} bytes", program.to_string_lossy()),
+            }),
+            (status, Output::Whole(stdout), _) if status.success() => Ok(stdout),
+            (status, Output::Whole(stdout), stderr) => Err(failure(op, status, &stdout, &stderr)),
         }
     }
 
@@ -202,15 +222,28 @@ impl<S: Spawner> CtrRuntime<S> {
         args: &[OsString],
         env: Option<BTreeMap<OsString, OsString>>,
     ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), PortError> {
+        let (status, stdout, stderr) = self.exec_capped(op, program, args, env, usize::MAX)?;
+        Ok((status, stdout.whole(), stderr))
+    }
+
+    /// [`Self::exec`], keeping at most `cap` bytes of stdout.
+    fn exec_capped(
+        &self,
+        op: &'static str,
+        program: &OsStr,
+        args: &[OsString],
+        env: Option<BTreeMap<OsString, OsString>>,
+        cap: usize,
+    ) -> Result<(ExitStatus, Output, Vec<u8>), PortError> {
         match self.cfg.command_timeout {
             Some(limit) => {
                 let secs = limit.as_secs().to_string();
                 let mut argv = os(&["--kill-after=5", &secs]);
                 argv.push(program.to_owned());
                 argv.extend_from_slice(args);
-                self.spawn_wait(op, OsStr::new("timeout"), &argv, env)
+                self.spawn_wait_capped(op, OsStr::new("timeout"), &argv, env, cap)
             }
-            None => self.spawn_wait(op, program, args, env),
+            None => self.spawn_wait_capped(op, program, args, env, cap),
         }
     }
 
@@ -222,6 +255,20 @@ impl<S: Spawner> CtrRuntime<S> {
         argv: &[OsString],
         env: Option<BTreeMap<OsString, OsString>>,
     ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), PortError> {
+        let (status, stdout, stderr) = self.spawn_wait_capped(op, exe, argv, env, usize::MAX)?;
+        Ok((status, stdout.whole(), stderr))
+    }
+
+    /// [`Self::spawn_wait`], keeping at most `cap` bytes of stdout. Past that the pipe is closed
+    /// and the rest is never read.
+    fn spawn_wait_capped(
+        &self,
+        op: &'static str,
+        exe: &OsStr,
+        argv: &[OsString],
+        env: Option<BTreeMap<OsString, OsString>>,
+        cap: usize,
+    ) -> Result<(ExitStatus, Output, Vec<u8>), PortError> {
         let fail = |cause: String| PortError { op, cause };
         if self.cfg.trace {
             let line: Vec<String> = std::iter::once(exe)
@@ -241,12 +288,15 @@ impl<S: Spawner> CtrRuntime<S> {
             .spawner
             .spawn(&cmd)
             .map_err(|e| fail(format!("spawn {}: {e:?}", exe.to_string_lossy())))?;
-        let drain = |pipe: Option<Box<dyn platform::fs::File>>| match pipe {
-            Some(mut pipe) => read_all(pipe.as_mut()).map_err(|e| fail(format!("read: {e:?}"))),
-            None => Ok(Vec::new()),
+        let drain = |pipe: Option<Box<dyn platform::fs::File>>, cap: usize| match pipe {
+            Some(mut pipe) => {
+                read_capped(pipe.as_mut(), cap).map_err(|e| fail(format!("read: {e:?}")))
+            }
+            None => Ok(Output::Whole(Vec::new())),
         };
-        let stdout = drain(child.take_stdout())?;
-        let stderr = drain(child.take_stderr())?;
+        // The stdout pipe is dropped here, so a program cut off at the cap gets SIGPIPE.
+        let stdout = drain(child.take_stdout(), cap)?;
+        let stderr = drain(child.take_stderr(), usize::MAX)?.whole();
         let status = child.wait().map_err(|e| fail(format!("wait: {e:?}")))?;
         Ok((status, stdout, stderr))
     }
@@ -631,7 +681,12 @@ fn with_cleanup(original: PortError, cleanup: Result<(), PortError>) -> PortErro
 
 /// Error for a program that exited unsuccessfully, quoting stderr, or stdout if stderr is empty.
 /// Exits 124 and 137 come from `timeout`.
-fn failure(op: &'static str, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> PortError {
+pub(crate) fn failure(
+    op: &'static str,
+    status: ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> PortError {
     let hint = if matches!(status, ExitStatus::Code(124 | 137)) {
         " (timed out)"
     } else {
@@ -688,13 +743,42 @@ fn is_already_gone(cause: &str) -> bool {
 }
 
 pub(crate) fn read_all(file: &mut dyn platform::fs::File) -> platform::error::Result<Vec<u8>> {
+    read_capped(file, usize::MAX).map(Output::whole)
+}
+
+/// What was read from a pipe: all of it, or more than the cap allowed (and nothing kept).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Output {
+    Whole(Vec<u8>),
+    Over,
+}
+
+impl Output {
+    /// The bytes, or none when over the cap (only reachable with a finite cap).
+    fn whole(self) -> Vec<u8> {
+        match self {
+            Output::Whole(bytes) => bytes,
+            Output::Over => Vec::new(),
+        }
+    }
+}
+
+/// Read `file` to its end, or stop once more than `cap` bytes came (holding at most `cap` plus
+/// one read's worth).
+pub(crate) fn read_capped(
+    file: &mut dyn platform::fs::File,
+    cap: usize,
+) -> platform::error::Result<Output> {
     let (mut out, mut buf) = (Vec::new(), [0u8; 4096]);
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
-            return Ok(out);
+            return Ok(Output::Whole(out));
         }
         out.extend_from_slice(&buf[..n]);
+        if out.len() > cap {
+            return Ok(Output::Over);
+        }
     }
 }
 

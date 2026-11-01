@@ -22,6 +22,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 | A jobs token is stolen (`jobs:read,jobs:write` for some agents) | It runs prompts, so code as the agent user, in those agents only; it cannot pause, destroy, watch or type into them, and other agents answer 404. Revoke it alone (`ac-gateway token revoke`); see [API tokens](#api-tokens) |
 | The admin token is stolen | Full control of every agent (create, destroy, purge, jobs, take-over), not the host. Keep it on the host (root, 0600), give every other caller a narrower token, revoke and re-issue it if it leaks |
 | Runaway agent starves the host | Per-agent `cpu.max` and `memory.max` on the whole sandbox, a btrfs quota on its workspace (ADR-023), the job gate (ADR-013) |
+| An agent stalls the gateway for every agent | Work sized by what an agent made never runs on the job supervisor's thread, under the lifecycle lock or before `READY=1`: a job's changed-path listing (ADR-019) runs on a thread of its own, one at a time, and reads at most 64 MiB of it; as a job ends only one snapshot is taken; a purge never waits for a listing (409 instead) |
 | Destructive commands | Command guard in the shell container (a backstop, not a boundary) |
 
 ## Hardening checklist
@@ -207,5 +208,11 @@ the agent user, by capped execs. Prompts are never in an argv; history records o
   CDN addresses is possible. See ADR-007.
 - Egress profiles widen an agent's reach to whole package registries, which deliver code. Attach them to the
   agents that build, not by default (ADR-016).
+- Change listings (ADR-019) are worked out one at a time: a job that made a million files delays the change
+  notes of jobs that end after it (never their jobs or the API), and so keeps their start snapshots, with
+  what those jobs deleted, on disk longer. One whose listing passes 64 MiB is noted as having changed too many paths to list, and one whose listing
+  fails (a timeout) as having changes that could not be listed.
+  The send stream it writes under `checkpoints/<agent>/` is not capped; it is deleted once listed. A purge
+  is refused (409) while one of that agent's listings runs.
 - Screen streaming exposes whatever the agent's browser shows, including anything a logged-in
   session reveals. Treat viewer access as equivalent to agent access.

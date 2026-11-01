@@ -22,9 +22,12 @@
 //!
 //! What a started job changed (ADR-019) is noted in the agent's history when it ends: [`Changes`]
 //! compares workspace snapshots from its start and end, which btrfs does without root opening a
-//! path inside the workspace.
+//! path inside the workspace. Only the end snapshot is taken as the job ends. The compare costs as
+//! much as the job made, so it never runs on the supervisor's thread, under the lifecycle lock or
+//! before the gateway is ready: ended jobs queue for [`Jobs::diff_next`], which the gateway runs
+//! on a thread of its own, one compare at a time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -33,6 +36,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ac_ctr::CtrRuntime;
+use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
 use ac_domain::job;
 use ac_domain::schedule::{self, Limits, Wait};
@@ -220,9 +224,18 @@ pub trait JobRunner: Send + Sync + 'static {
 pub trait Changes: Send + Sync + 'static {
     /// Snapshot the agent's workspace as `job` starts; nothing, and `Ok`, where it cannot be.
     fn begin(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
-    /// The paths changed since [`Changes::begin`], whose snapshot is then deleted; `None` if it
-    /// took none.
-    fn end(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String>;
+    /// Snapshot it as `job` ends: one snapshot, whatever the job made. `false` if [`Changes::begin`]
+    /// took none, so there is nothing to compare.
+    fn end(&self, agent: &AgentId, job: &JobId) -> Result<bool, String>;
+    /// What changed between the two, which are then deleted, also on failure; `None` if there
+    /// was no start snapshot. Costs as much as the job made: never on the supervisor's thread or
+    /// under a lock.
+    fn diff(&self, agent: &AgentId, job: &JobId) -> Result<Option<Changed>, String>;
+    /// Delete the job's snapshots without comparing them.
+    fn discard(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
+    /// Every job with snapshots on disk, of any agent: ended jobs whose compare a stopped gateway
+    /// never ran, besides the running ones.
+    fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String>;
 }
 
 impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
@@ -230,9 +243,27 @@ impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
         self.job_begin(agent, job).map_err(|e| e.to_string())
     }
 
-    fn end(&self, agent: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+    fn end(&self, agent: &AgentId, job: &JobId) -> Result<bool, String> {
+        self.job_end(agent, job).map_err(|e| e.to_string())
+    }
+
+    fn diff(&self, agent: &AgentId, job: &JobId) -> Result<Option<Changed>, String> {
         self.job_changes(agent, job).map_err(|e| e.to_string())
     }
+
+    fn discard(&self, agent: &AgentId, job: &JobId) -> Result<(), String> {
+        self.job_discard(agent, job).map_err(|e| e.to_string())
+    }
+
+    fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String> {
+        self.job_leftovers().map_err(|e| e.to_string())
+    }
+}
+
+/// The history note for a job whose listing was over the cap: what it changed is not listed, but
+/// that it changed a great deal is said.
+pub fn too_many_note(id: &JobId) -> String {
+    format!("job {id} changed too many paths to list")
 }
 
 /// The history note for the paths job `id` changed, leaving out the runner's own files (the
@@ -539,6 +570,11 @@ pub struct Jobs {
     clock: Clock,
     limits: Limits,
     load: Option<Box<dyn HostLoad + Send + Sync>>,
+    /// Which jobs this run ended, until the first tick has swept leftovers.
+    restart: Mutex<Restart>,
+    /// Jobs [`Jobs::startup`] ended without their end snapshot, taken by the first tick or by
+    /// [`Busy::settle`] before their agent boots, whichever comes first.
+    unsealed: Mutex<Vec<(AgentId, JobId)>>,
     /// Why each queued job waited at the last tick (by job id).
     waits: Mutex<HashMap<String, Wait>>,
     /// The last pressure read failed (logged once per failure streak).
@@ -547,6 +583,49 @@ pub struct Jobs {
     book: Mutex<HashMap<String, u64>>,
     changed: Condvar,
     waiters: AtomicUsize,
+    /// Ended jobs whose changes are still to be compared ([`Jobs::diff_next`]).
+    diffs: Mutex<Diffs>,
+    queued: Condvar,
+}
+
+/// Telling an earlier run's leftover snapshots from this run's jobs, by what this run did rather
+/// than by the clock (which can go back across a restart).
+#[derive(Default)]
+struct Restart {
+    /// [`Jobs::queue_leftovers`] has run.
+    swept: bool,
+    /// A sweep failed and is retried each tick; logged once.
+    failed: bool,
+    /// Started jobs this run ended before that.
+    ended: HashSet<(AgentId, JobId)>,
+}
+
+/// When a started job's end snapshot is taken as it ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seal {
+    /// At once, then its compare is queued.
+    Now,
+    /// Later ([`Jobs::startup`]): no host command yet.
+    Later,
+}
+
+/// The compares to run, and which agents' are off limits to them.
+#[derive(Default)]
+struct Diffs {
+    /// Ended jobs, oldest first.
+    queue: VecDeque<(AgentId, JobId)>,
+    /// The agent whose job is being compared now.
+    listing: Option<AgentId>,
+    /// Agents being purged ([`Busy::hold`]): their compares wait, since the purge deletes the
+    /// snapshots they read.
+    held: HashSet<AgentId>,
+}
+
+impl Diffs {
+    /// Where the oldest compare of an agent not held is.
+    fn next(&self) -> Option<usize> {
+        self.queue.iter().position(|(a, _)| !self.held.contains(a))
+    }
 }
 
 impl Jobs {
@@ -570,11 +649,15 @@ impl Jobs {
             clock: Box::new(now_ms),
             limits: Limits::OPEN,
             load: None,
+            restart: Mutex::new(Restart::default()),
+            unsealed: Mutex::new(Vec::new()),
             waits: Mutex::new(HashMap::new()),
             blind: AtomicBool::new(false),
             book: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
             waiters: AtomicUsize::new(0),
+            diffs: Mutex::new(Diffs::default()),
+            queued: Condvar::new(),
         }
     }
 
@@ -585,7 +668,7 @@ impl Jobs {
     }
 
     /// Note in the agent's history which paths each started job changed, found by `changes`
-    /// (ADR-019). Without this, no change notes.
+    /// (ADR-019) on whichever thread calls [`Jobs::diff_next`]. Without this, no change notes.
     pub fn with_changes(mut self, changes: impl Changes) -> Self {
         self.changes = Some(Box::new(changes));
         self
@@ -764,12 +847,36 @@ impl Jobs {
         }
     }
 
+    /// End the jobs of agents that are not running, as [`Jobs::reconcile`] does but in the
+    /// registry only, with no host command, so it fits before `READY=1` however many jobs a
+    /// reboot interrupted. A caller then never sees such a job `running`, and a resume cannot
+    /// race it. The end snapshots are taken by the first tick or, for an agent booted before
+    /// that, by [`Busy::settle`] first.
+    pub fn startup(&self) {
+        self.end_stopped(Seal::Later);
+    }
+
+    /// Take the end snapshots [`Jobs::startup`] left, one at a time, each under the lock
+    /// [`Busy::settle`] takes, so an agent never boots while its job's is being taken.
+    fn seal_unsealed(&self) {
+        loop {
+            let mut unsealed = self.unsealed.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((agent, id)) = unsealed.pop() else {
+                return;
+            };
+            self.seal(&agent, &id);
+        }
+    }
+
     /// One supervisor step: end jobs of agents that stopped, poll or time out the running jobs,
     /// then start what the gate allows, oldest first ([`schedule::plan`]). Decisions use the
     /// snapshot taken at the start of the tick, so a job that just ended frees its agent and its
-    /// slot at the next tick. Called every second by the gateway.
+    /// slot at the next tick. Called every second by the gateway. The first tick also queues the
+    /// compares an earlier run left.
     pub fn tick(&self) {
+        self.seal_unsealed();
         self.reconcile();
+        self.queue_leftovers();
         let mut active = match self.store.active_jobs() {
             Ok(all) => all,
             Err(e) => {
@@ -848,18 +955,23 @@ impl Jobs {
     }
 
     /// End the jobs of agents that are not running: running ones become `interrupted`, queued
-    /// ones `cancelled` (ADR-010). Run at startup, after the fleet's reconcile, and every tick.
+    /// ones `cancelled` (ADR-010). Run every tick; [`Jobs::startup`] does the same before READY.
     pub fn reconcile(&self) {
+        self.end_stopped(Seal::Now);
+    }
+
+    fn end_stopped(&self, seal: Seal) {
         let Ok(active) = self.store.active_jobs() else {
             return;
         };
         for j in active {
             if !matches!(self.agents.state(&j.agent), Ok(Some(State::Running))) {
-                let _ = self.transition(
+                let _ = self.step(
                     &j.agent,
                     &j.id,
                     JobEvent::Interrupt,
                     Some("agent is not running"),
+                    seal,
                 );
             }
         }
@@ -914,7 +1026,7 @@ impl Jobs {
             .transition(&j.agent, &j.id, JobEvent::Start, None)
             .is_err()
         {
-            if let Some(Err(e)) = self.changes.as_ref().map(|c| c.end(&j.agent, &j.id)) {
+            if let Some(Err(e)) = self.changes.as_ref().map(|c| c.discard(&j.agent, &j.id)) {
                 eprintln!("ac-gateway: jobs: {}/{}: drop snapshot: {e}", j.agent, j.id);
             }
             return;
@@ -950,8 +1062,8 @@ impl Jobs {
     }
 
     /// Apply `event` to a job under the lock, persist it, prune old jobs if it ended, note it in
-    /// the agent's history and wake long-polls. A started job that ended then gets its change
-    /// note, outside the lock.
+    /// the agent's history and wake long-polls. A started job that ended then gets its end
+    /// snapshot, outside the lock, and is queued for its change note.
     fn transition(
         &self,
         agent: &AgentId,
@@ -959,11 +1071,31 @@ impl Jobs {
         event: JobEvent,
         reason: Option<&str>,
     ) -> Result<Job, Reply> {
+        self.step(agent, id, event, reason, Seal::Now)
+    }
+
+    /// [`Jobs::transition`], taking a started job's end snapshot as `seal` says.
+    fn step(
+        &self,
+        agent: &AgentId,
+        id: &JobId,
+        event: JobEvent,
+        reason: Option<&str>,
+        seal: Seal,
+    ) -> Result<Job, Reply> {
         let mut book = self.lock();
         let mut j = self.find(agent, id)?;
         let was = j.state;
         j.apply(event, (self.clock)())
             .map_err(|e| error(409, &e.to_string()))?;
+        let ended = was == JobState::Running && j.state.is_terminal();
+        if ended {
+            // Before the record says so, so the sweep sees it running or sees it here.
+            let mut restart = self.restart();
+            if !restart.swept {
+                restart.ended.insert((agent.clone(), id.clone()));
+            }
+        }
         if let Some(r) = reason {
             j.reason = Some(r.to_owned());
         }
@@ -987,22 +1119,126 @@ impl Jobs {
         }
         drop(book);
         self.changed.notify_all();
-        if was == JobState::Running && j.state.is_terminal() {
-            self.note_changes(&j);
+        match (ended, seal) {
+            (false, _) => {}
+            (true, Seal::Now) => self.seal(agent, id),
+            (true, Seal::Later) => self
+                .unsealed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((agent.clone(), id.clone())),
         }
         Ok(j)
     }
 
-    /// Note in `j`'s agent's history which paths it changed, if a start snapshot was taken.
-    fn note_changes(&self, j: &Job) {
+    /// Take the job's end snapshot and queue it for its change note, if a start snapshot was
+    /// taken. A failed end snapshot is queued too, so the compare deletes the start one.
+    fn seal(&self, agent: &AgentId, id: &JobId) {
         let Some(changes) = &self.changes else {
             return;
         };
-        match changes.end(&j.agent, &j.id) {
-            Ok(Some(paths)) => (self.notes)(&j.agent, &change_note(&j.id, &paths)),
-            Ok(None) => {}
-            Err(e) => eprintln!("ac-gateway: jobs: {}/{}: changes: {e}", j.agent, j.id),
+        match changes.end(agent, id) {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(e) => eprintln!("ac-gateway: jobs: {agent}/{id}: end snapshot: {e}"),
         }
+        self.queue().queue.push_back((agent.clone(), id.clone()));
+        self.queued.notify_all();
+    }
+
+    fn restart(&self) -> MutexGuard<'_, Restart> {
+        self.restart.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue the compare of every ended job whose snapshots are still on disk: a gateway stopped
+    /// with compares queued leaves them, and nothing else would delete them before a purge. Jobs
+    /// still queued or running keep theirs, and so do jobs that ended in this run: their own
+    /// transition seals and queues them, and a caller's cancel may still be taking the end
+    /// snapshot. Run by the first tick, after its reconcile, and by each later one until it
+    /// succeeds. Which jobs this run ended is recorded, not read from the clock.
+    fn queue_leftovers(&self) {
+        if self.restart().swept {
+            return;
+        }
+        let Some(changes) = &self.changes else {
+            self.restart().swept = true;
+            return;
+        };
+        let found = match changes.leftovers() {
+            Ok(found) => found,
+            Err(e) => {
+                let mut restart = self.restart();
+                if !restart.failed {
+                    eprintln!("ac-gateway: jobs: leftover job snapshots: {e}; retrying each tick");
+                    restart.failed = true;
+                }
+                return;
+            }
+        };
+        // Held throughout, so a job that ends meanwhile is either still running in the registry
+        // here or already in `ended` (its transition records it first).
+        let mut restart = self.restart();
+        restart.swept = true;
+        let live = |agent: &AgentId, id: &JobId| {
+            self.store
+                .jobs(agent)
+                .is_ok_and(|jobs| jobs.iter().any(|j| j.id == *id && !j.state.is_terminal()))
+        };
+        let ended: Vec<_> = found
+            .into_iter()
+            .filter(|(a, j)| !restart.ended.contains(&(a.clone(), j.clone())) && !live(a, j))
+            .collect();
+        restart.ended = HashSet::new();
+        drop(restart);
+        if ended.is_empty() {
+            return;
+        }
+        eprintln!(
+            "ac-gateway: jobs: comparing {} ended job(s) left from an earlier run",
+            ended.len()
+        );
+        self.queue().queue.extend(ended);
+        self.queued.notify_all();
+    }
+
+    /// Compare the oldest ended job's snapshots and note in its agent's history which paths it
+    /// changed, waiting up to `wait` for one to be queued. Whether there was one. The gateway
+    /// calls this in a loop on a thread of its own, so one job's large compare delays only the
+    /// notes queued behind it.
+    /// Compares of an agent being purged wait until [`Busy::release`].
+    pub fn diff_next(&self, wait: Duration) -> bool {
+        let next = {
+            let mut diffs = self.queue();
+            // Cleared here too, in case the last compare panicked.
+            diffs.listing = None;
+            let (mut diffs, _) = self
+                .queued
+                .wait_timeout_while(diffs, wait, |d| d.next().is_none())
+                .unwrap_or_else(|e| e.into_inner());
+            let next = diffs.next().and_then(|i| diffs.queue.remove(i));
+            diffs.listing = next.as_ref().map(|(agent, _)| agent.clone());
+            next
+        };
+        let (Some((agent, id)), Some(changes)) = (next, &self.changes) else {
+            return false;
+        };
+        match changes.diff(&agent, &id) {
+            Ok(Some(Changed::Paths(paths))) => (self.notes)(&agent, &change_note(&id, &paths)),
+            Ok(Some(Changed::TooMany)) => (self.notes)(&agent, &too_many_note(&id)),
+            Ok(None) => {}
+            // Noted too, so a job cannot hide what it did by making its listing fail (a send
+            // timed out on millions of files); the cause, host paths and all, only in the log.
+            Err(e) => {
+                eprintln!("ac-gateway: jobs: {agent}/{id}: changes: {e}");
+                (self.notes)(&agent, &format!("job {id} changes could not be listed"));
+            }
+        }
+        self.queue().listing = None;
+        true
+    }
+
+    fn queue(&self) -> MutexGuard<'_, Diffs> {
+        self.diffs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keep the newest [`KEEP`] finished jobs of `agent`. Called with the lock held.
@@ -1093,7 +1329,31 @@ impl Busy for Jobs {
         }
     }
 
+    fn settle(&self, id: &AgentId) {
+        let mut unsealed = self.unsealed.lock().unwrap_or_else(|e| e.into_inner());
+        let (ours, rest): (Vec<_>, Vec<_>) = unsealed.drain(..).partition(|(a, _)| a == id);
+        *unsealed = rest;
+        for (agent, job) in ours {
+            self.seal(&agent, &job);
+        }
+    }
+
+    fn hold(&self, id: &AgentId) -> bool {
+        let mut diffs = self.queue();
+        if diffs.listing.as_ref() == Some(id) {
+            return false;
+        }
+        diffs.held.insert(id.clone());
+        true
+    }
+
+    fn release(&self, id: &AgentId) {
+        self.queue().held.remove(id);
+        self.queued.notify_all();
+    }
+
     fn forget(&self, id: &AgentId) {
+        self.queue().queue.retain(|(agent, _)| agent != id);
         let _book = self.lock();
         if let Ok(jobs) = self.store.jobs(id) {
             for j in jobs {

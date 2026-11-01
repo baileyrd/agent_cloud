@@ -409,7 +409,13 @@ impl<S: Spawner> CtrRuntime<S> {
                 continue;
             };
             let dir = entry.path();
-            for name in std::fs::read_dir(&dir).map_err(|e| io_fail(op, "list", &dir, e))? {
+            // Gone since the root was listed (a purge beside this sweep): nothing left there.
+            let names = match std::fs::read_dir(&dir) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_fail(op, "list", &dir, e)),
+                Ok(names) => names,
+            };
+            for name in names {
                 let name = name.map_err(|e| io_fail(op, "list", &dir, e))?.file_name();
                 let job = name
                     .to_str()
@@ -1021,6 +1027,20 @@ esac"#;
         let mut found = ok(h.rt.job_leftovers());
         found.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         assert_eq!(found, [(a1, j1), (a2, j2)]);
+    }
+
+    /// An agent's directory that goes away while the sweep lists (a purge beside it) is skipped,
+    /// not an error that loses every other agent's leftovers. A dangling link stands in for the
+    /// directory removed between the two reads. Red at 45b7eef, where the whole listing failed.
+    #[test]
+    fn job_leftovers_skip_an_agent_directory_that_went_away() {
+        let h = Host::new();
+        let (a1, j1) = (agent("a1"), JobId::from_random([8; 8]));
+        h.workspace(&a1, "x");
+        ok(h.rt.job_begin(&a1, &j1));
+        let gone = h.root.join("checkpoints/a9");
+        let _ = std::os::unix::fs::symlink(h.root.join("purged"), &gone);
+        assert_eq!(ok(h.rt.job_leftovers()), [(a1, j1)]);
     }
 
     /// An end snapshot or stream left without its start snapshot is deleted by the compare that

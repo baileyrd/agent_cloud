@@ -4,6 +4,16 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+/// What comparing a job's two snapshots found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Changed {
+    /// The paths it changed ([`paths`]).
+    Paths(Vec<String>),
+    /// More than the listing cap holds: the job is noted as having changed too many paths to
+    /// list, so it cannot hide what it did by making millions of files.
+    TooMany,
+}
+
 /// The workspace paths a `btrfs receive --dump` listing says changed: added, removed, renamed
 /// (both names), written, truncated, or with a new owner, mode or extended attribute. Sorted,
 /// unique, relative to the workspace root and still escaped as btrfs prints them (`\ ` for a

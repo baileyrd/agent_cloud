@@ -681,7 +681,12 @@ fn with_cleanup(original: PortError, cleanup: Result<(), PortError>) -> PortErro
 
 /// Error for a program that exited unsuccessfully, quoting stderr, or stdout if stderr is empty.
 /// Exits 124 and 137 come from `timeout`.
-fn failure(op: &'static str, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> PortError {
+pub(crate) fn failure(
+    op: &'static str,
+    status: ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> PortError {
     let hint = if matches!(status, ExitStatus::Code(124 | 137)) {
         " (timed out)"
     } else {

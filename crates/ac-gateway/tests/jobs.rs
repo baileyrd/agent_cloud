@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ac_ctr::{CtrConfig, CtrRuntime};
+use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
@@ -60,6 +61,8 @@ struct World {
     ended: Vec<String>,
     /// Jobs whose snapshots were dropped uncompared.
     discarded: Vec<String>,
+    /// Every compare finds more than the listing cap holds.
+    too_many: bool,
     /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
     leftovers: Vec<(AgentId, JobId)>,
 }
@@ -169,12 +172,18 @@ impl Changes for Fake {
         w.sealed.push(job.to_string());
         Ok(w.snapshots.contains_key(job.as_str()))
     }
-    fn diff(&self, _: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, String> {
+    fn diff(&self, _: &AgentId, job: &JobId) -> Result<Option<Changed>, String> {
         self.w().listing.push(job.to_string());
         self.gate().pass();
         let mut w = self.w();
         w.ended.push(job.to_string());
-        Ok(w.snapshots.remove(job.as_str()))
+        let too_many = w.too_many;
+        Ok(w.snapshots
+            .remove(job.as_str())
+            .map(|paths| match too_many {
+                true => Changed::TooMany,
+                false => Changed::Paths(paths),
+            }))
     }
     fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String> {
         Ok(self.w().leftovers.clone())
@@ -513,6 +522,25 @@ fn started_jobs_note_what_they_changed_and_drop_their_snapshot() {
     assert!(w.snapshots.is_empty(), "every snapshot dropped");
 }
 
+/// Issue #26 review: a job whose listing is over the cap (a few hundred thousand files) still gets
+/// a history line saying it changed too many paths to list, so it cannot hide what it did by
+/// making many files. Red at 4c674da, where the over-cap listing was an error and only logged.
+#[test]
+fn a_listing_over_the_cap_is_noted_as_too_many() {
+    let r = rig();
+    let id = r.ok("a1", "make a million files");
+    r.jobs.tick();
+    r.fake.w().too_many = true;
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    let notes = r.notes.lock().map(|v| v.clone()).unwrap_or_default();
+    assert!(
+        notes.contains(&format!("a1: job {id} changed too many paths to list")),
+        "{notes:?}"
+    );
+}
+
 #[test]
 fn change_notes_leave_out_the_runner_and_are_capped() {
     let id = job_id("j1");
@@ -742,6 +770,65 @@ fn the_sweep_leaves_jobs_ended_in_this_run() {
     r.jobs.tick();
     r.diff_all();
     assert_eq!(r.fake.w().ended, std::slice::from_ref(&id), "compared once");
+}
+
+/// A host reboot leaves a1's job recorded running with no VM. A resume that comes after READY
+/// but before the supervisor's first tick (as `post-reboot-check.sh` does) must find the job
+/// already interrupted, and its end snapshot taken before the VM boots, so the note holds only
+/// the job's own changes. Red at 4c674da, which ended such jobs only on the first tick: the job
+/// stayed `running`, then failed once probed, and was sealed after the resumed agent wrote.
+#[test]
+fn a_resume_before_the_first_tick_finds_the_job_interrupted_and_sealed() {
+    let r = rig();
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    let (fake, mut r) = (r.fake.clone(), r);
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let _ = store.set_state(&agent("a1"), State::Paused);
+    let r = with_store(store, fake, root);
+    r.jobs.startup();
+    let addr = serve(&r);
+    assert_eq!(r.state("a1", &id), "interrupted", "ended before READY");
+    assert!(r.fake.w().sealed.is_empty(), "no host command before READY");
+    let (status, _, body) = request(addr, "POST", "/api/v1/agents/a1/resume", "");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        r.fake.w().sealed,
+        std::slice::from_ref(&id),
+        "sealed before it boots"
+    );
+    r.fake.set(&id, Probe::Gone);
+    r.tick();
+    r.diff_all();
+    assert_eq!(r.state("a1", &id), "interrupted");
+    assert_eq!(r.fake.w().sealed, std::slice::from_ref(&id), "sealed once");
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&id), "compared once");
+}
+
+/// The clock can go back across a restart (a wrong RTC fixed by NTP). Leftovers of the earlier
+/// run must still be compared, so the sweep cannot tell "this run's" jobs by time. Red at
+/// 4c674da, which skipped jobs whose `finished_ms` was not before this run's start.
+#[test]
+fn leftovers_are_compared_when_the_clock_went_back() {
+    let r = rig();
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    r.advance(1_000_000);
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    assert_eq!(r.state("a1", &id), "succeeded");
+    let (fake, mut r) = (r.fake.clone(), r);
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    // Stopped with the compare queued; the new run's clock starts 1000 s earlier.
+    fake.w().leftovers = vec![(agent("a1"), job_id(&id))];
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let r = with_store(store, fake, root);
+    r.jobs.tick();
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&id));
 }
 
 #[test]

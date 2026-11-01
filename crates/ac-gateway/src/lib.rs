@@ -91,6 +91,10 @@ pub trait Busy: Send + Sync {
     /// The agent's VM is about to go away: kill its running job and mark it interrupted; cancel the
     /// queued ones.
     fn interrupt(&self, id: &AgentId);
+    /// The agent's workspace is about to change outside a job (a boot, a restore): take the end
+    /// snapshots of its jobs that [`jobs::Jobs::startup`] ended without them, so their change
+    /// notes hold only the jobs' own changes. One snapshot per job at most.
+    fn settle(&self, _: &AgentId) {}
     /// The agent is about to be purged, which deletes its job snapshots: hold its jobs' change
     /// compares (ADR-019) until [`Busy::release`]. `false`, holding nothing, while one of them
     /// runs, since deleting a snapshot that `btrfs send` reads fails.
@@ -225,7 +229,10 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
                 Some(force) => self.vacate(&id, force, false, || self.fleet.pause(&id)),
                 None => error(400, "force must be true or false"),
             },
-            ("POST", Some("resume")) => self.done(&id, self.fleet.resume(&id), 200),
+            ("POST", Some("resume")) => {
+                self.jobs.settle(&id);
+                self.done(&id, self.fleet.resume(&id), 200)
+            }
             ("DELETE", None) => match (flag(query, "purge"), flag(query, "force")) {
                 (Some(purge), Some(force)) => {
                     let reply = self.vacate(&id, force, purge, || self.fleet.destroy(&id, purge));
@@ -311,6 +318,7 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         if self.jobs.busy(id) {
             return error(409, &format!("agent {id} has a queued or running job"));
         }
+        self.jobs.settle(id);
         match self.fleet.restore(id, &cp) {
             Ok(kept) => Reply {
                 status: 200,
@@ -357,6 +365,7 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
                 return reply;
             }
         }
+        self.jobs.settle(id);
         self.done(id, self.fleet.create_attached(id, profiles.as_deref()), 201)
     }
 

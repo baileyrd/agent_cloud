@@ -600,10 +600,10 @@ failed with connection refused, and every script and `ac-ctl tune --restart-gate
   0.18 s. The slower case is a1's VM killed too, so the reconcile pauses it and cleans up: 0.51, 0.66, 0.77 and
   1.11 s. 180 s outlasts one external command (`ctr`, `ip`, CNI) at its 120 s `command_timeout`, which the
   reconcile logs and serves through.
-- No job work before READY (issue #26): ending the jobs of agents a reboot stopped takes an end snapshot per
-  job (ADR-019), one external command each, so the job supervisor does it on its first tick, on its own thread,
-  started before READY and not waited for. Until that tick has taken those snapshots (one external command
-  per job) such a job can still read `running`.
+- No job host commands before READY (issue #26): the jobs of agents a reboot stopped are ended before READY
+  in the registry only. Their end snapshots (ADR-019), one external command per job, are taken by the job
+  supervisor's first tick on its own thread, not waited for, or before the agent is resumed if that comes
+  first.
 
 **Evidence (2026-10-24, BaileyServ).** Before: `time systemctl restart ac-gateway && curl .../capacity` 0.04 s,
 then `curl: (7) ... Could not connect`. After: 0.88 s, then the capacity JSON. With systemd at debug level:
@@ -843,13 +843,20 @@ without trusting the agent.
   10⁶ empty files), so the ended job is queued and a thread of the gateway's own lists it, one at a time
   (`Jobs::diff_next`); never the job supervisor's thread, the lifecycle lock or startup before `READY=1`. The
   dump read in is capped at 64 MiB (`ac_ctr::snap::DUMP_CAP`, some hundred thousand paths); past it the
-  pipe is closed, the job gets no note and the journal says why. A purge (`DELETE ...?purge=true`) deletes
+  pipe is closed and the note is `job <id> changed too many paths to list`, so a job cannot hide what it
+  did by making many files. A purge (`DELETE ...?purge=true`) deletes
   every job snapshot itself, and btrfs refuses to delete a snapshot `send` reads: while one of the agent's
   listings runs the purge is refused (409, retry), and while the purge runs the agent's queued listings
   wait (they find nothing after it); `ac-ctl destroy --purge` runs with the gateway stopped and needs no
   hold. The supervisor's first tick, after its reconcile, queues the ended jobs whose snapshots a stopped
-  gateway left; a job still queued or running keeps its own, and an end snapshot or stream left without a
+  gateway left; a job still queued or running, or ended by this run (recorded as it ends, not judged by the
+  clock, which can go back across a restart), keeps its own, and an end snapshot or stream left without a
   start one is deleted.
+- *At startup:* the jobs of agents that are not running are ended before `READY=1` in the registry only
+  (`Jobs::startup`), so no caller sees them `running`. Their end snapshots are taken by the first tick, or
+  before the agent's workspace next changes outside a job (resume, create, restore: `Busy::settle`, one
+  snapshot per job, under the lifecycle lock), whichever comes first, so the note holds only the job's
+  own changes.
 - *Code:* `jobs::Changes` (begin, end, diff, discard, leftovers) is a seam beside `JobRunner`, implemented by
   `CtrRuntime` over `ac_ctr::snap` and faked in the job tests.
 

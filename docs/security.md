@@ -210,7 +210,7 @@ the agent user, by capped execs. Prompts are never in an argv; history records o
   agents that build, not by default (ADR-016).
 - Change listings (ADR-019) are worked out one at a time: a job that made a million files delays the change
   notes of jobs that end after it (never their jobs or the API), and so keeps their start snapshots, with
-  what those jobs deleted, on disk longer. One whose listing passes 64 MiB gets no note, only a journal line.
+  what those jobs deleted, on disk longer. One whose listing passes 64 MiB is noted as having changed too many paths to list.
   The send stream it writes under `checkpoints/<agent>/` is not capped; it is deleted once listed. A purge
   is refused (409) while one of that agent's listings runs.
 - Screen streaming exposes whatever the agent's browser shows, including anything a logged-in

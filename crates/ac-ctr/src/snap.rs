@@ -15,7 +15,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ac_domain::{changes, AgentId, Checkpoint, CheckpointId, JobId, Label, Volume};
+use ac_domain::changes::{self, Changed};
+use ac_domain::{AgentId, Checkpoint, CheckpointId, JobId, Label, Volume};
 use ac_ports::{PortError, Snapshots};
 use platform::process::Spawner;
 
@@ -32,8 +33,8 @@ const LABEL_SUFFIX: &str = "label";
 const JOB_START: &str = "start";
 const JOB_END: &str = "end";
 /// Most bytes of `btrfs receive --dump` read for a job's changes. A metadata-only listing takes a
-/// few hundred bytes a path, so this is some hundred thousand paths; a job that changed more gets
-/// no note (logged) rather than the gateway holding a listing of any size.
+/// few hundred bytes a path, so this is some hundred thousand paths; a job that changed more is
+/// [`Changed::TooMany`] rather than the gateway holding a listing of any size.
 pub const DUMP_CAP: usize = 64 << 20;
 
 /// How the adapter tells what is on disk. Tests swap in their own.
@@ -363,10 +364,10 @@ impl<S: Spawner> CtrRuntime<S> {
     /// with its end one ([`Self::job_end`]), by `btrfs send --no-data`, which reads metadata only
     /// and never opens a path inside the workspace. Costs as much as the job made (an agent can
     /// make millions of empty files), so the gateway runs it on its own worker; the listing read
-    /// in is capped at [`DUMP_CAP`]. Both snapshots and the stream are deleted, also on failure.
-    /// `None` when the job has no start snapshot; an end snapshot or stream left without one (a
-    /// stop or a race cut a cleanup short) is deleted then too.
-    pub fn job_changes(&self, id: &AgentId, job: &JobId) -> Result<Option<Vec<String>>, PortError> {
+    /// in is capped at [`DUMP_CAP`] ([`Changed::TooMany`] past it). Both snapshots and the stream
+    /// are deleted, also on failure. `None` when the job has no start snapshot; an end snapshot or
+    /// stream left without one (a stop or a race cut a cleanup short) is deleted then too.
+    pub fn job_changes(&self, id: &AgentId, job: &JobId) -> Result<Option<Changed>, PortError> {
         let op = "job changes";
         let base = self.checkpoints_dir(id).join(job.as_str());
         if self.volume_at(op, &sibling(&base, JOB_START))? == Volume::Missing {
@@ -442,7 +443,7 @@ impl<S: Spawner> CtrRuntime<S> {
 
     /// Write the incremental send from `<base>.start` to `<base>.end` to `<base>.send`, and list
     /// what changed.
-    fn diff(&self, op: &'static str, base: &Path) -> Result<Vec<String>, PortError> {
+    fn diff(&self, op: &'static str, base: &Path) -> Result<Changed, PortError> {
         let (start, end) = (sibling(base, JOB_START), sibling(base, JOB_END));
         let stream = sibling(base, "send");
         if self.volume_at(op, &end)? == Volume::Missing {
@@ -463,8 +464,13 @@ impl<S: Spawner> CtrRuntime<S> {
         let mut dump = os(&["receive", "--dump", "-f"]);
         dump.push(stream.as_os_str().to_owned());
         let btrfs = OsStr::new(&self.cfg.btrfs_bin);
-        let out = self.run_capped(op, btrfs, &dump, None, self.dump_cap)?;
-        Ok(changes::paths(&String::from_utf8_lossy(&out)))
+        match self.exec_capped(op, btrfs, &dump, None, self.dump_cap)? {
+            (_, crate::Output::Over, _) => Ok(Changed::TooMany),
+            (status, crate::Output::Whole(out), _) if status.success() => Ok(Changed::Paths(
+                changes::paths(&String::from_utf8_lossy(&out)),
+            )),
+            (status, crate::Output::Whole(out), err) => Err(crate::failure(op, status, &out, &err)),
+        }
     }
 }
 
@@ -947,7 +953,10 @@ esac"#;
         ok(h.rt.job_begin(&a1, &job));
         assert!(ok(h.rt.checkpoints(&a1)).is_empty(), "not a checkpoint");
         assert!(ok(h.rt.job_end(&a1, &job)));
-        assert_eq!(ok(h.rt.job_changes(&a1, &job)), Some(vec!["file".into()]));
+        assert_eq!(
+            ok(h.rt.job_changes(&a1, &job)),
+            Some(Changed::Paths(vec!["file".into()]))
+        );
         let dir = h.root.join("checkpoints/a1");
         let left: Vec<_> = std::fs::read_dir(&dir)
             .map(|d| d.count())
@@ -972,23 +981,19 @@ esac"#;
         assert!(!dir.exists());
     }
 
-    /// Issue #26: a job that changed more than the cap allows gets an error, not a listing of any
-    /// size in the gateway, and its snapshots and stream are still deleted. Red without the cap
-    /// (the whole dump read in, as on 9368efb).
+    /// Issue #26: a job that changed more than the cap allows is `TooMany`, not a listing of any
+    /// size in the gateway nor an error that leaves no note, and its snapshots and stream are
+    /// still deleted. Red without the cap (the whole dump read in, as on 9368efb) and at 4c674da
+    /// (an error).
     #[test]
-    fn job_changes_refuse_a_listing_over_the_cap_and_still_clean_up() {
+    fn job_changes_over_the_cap_are_too_many_and_still_clean_up() {
         let mut h = Host::new();
         h.rt.dump_cap = 10;
         let (a1, job) = (agent("a1"), JobId::from_random([2; 8]));
         h.workspace(&a1, "x");
         ok(h.rt.job_begin(&a1, &job));
         assert!(ok(h.rt.job_end(&a1, &job)));
-        let err = h.rt.job_changes(&a1, &job).err().map(|e| e.cause);
-        assert!(
-            err.as_deref()
-                .is_some_and(|e| e.contains("output over 10 bytes")),
-            "{err:?}"
-        );
+        assert_eq!(ok(h.rt.job_changes(&a1, &job)), Some(Changed::TooMany));
         let left = std::fs::read_dir(h.root.join("checkpoints/a1")).map(|d| d.count());
         assert_eq!(left.ok(), Some(0), "snapshots and stream deleted");
     }
@@ -1165,11 +1170,11 @@ esac"#;
         let changed = ok(rt.job_changes(&a1, &job));
         assert_eq!(
             changed,
-            Some(vec![
+            Some(Changed::Paths(vec![
                 "file".into(),
                 r"new\ dir".into(),
                 r"new\ dir/f".into()
-            ])
+            ]))
         );
         assert_eq!(ok(rt.checkpoints(&a1)).len(), 2, "no job snapshot left");
         ok(rt.job_begin(&a1, &job));

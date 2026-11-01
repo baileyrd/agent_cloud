@@ -629,7 +629,8 @@ impl Diffs {
     }
 
     /// Take the next compare, and move the rest of its agent's behind every other agent's, so
-    /// agents take turns: one with many large compares queued delays another's by one at most.
+    /// agents take turns: each turn compares the oldest queued job of each agent, and an agent
+    /// with many large compares queued delays another's by one of them per turn.
     fn take(&mut self) -> Option<(AgentId, JobId)> {
         let next = self.next().and_then(|i| self.queue.remove(i))?;
         let (theirs, others): (VecDeque<_>, VecDeque<_>) =

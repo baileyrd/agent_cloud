@@ -209,9 +209,9 @@ the agent user, by capped execs. Prompts are never in an argv; history records o
 - Egress profiles widen an agent's reach to whole package registries, which deliver code. Attach them to the
   agents that build, not by default (ADR-016).
 - Change listings (ADR-019) are worked out one at a time, agents taking turns: a job that made a million files
-  delays the change notes of jobs that end after it by that one listing (never their jobs
-  or the API), and so keeps their start snapshots, with what those jobs deleted, on disk longer; an agent's
-  further listings wait behind every other agent's. One whose listing passes 64 MiB is noted as having changed too many paths to list, and one whose listing
+  delays the change notes of other agents' jobs (never their jobs or the API) by that listing, once per turn
+  until theirs, and so keeps their start snapshots, with what those jobs deleted, on disk longer; an agent's
+  own older listings still come first. One whose listing passes 64 MiB is noted as having changed too many paths to list, and one whose listing
   fails (a timeout) as having changes that could not be listed.
   The send stream it writes under `checkpoints/<agent>/` is not capped; it is deleted once listed. A purge
   is refused (409) while one of that agent's listings runs.

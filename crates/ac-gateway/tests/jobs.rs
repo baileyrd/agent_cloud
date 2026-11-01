@@ -65,6 +65,8 @@ struct World {
     too_many: bool,
     /// Every compare fails (a `btrfs send` that timed out).
     diff_fails: bool,
+    /// How many `leftovers` calls fail before one succeeds.
+    leftovers_fail: usize,
     /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
     leftovers: Vec<(AgentId, JobId)>,
 }
@@ -192,7 +194,12 @@ impl Changes for Fake {
             }))
     }
     fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String> {
-        Ok(self.w().leftovers.clone())
+        let mut w = self.w();
+        if w.leftovers_fail > 0 {
+            w.leftovers_fail -= 1;
+            return Err("list checkpoints: Permission denied".into());
+        }
+        Ok(w.leftovers.clone())
     }
     fn discard(&self, _: &AgentId, job: &JobId) -> Result<(), String> {
         let mut w = self.w();
@@ -853,6 +860,38 @@ fn leftovers_are_compared_when_the_clock_went_back() {
     r.jobs.tick();
     r.diff_all();
     assert_eq!(r.fake.w().ended, std::slice::from_ref(&id));
+}
+
+/// A sweep whose listing fails is retried on the next tick rather than given up, and the
+/// leftovers it then finds are compared once; a job this run ended meanwhile is still left to
+/// its own seal. Red at a2ee05a, where a failed sweep was never retried.
+#[test]
+fn a_failed_leftover_sweep_is_retried_on_the_next_tick() {
+    let r = rig();
+    let gone = job_id("00000000000000bb");
+    {
+        let mut w = r.fake.w();
+        w.leftovers_fail = 1;
+        w.snapshots.insert(gone.to_string(), vec!["old".into()]);
+        w.leftovers = vec![(agent("a2"), gone.clone())];
+    }
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    r.diff_all();
+    assert!(r.fake.w().ended.is_empty(), "the first sweep failed");
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.fake.w().leftovers.push((agent("a1"), job_id(&id)));
+    r.tick();
+    r.diff_all();
+    r.tick();
+    r.diff_all();
+    let ended = r.fake.w().ended.clone();
+    assert_eq!(
+        ended.iter().filter(|j| **j == gone.to_string()).count(),
+        1,
+        "{ended:?}"
+    );
+    assert_eq!(ended.iter().filter(|j| **j == id).count(), 1, "{ended:?}");
 }
 
 #[test]

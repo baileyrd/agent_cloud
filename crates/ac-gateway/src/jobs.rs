@@ -594,6 +594,8 @@ pub struct Jobs {
 struct Restart {
     /// [`Jobs::queue_leftovers`] has run.
     swept: bool,
+    /// A sweep failed and is retried each tick; logged once.
+    failed: bool,
     /// Started jobs this run ended before that.
     ended: HashSet<(AgentId, JobId)>,
 }
@@ -1152,8 +1154,8 @@ impl Jobs {
     /// with compares queued leaves them, and nothing else would delete them before a purge. Jobs
     /// still queued or running keep theirs, and so do jobs that ended in this run: their own
     /// transition seals and queues them, and a caller's cancel may still be taking the end
-    /// snapshot. Run once, by the first tick, after its reconcile. Which jobs this run ended is
-    /// recorded, not read from the clock.
+    /// snapshot. Run by the first tick, after its reconcile, and by each later one until it
+    /// succeeds. Which jobs this run ended is recorded, not read from the clock.
     fn queue_leftovers(&self) {
         if self.restart().swept {
             return;
@@ -1165,8 +1167,11 @@ impl Jobs {
         let found = match changes.leftovers() {
             Ok(found) => found,
             Err(e) => {
-                eprintln!("ac-gateway: jobs: leftover job snapshots: {e}");
-                self.restart().swept = true;
+                let mut restart = self.restart();
+                if !restart.failed {
+                    eprintln!("ac-gateway: jobs: leftover job snapshots: {e}; retrying each tick");
+                    restart.failed = true;
+                }
                 return;
             }
         };

@@ -850,7 +850,8 @@ without trusting the agent.
   listings runs the purge is refused (409, retry), and while the purge runs the agent's queued listings
   wait (they find nothing after it); `ac-ctl destroy --purge` runs with the gateway stopped and needs no
   hold. The supervisor's first tick, after its reconcile, queues the ended jobs whose snapshots a stopped
-  gateway left; a job still queued or running, or ended by this run (recorded as it ends, not judged by the
+  gateway left (each later tick retries a sweep that failed; an agent directory a purge removes meanwhile is
+  skipped); a job still queued or running, or ended by this run (recorded as it ends, not judged by the
   clock, which can go back across a restart), keeps its own, and an end snapshot or stream left without a
   start one is deleted.
 - *At startup:* the jobs of agents that are not running are ended before `READY=1` in the registry only

@@ -671,8 +671,8 @@ fn a_purge_waits_for_no_listing_and_holds_the_agents_queue() {
 /// Issue #26: compares still queued when the gateway stopped are queued again by the next
 /// gateway's first tick, so their snapshots do not stay until a purge. A job still running keeps
 /// its start snapshot. A job that tick ends (its agent stopped with the host) is sealed first and
-/// noted once: the sweep runs after the reconcile on the same thread, never beside it, so no
-/// compare reads a job before its end snapshot exists.
+/// noted once. A guard, not a regression test: the race it rules out needed the sweep on another
+/// thread, beside the reconcile.
 #[test]
 fn leftovers_are_compared_after_the_first_ticks_reconcile() {
     let r = rig();
@@ -719,6 +719,29 @@ fn leftovers_are_compared_after_the_first_ticks_reconcile() {
         .count();
     assert_eq!(noted, 1, "{notes:?}");
     assert!(notes.contains(&"a2: job 00000000000000aa changed 1 path: old".to_owned()));
+}
+
+/// A job a caller ends while the first tick sweeps leftovers is this run's: its own transition
+/// seals and queues it, so the sweep leaves it alone. Red when the sweep queues every ended job
+/// (ce9eec6): the job is compared twice, and had the cancel still been taking its end snapshot,
+/// the sweep's compare would have deleted its start one and lost the note.
+#[test]
+fn the_sweep_leaves_jobs_ended_in_this_run() {
+    let r = rig();
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    let fake = r.fake.clone();
+    let mut r = r;
+    let root = std::mem::take(&mut r.root);
+    drop(r);
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let r = with_store(store, fake, root);
+    let (status, body) = r.json(Route::Cancel(agent("a1"), job_id(&id)), "");
+    assert_eq!(status, 200, "{body}");
+    r.fake.w().leftovers = vec![(agent("a1"), job_id(&id))];
+    r.jobs.tick();
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, std::slice::from_ref(&id), "compared once");
 }
 
 #[test]

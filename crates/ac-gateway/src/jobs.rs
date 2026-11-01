@@ -565,6 +565,9 @@ pub struct Jobs {
     load: Option<Box<dyn HostLoad + Send + Sync>>,
     /// The first tick has queued what an earlier run left ([`Jobs::queue_leftovers`]).
     swept: AtomicBool,
+    /// When this run began (ms, by `clock`): jobs that ended since are sealed and queued by their
+    /// own transition, never by the sweep.
+    born: u64,
     /// Why each queued job waited at the last tick (by job id).
     waits: Mutex<HashMap<String, Wait>>,
     /// The last pressure read failed (logged once per failure streak).
@@ -619,6 +622,7 @@ impl Jobs {
             limits: Limits::OPEN,
             load: None,
             swept: AtomicBool::new(false),
+            born: now_ms(),
             waits: Mutex::new(HashMap::new()),
             blind: AtomicBool::new(false),
             book: Mutex::new(HashMap::new()),
@@ -644,6 +648,7 @@ impl Jobs {
 
     /// Read the time (ms since the epoch) from `clock`.
     pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.born = clock();
         self.clock = Box::new(clock);
         self
     }
@@ -1067,9 +1072,9 @@ impl Jobs {
 
     /// Queue the compare of every ended job whose snapshots are still on disk: a gateway stopped
     /// with compares queued leaves them, and nothing else would delete them before a purge. Jobs
-    /// still queued or running keep theirs. Run by the first tick after its reconcile, so every job
-    /// that tick ended already has its end snapshot; such a job is queued twice, and its second
-    /// compare finds nothing.
+    /// still queued or running keep theirs, and so do jobs that ended in this run: their own
+    /// transition seals and queues them, and a caller's cancel may still be taking the end
+    /// snapshot. Run by the first tick, after its reconcile.
     fn queue_leftovers(&self) {
         let Some(changes) = &self.changes else {
             return;
@@ -1081,12 +1086,16 @@ impl Jobs {
                 return;
             }
         };
-        let live = |agent: &AgentId, id: &JobId| {
-            self.store
-                .jobs(agent)
-                .is_ok_and(|jobs| jobs.iter().any(|j| j.id == *id && !j.state.is_terminal()))
+        // Ours: still queued or running, or ended since this run began.
+        let ours = |agent: &AgentId, id: &JobId| {
+            self.store.jobs(agent).is_ok_and(|jobs| {
+                jobs.iter().any(|j| {
+                    j.id == *id
+                        && (!j.state.is_terminal() || j.finished_ms.is_some_and(|t| t >= self.born))
+                })
+            })
         };
-        let ended: Vec<_> = found.into_iter().filter(|(a, j)| !live(a, j)).collect();
+        let ended: Vec<_> = found.into_iter().filter(|(a, j)| !ours(a, j)).collect();
         if ended.is_empty() {
             return;
         }

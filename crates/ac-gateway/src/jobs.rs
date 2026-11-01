@@ -612,7 +612,8 @@ enum Seal {
 /// The compares to run, and which agents' are off limits to them.
 #[derive(Default)]
 struct Diffs {
-    /// Ended jobs, oldest first.
+    /// Ended jobs in turn order: oldest first, except that an agent whose compare was just taken
+    /// goes behind every other agent's ([`Diffs::take`]).
     queue: VecDeque<(AgentId, JobId)>,
     /// The agent whose job is being compared now.
     listing: Option<AgentId>,
@@ -625,6 +626,17 @@ impl Diffs {
     /// Where the oldest compare of an agent not held is.
     fn next(&self) -> Option<usize> {
         self.queue.iter().position(|(a, _)| !self.held.contains(a))
+    }
+
+    /// Take the next compare, and move the rest of its agent's behind every other agent's, so
+    /// agents take turns: one with many large compares queued delays another's by one at most.
+    fn take(&mut self) -> Option<(AgentId, JobId)> {
+        let next = self.next().and_then(|i| self.queue.remove(i))?;
+        let (theirs, others): (VecDeque<_>, VecDeque<_>) =
+            self.queue.drain(..).partition(|(a, _)| *a == next.0);
+        self.queue = others;
+        self.queue.extend(theirs);
+        Some(next)
     }
 }
 
@@ -1201,10 +1213,10 @@ impl Jobs {
         self.queued.notify_all();
     }
 
-    /// Compare the oldest ended job's snapshots and note in its agent's history which paths it
-    /// changed, waiting up to `wait` for one to be queued. Whether there was one. The gateway
-    /// calls this in a loop on a thread of its own, so one job's large compare delays only the
-    /// notes queued behind it.
+    /// Compare the next ended job's snapshots, taking turns per agent, and note in its agent's
+    /// history which paths it changed, waiting up to `wait` for one to be queued. Whether there
+    /// was one. The gateway calls this in a loop on a thread of its own, so one job's large
+    /// compare delays only the notes queued behind it, and agents take turns in that queue.
     /// Compares of an agent being purged wait until [`Busy::release`].
     pub fn diff_next(&self, wait: Duration) -> bool {
         let next = {
@@ -1215,7 +1227,7 @@ impl Jobs {
                 .queued
                 .wait_timeout_while(diffs, wait, |d| d.next().is_none())
                 .unwrap_or_else(|e| e.into_inner());
-            let next = diffs.next().and_then(|i| diffs.queue.remove(i));
+            let next = diffs.take();
             diffs.listing = next.as_ref().map(|(agent, _)| agent.clone());
             next
         };

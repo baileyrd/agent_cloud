@@ -727,6 +727,29 @@ fn a_purge_waits_for_no_listing_and_holds_the_agents_queue() {
     assert_eq!(r.fake.w().ended, [first, other, held]);
 }
 
+/// Issue #26 follow-up: change listings take turns per agent, so an agent with many large
+/// listings queued (a btrfs send takes about 44 s per million files) cannot delay another agent's
+/// note, or keep that agent's snapshots on disk, behind all of its own.
+#[test]
+fn change_listings_take_turns_per_agent() {
+    let r = rig();
+    let end = |agent: &str| {
+        let id = r.ok(agent, "x");
+        r.jobs.tick();
+        r.fake.set(&id, Probe::Exited(Some(0)));
+        r.tick();
+        id
+    };
+    let ones: Vec<String> = (0..3).map(|_| end("a1")).collect();
+    let two = end("a2");
+    r.diff_all();
+    assert_eq!(
+        r.fake.w().ended,
+        [ones[0].clone(), two, ones[1].clone(), ones[2].clone()],
+        "a2's one listing runs before a1's second"
+    );
+}
+
 /// Issue #26: compares still queued when the gateway stopped are queued again by the next
 /// gateway's first tick, so their snapshots do not stay until a purge. A job still running keeps
 /// its start snapshot. A job that tick ends (its agent stopped with the host) is sealed first and

@@ -841,8 +841,9 @@ without trusting the agent.
   did by making its listing fail; the job is unaffected.
 - *Off the supervisor (issue #26):* only the `<job>.end` snapshot is taken as the job ends, one snapshot
   whatever the job made. The send, the dump and the deletes cost as much as the job made (an agent can make
-  10⁶ empty files), so the ended job is queued and a thread of the gateway's own lists it, one at a time
-  (`Jobs::diff_next`); never the job supervisor's thread, the lifecycle lock or startup before `READY=1`. The
+  10⁶ empty files), so the ended job is queued and a thread of the gateway's own lists it, one at a time,
+  agents taking turns (`Jobs::diff_next`: after an agent's listing its other queued ones go behind every
+  other agent's, so one with many large jobs delays another's note by one listing at most); never the job supervisor's thread, the lifecycle lock or startup before `READY=1`. The
   dump read in is capped at 64 MiB (`ac_ctr::snap::DUMP_CAP`, some hundred thousand paths); past it the
   pipe is closed and the note is `job <id> changed too many paths to list`, so a job cannot hide what it
   did by making many files. A purge (`DELETE ...?purge=true`) deletes
@@ -866,7 +867,8 @@ without trusting the agent.
 - What a job did is known from the filesystem, not from the agent's account of it. The names are still
   agent-chosen text.
 - A start snapshot keeps what the job deletes or rewrites on disk until the job is listed, after it ends: by up
-  to the listings queued ahead of it, other agents' included. The end snapshot lives only until then too.
+  to the listings queued ahead of it: its agent's earlier ones and at most one per other agent. The end
+  snapshot lives only until then too.
 - Each started job costs two snapshot creations and deletions, and a metadata send proportional to what changed.
   A job interrupted by pause or destroy gets its end snapshot under the lifecycle lock, before the VM stops;
   it is listed afterwards, off the lock.

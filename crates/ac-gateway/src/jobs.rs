@@ -612,11 +612,14 @@ enum Seal {
 /// The compares to run, and which agents' are off limits to them.
 #[derive(Default)]
 struct Diffs {
-    /// Ended jobs in turn order: oldest first, except that an agent whose compare was just taken
-    /// goes behind every other agent's ([`Diffs::take`]).
+    /// Ended jobs in turn order: oldest first, except that the agent whose compare was taken last
+    /// goes behind every other agent's at the next take ([`Diffs::take`]).
     queue: VecDeque<(AgentId, JobId)>,
     /// The agent whose job is being compared now.
     listing: Option<AgentId>,
+    /// The agent whose compare was taken last: its others go behind every other agent's at the
+    /// next take, so a job queued meanwhile gets the next turn.
+    last: Option<AgentId>,
     /// Agents being purged ([`Busy::hold`]): their compares wait, since the purge deletes the
     /// snapshots they read.
     held: HashSet<AgentId>,
@@ -628,15 +631,19 @@ impl Diffs {
         self.queue.iter().position(|(a, _)| !self.held.contains(a))
     }
 
-    /// Take the next compare, and move the rest of its agent's behind every other agent's, so
-    /// agents take turns: each turn compares the oldest queued job of each agent, and an agent
-    /// with many large compares queued delays another's by one of them per turn.
+    /// Take the next compare, after moving the last-served agent's behind every other agent's,
+    /// so agents take turns: each turn compares the oldest queued job of each agent with compares
+    /// queued, a job queued during a compare included, and an agent with many large compares
+    /// queued delays another's by one of them per turn.
     fn take(&mut self) -> Option<(AgentId, JobId)> {
+        if let Some(last) = self.last.take() {
+            let (theirs, others): (VecDeque<_>, VecDeque<_>) =
+                self.queue.drain(..).partition(|(a, _)| *a == last);
+            self.queue = others;
+            self.queue.extend(theirs);
+        }
         let next = self.next().and_then(|i| self.queue.remove(i))?;
-        let (theirs, others): (VecDeque<_>, VecDeque<_>) =
-            self.queue.drain(..).partition(|(a, _)| *a == next.0);
-        self.queue = others;
-        self.queue.extend(theirs);
+        self.last = Some(next.0.clone());
         Some(next)
     }
 }

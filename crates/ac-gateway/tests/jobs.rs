@@ -773,10 +773,10 @@ fn change_listings_alternate_over_several_turns() {
     assert_eq!(r.fake.w().ended, turns);
 }
 
-/// PR #33 review: a job queued while another agent's listing runs waits for that listing and the
-/// one other listing of this turn, not for the rest of that agent's queue.
+/// PR #33 review (Codex): a job queued while another agent's listing runs gets the next turn: it
+/// waits for that listing only, not for another of that agent's queued ones.
 #[test]
-fn a_listing_queued_during_another_agents_waits_one_turn() {
+fn a_listing_queued_during_another_agents_gets_the_next_turn() {
     let r = Arc::new(rig());
     let end = |agent: &str| {
         let id = r.ok(agent, "x");
@@ -801,7 +801,7 @@ fn a_listing_queued_during_another_agents_waits_one_turn() {
     r.diff_all();
     assert_eq!(
         r.fake.w().ended,
-        [ones[0].clone(), ones[1].clone(), two, ones[2].clone()]
+        [ones[0].clone(), two, ones[1].clone(), ones[2].clone()]
     );
 }
 

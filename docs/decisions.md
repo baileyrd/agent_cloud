@@ -1103,4 +1103,5 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
   access, since Serve answers only on the tailnet, but rename the host (and pick the tailnet name) before the
   first `tailscale serve --https` if those names should stay private; a later rename does not remove the entry.
 - Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it.
-- *Rollback:* `sudo tailscale serve reset`.
+- *Rollback:* `sudo tailscale serve --https=443 off`, which removes this mapping only; not `tailscale serve reset`,
+  which clears everything else the host serves too.

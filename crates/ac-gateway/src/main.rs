@@ -7,7 +7,9 @@
 //! refused if group/world readable), `AC_BIND` (default 127.0.0.1:8780), `AC_IMAGE` (required),
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
-//! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_PROBE_INTERVAL`
+//! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_TAILSCALE_SERVE=1` (behind
+//! `tailscale serve` on loopback, ADR-024: failed authentications are logged with the tailnet user),
+//! `AC_PROBE_INTERVAL`
 //! (seconds between watchdog probes, default 30; 0 turns the watchdog off). Watchdog thresholds
 //! (ADR-012; defaults in [`Thresholds`]): `AC_PROBE_BUDGET` (seconds one probe may take, 10),
 //! `AC_PROBE_FAILURES` (consecutive failures before acting, 3), `AC_PROBE_WINDOW` (seconds they must
@@ -400,6 +402,7 @@ fn run() -> Result<(), String> {
              unsets it.)"
         ));
     }
+    let behind_serve = bind::behind_serve(&addr, &env("AC_TAILSCALE_SERVE", ""))?;
     let data = PathBuf::from(env("AC_DATA", "/var/lib/agent-cloud"));
     let uid: u32 = env("AC_UID", "1000")
         .parse()
@@ -528,7 +531,10 @@ fn run() -> Result<(), String> {
             eprintln!("ac-gateway: {id}: clearing old viewer clients: {e}");
         }
     }
-    let app = Arc::new(App::new(api, hub.clone(), keys.clone()).with_jobs(Arc::clone(&jobs)));
+    let app = App::new(api, hub.clone(), keys.clone())
+        .with_jobs(Arc::clone(&jobs))
+        .with_tailscale_logins(behind_serve);
+    let app = Arc::new(app);
     let differ = Arc::clone(&jobs);
     std::thread::spawn(move || loop {
         // A panic in one compare is logged and the next runs, so snapshots never pile up behind

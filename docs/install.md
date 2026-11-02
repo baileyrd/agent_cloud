@@ -405,6 +405,9 @@ From another tailnet device use `https://<host>.<tailnet>.ts.net/` wherever this
 Never use `tailscale funnel`, which publishes the port to the internet. `sudo tailscale serve --https=443 --set-path=/ off` turns off
 this mapping only (the same flags as when it was turned on); `tailscale serve reset` would clear every
 application the host serves, so keep it for a host that serves nothing else.
+Then set `AC_TAILSCALE_SERVE=1` in `/etc/agent-cloud/gateway.env` and restart the gateway, so each failed
+authentication is logged with the tailnet user Serve names (the gateway refuses the setting unless `AC_BIND` is
+loopback).
 
 *Migrating from `AC_TOKEN_FILE`* (hosts set up before ADR-011). Nothing breaks on upgrade: the old token keeps
 working as an `admin` token for every agent named `legacy`, and the gateway logs that it is deprecated. To move

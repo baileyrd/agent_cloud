@@ -16,9 +16,44 @@ pub fn is_private(addr: &SocketAddr) -> bool {
     }
 }
 
+/// Whether the gateway sits behind `tailscale serve` (`AC_TAILSCALE_SERVE=1`, ADR-024), so that
+/// failure logs name the `Tailscale-User-Login` Serve sets. Only on loopback: on any other address a
+/// remote client reaches the gateway directly and writes the header itself. A process on the host
+/// can still write it, so the login is advisory, for the log only: never an identity.
+pub fn behind_serve(addr: &SocketAddr, setting: &str) -> Result<bool, String> {
+    match setting {
+        "" | "0" => Ok(false),
+        "1" if addr.ip().is_loopback() => Ok(true),
+        "1" => Err(format!(
+            "AC_TAILSCALE_SERVE=1 needs AC_BIND on loopback, not {addr}: tailscale serve \
+             forwards to it there, and remote clients cannot reach it to write the login it logs"
+        )),
+        other => Err(format!("AC_TAILSCALE_SERVE: {other:?} is not 0 or 1")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn behind_serve_only_on_loopback() {
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(behind_serve(&at("127.0.0.1:8780"), "1"), Ok(true));
+        assert_eq!(behind_serve(&at("[::1]:8780"), "1"), Ok(true));
+        assert_eq!(behind_serve(&at("100.64.0.2:8780"), ""), Ok(false));
+        assert_eq!(behind_serve(&at("127.0.0.1:8780"), "0"), Ok(false));
+        for (addr, setting) in [
+            ("100.64.0.2:8780", "1"),
+            ("10.0.0.1:1", "1"),
+            ("127.0.0.1:1", "yes"),
+        ] {
+            assert!(
+                behind_serve(&at(addr), setting).is_err(),
+                "{addr} {setting}"
+            );
+        }
+    }
 
     fn ok(s: &str) -> bool {
         s.parse().map(|a| is_private(&a)).unwrap_or(false)

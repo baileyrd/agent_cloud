@@ -1281,10 +1281,21 @@ fn serve(r: &Rig) -> SocketAddr {
 }
 
 fn serve_with(r: &Rig, keys: Keys) -> SocketAddr {
+    serve_app(r, keys, false)
+}
+
+/// Behind `tailscale serve` (ADR-024): failures are logged with the `Tailscale-User-Login`.
+fn serve_behind_tailscale(r: &Rig) -> SocketAddr {
+    serve_app(r, legacy(), true)
+}
+
+fn serve_app(r: &Rig, keys: Keys, tailscale: bool) -> SocketAddr {
     let fleet = Fleet::new(Rt, Arc::clone(&r.store));
     let api = Api::new(fleet).with_jobs(r.jobs.clone());
     let hub = Hub::new(NoTerm, r.root.join("history"));
-    let app = App::new(api, hub, keys).with_jobs(Arc::clone(&r.jobs));
+    let app = App::new(api, hub, keys)
+        .with_jobs(Arc::clone(&r.jobs))
+        .with_tailscale_logins(tailscale);
     let server = Server::bind_shared("127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")), app)
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
@@ -1593,6 +1604,45 @@ fn expired_tokens_are_refused_and_live_ones_say_when() {
         .file
         .list()
         .is_ok_and(|l| l.iter().any(|k| k.name == "old")));
+}
+
+/// A guess as tailnet user `login` (no login: a caller on the host itself, or a tagged device).
+fn guess_as(addr: SocketAddr, login: Option<&str>, i: usize) -> u16 {
+    let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
+    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+    let header = login.map_or(String::new(), |l| format!("Tailscale-User-Login: {l}\r\n"));
+    let _ = write!(
+        s,
+        "GET /api/v1/agents HTTP/1.1\r\nHost: {addr}\r\n{header}Authorization: Bearer guess{i}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let mut raw = String::new();
+    let _ = s.read_to_string(&mut raw);
+    raw.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
+}
+
+/// Card #470 review: behind `tailscale serve` the failure count stays one for the gateway. A
+/// process on the host reaches loopback without Serve and can name a new tailnet user on every
+/// guess; per-login counts logged all 2000 of 2000 such guesses. Red at a0e6b71.
+#[test]
+fn failed_auth_stays_limited_behind_tailscale_serve_whatever_login_is_sent() {
+    let r = rig();
+    let addr = serve_behind_tailscale(&r);
+    let codes: Vec<u16> = (0..25)
+        .map(|i| guess_as(addr, Some(&format!("user{i}@example.com")), i))
+        .collect();
+    assert_eq!(codes[..19], [401; 19]);
+    assert!(codes[19..].iter().all(|c| *c == 429), "{codes:?}");
+    assert_eq!(
+        guess_as(addr, None, 0),
+        429,
+        "a caller with no login shares it"
+    );
+    assert_eq!(
+        request(addr, "GET", "/api/v1/agents", "").0,
+        200,
+        "a valid token still works"
+    );
 }
 
 #[test]

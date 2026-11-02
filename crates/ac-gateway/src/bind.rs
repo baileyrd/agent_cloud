@@ -16,16 +16,17 @@ pub fn is_private(addr: &SocketAddr) -> bool {
     }
 }
 
-/// Whether the gateway sits behind `tailscale serve` (`AC_TAILSCALE_SERVE=1`, ADR-024), which
-/// makes the `Tailscale-User-Login` header Serve's word, not the client's. Only on loopback:
-/// on any other address a client reaches the gateway directly and writes the header itself.
+/// Whether the gateway sits behind `tailscale serve` (`AC_TAILSCALE_SERVE=1`, ADR-024), so that
+/// failure logs name the `Tailscale-User-Login` Serve sets. Only on loopback: on any other address a
+/// remote client reaches the gateway directly and writes the header itself. A process on the host
+/// can still write it, so the login is advisory, for the log only: never an identity.
 pub fn behind_serve(addr: &SocketAddr, setting: &str) -> Result<bool, String> {
     match setting {
         "" | "0" => Ok(false),
         "1" if addr.ip().is_loopback() => Ok(true),
         "1" => Err(format!(
             "AC_TAILSCALE_SERVE=1 needs AC_BIND on loopback, not {addr}: tailscale serve \
-             forwards to it there, and nothing else can reach it to forge who is calling"
+             forwards to it there, and remote clients cannot reach it to write the login it logs"
         )),
         other => Err(format!("AC_TAILSCALE_SERVE: {other:?} is not 0 or 1")),
     }

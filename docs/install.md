@@ -391,7 +391,8 @@ claude mcp add --transport http agent-cloud http://127.0.0.1:8780/api/v1/mcp \
 
 *HTTPS on the tailnet* (ADR-024). Keep `AC_BIND` on loopback and let tailscaled serve it over HTTPS with the
 certificate Tailscale provisions for the host's name (HTTPS certificates must be on for the tailnet, in the
-admin console under DNS):
+admin console under DNS). The certificate puts `<host>.<tailnet>.ts.net` in the public certificate-transparency
+logs for good: rename the host first if its name, or the tailnet's, should not be public.
 
 ```bash
 sudo tailscale serve --bg --https=443 http://127.0.0.1:8780
@@ -401,9 +402,9 @@ tailscale serve status        # https://<host>.<tailnet>.ts.net (tailnet only) |
 From another tailnet device use `https://<host>.<tailnet>.ts.net/` wherever this page says
 `http://127.0.0.1:8780` or `http://localhost:8780` (the viewer, MCP, the API). The setting survives reboots.
 Never use `tailscale funnel`, which publishes the port to the internet. `sudo tailscale serve reset` turns it off.
-Then set `AC_TAILSCALE_SERVE=1` in `/etc/agent-cloud/gateway.env` and restart the gateway, so failed
-authentications are limited per tailnet user rather than for everyone at once (the gateway refuses the setting
-unless `AC_BIND` is loopback).
+Then set `AC_TAILSCALE_SERVE=1` in `/etc/agent-cloud/gateway.env` and restart the gateway, so each failed
+authentication is logged with the tailnet user Serve names (the gateway refuses the setting unless `AC_BIND` is
+loopback).
 
 *Migrating from `AC_TOKEN_FILE`* (hosts set up before ADR-011). Nothing breaks on upgrade: the old token keeps
 working as an `admin` token for every agent named `legacy`, and the gateway logs that it is deprecated. To move

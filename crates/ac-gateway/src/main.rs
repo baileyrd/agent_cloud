@@ -8,7 +8,7 @@
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
 //! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_TAILSCALE_SERVE=1` (behind
-//! `tailscale serve` on loopback, ADR-024: failed authentications are limited per tailnet user),
+//! `tailscale serve` on loopback, ADR-024: failed authentications are logged with the tailnet user),
 //! `AC_PROBE_INTERVAL`
 //! (seconds between watchdog probes, default 30; 0 turns the watchdog off). Watchdog thresholds
 //! (ADR-012; defaults in [`Thresholds`]): `AC_PROBE_BUDGET` (seconds one probe may take, 10),

@@ -1284,7 +1284,7 @@ fn serve_with(r: &Rig, keys: Keys) -> SocketAddr {
     serve_app(r, keys, false)
 }
 
-/// Behind `tailscale serve` (ADR-024): failures are counted per `Tailscale-User-Login`.
+/// Behind `tailscale serve` (ADR-024): failures are logged with the `Tailscale-User-Login`.
 fn serve_behind_tailscale(r: &Rig) -> SocketAddr {
     serve_app(r, legacy(), true)
 }
@@ -1621,42 +1621,28 @@ fn guess_as(addr: SocketAddr, login: Option<&str>, i: usize) -> u16 {
     raw.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
 }
 
-/// Card #470: behind `tailscale serve`, one tailnet user's failed guesses are limited without
-/// limiting another's, or callers on the host. The header is trusted only there: Serve strips a
-/// client's own copy, and the gateway listens on loopback.
+/// Card #470 review: behind `tailscale serve` the failure count stays one for the gateway. A
+/// process on the host reaches loopback without Serve and can name a new tailnet user on every
+/// guess; per-login counts logged all 2000 of 2000 such guesses. Red at a0e6b71.
 #[test]
-fn failed_auth_is_limited_per_tailnet_user_behind_tailscale_serve() {
+fn failed_auth_stays_limited_behind_tailscale_serve_whatever_login_is_sent() {
     let r = rig();
     let addr = serve_behind_tailscale(&r);
-    let mallory: Vec<u16> = (0..25)
-        .map(|i| guess_as(addr, Some("mallory@example.com"), i))
+    let codes: Vec<u16> = (0..25)
+        .map(|i| guess_as(addr, Some(&format!("user{i}@example.com")), i))
         .collect();
-    assert_eq!(mallory[..19], [401; 19]);
-    assert!(mallory[19..].iter().all(|c| *c == 429), "{mallory:?}");
+    assert_eq!(codes[..19], [401; 19]);
+    assert!(codes[19..].iter().all(|c| *c == 429), "{codes:?}");
     assert_eq!(
-        guess_as(addr, Some("alice@example.com"), 0),
-        401,
-        "another user"
+        guess_as(addr, None, 0),
+        429,
+        "a caller with no login shares it"
     );
-    assert_eq!(guess_as(addr, None, 0), 401, "a caller on the host");
-    for hostile in ["", "a\u{1}b", &"x".repeat(300)] {
-        assert_eq!(
-            guess_as(addr, Some(hostile), 0),
-            401,
-            "{hostile:?}: counted as no login"
-        );
-    }
-}
-
-/// Without `tailscale serve` in front, the header is a client's own text: ignored.
-#[test]
-fn the_tailscale_login_is_ignored_unless_behind_tailscale_serve() {
-    let r = rig();
-    let addr = serve(&r);
-    for i in 0..20 {
-        guess_as(addr, Some("mallory@example.com"), i);
-    }
-    assert_eq!(guess_as(addr, Some("alice@example.com"), 0), 429);
+    assert_eq!(
+        request(addr, "GET", "/api/v1/agents", "").0,
+        200,
+        "a valid token still works"
+    );
 }
 
 #[test]

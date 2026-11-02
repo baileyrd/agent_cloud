@@ -27,13 +27,14 @@ const FAIL_LIMIT: u32 = 20;
 const FAIL_WINDOW: Duration = Duration::from_secs(60);
 /// Sources tracked at once.
 const FAIL_SOURCES: usize = 1024;
-/// rusty_serve does not tell a handler the peer's address. Behind `tailscale serve` (ADR-024)
-/// failures count against the tailnet user Serve names; otherwise, and for callers it names no one
-/// for (the host itself, tagged devices), against one shared source (ADR-011).
-const SHARED: &str = "any";
+/// rusty_serve does not tell a handler the peer's address, so every failure counts against one
+/// source: the limit bounds log volume and does not single out an address (ADR-011). Not one per
+/// tailnet login either: a process on the host reaches loopback without `tailscale serve` and could
+/// name a new login each time, so per-login counts would log every failure (ADR-024).
+const SOURCE: &str = "any";
 /// The tailnet user `tailscale serve` names. It strips a client's own copy of the header.
 const TAILSCALE_LOGIN: &str = "tailscale-user-login";
-/// Longest login taken as a source; a longer or unprintable one counts as none.
+/// Longest login logged; a longer or unprintable one is logged as none.
 const LOGIN_MAX: usize = 256;
 
 const PAGE: &str = include_str!("../assets/viewer.html");
@@ -61,7 +62,7 @@ pub struct App<R, S> {
     failures: Failures,
     hub: Hub,
     jobs: Option<Arc<Jobs>>,
-    /// Behind `tailscale serve`: [`TAILSCALE_LOGIN`] names the caller.
+    /// Behind `tailscale serve`: [`TAILSCALE_LOGIN`] names the caller in failure logs.
     tailscale: bool,
 }
 
@@ -78,7 +79,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
         }
     }
 
-    /// Count failed authentications per tailnet user, as `tailscale serve` names them (ADR-024).
+    /// Log the tailnet user `tailscale serve` names with each failed authentication (ADR-024).
     /// Only for a gateway listening on loopback behind Serve: elsewhere the header is the
     /// client's own text.
     pub fn with_tailscale_logins(mut self, behind_serve: bool) -> Self {
@@ -142,19 +143,21 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
     /// never the token or the header.
     fn refuse(&self, headers: &HeaderMap, method: &str, path: &str, why: &str) -> Response {
         let path = shown(path);
-        let source = match self.tailscale {
-            true => tailscale_login(headers).unwrap_or(SHARED),
-            false => SHARED,
+        let from = match self.tailscale {
+            true => format!(
+                " from {}",
+                tailscale_login(headers).map_or("no tailnet user".into(), escape)
+            ),
+            false => String::new(),
         };
-        let from = escape(source);
-        match self.failures.fail(source, Instant::now()) {
+        match self.failures.fail(SOURCE, Instant::now()) {
             Verdict::Log => {
-                eprintln!("ac-gateway: auth: {why} for {method} {path} from {from}");
+                eprintln!("ac-gateway: auth: {why} for {method} {path}{from}");
                 json(error(401, "unauthorized"))
             }
             Verdict::Limit => {
                 eprintln!(
-                    "ac-gateway: auth: {why} for {method} {path} from {from}; {FAIL_LIMIT} \
+                    "ac-gateway: auth: {why} for {method} {path}{from}; {FAIL_LIMIT} \
                      failures in {}s, further ones answered 429 and not logged",
                     FAIL_WINDOW.as_secs()
                 );
@@ -502,6 +505,27 @@ fn with(mut response: Response, headers: &[(&str, &str)]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tailscale_login_is_logged_only_when_printable_and_short() {
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            let _ = h.insert(TAILSCALE_LOGIN, v);
+            h
+        };
+        assert_eq!(
+            tailscale_login(&with("alice@example.com")),
+            Some("alice@example.com")
+        );
+        for bad in ["", "a b", "a\u{1}b", "\u{e9}", &"x".repeat(LOGIN_MAX + 1)] {
+            assert_eq!(tailscale_login(&with(bad)), None, "{bad:?}");
+        }
+        assert_eq!(
+            tailscale_login(&with(&"x".repeat(LOGIN_MAX))).map(str::len),
+            Some(LOGIN_MAX)
+        );
+        assert_eq!(tailscale_login(&HeaderMap::new()), None);
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

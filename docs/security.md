@@ -148,7 +148,8 @@ What it does not protect:
   Treat a `viewer:control` token, and a take-over, as equivalent to agent access.
 - Anything the agent prints is shown and recorded, secrets included.
 - The gateway listens on loopback here; reach it over HTTPS on the tailnet through `tailscale serve`
-  (ADR-024) or through an SSH tunnel. There is no TLS in the gateway itself.
+  (ADR-024) or through an SSH tunnel. There is no TLS in the gateway itself. The HTTPS certificate publishes
+  the host's and the tailnet's names in the certificate-transparency logs (no access, but no longer private).
 - A browser that vanishes without closing its connection holds its seat until TCP gives up; a
   closed one is noticed within about 5 s.
 
@@ -201,10 +202,10 @@ the agent user, by capped execs. Prompts are never in an argv; history records o
 - The command guard only blocks known-bad patterns.
 - Tokens expire only if created with `--expires` (ADR-022); otherwise revoke them. An expired token stays in
   the file (listed as expired) until revoked. `admin` (and the deprecated legacy token) can do everything.
-- Failed authentications are limited (20 a minute are logged, then 429) per tailnet user behind
-  `tailscale serve` with `AC_TAILSCALE_SERVE=1` (ADR-024), otherwise per gateway: rusty_serve does not tell
-  handlers the peer's address. Callers on the host and tagged devices share one count. Tokens are 256-bit,
-  so this bounds log volume rather than guessing.
+- Failed authentications are limited per gateway (20 a minute are logged, then 429), not per source:
+  rusty_serve does not tell handlers the peer's address. Behind `tailscale serve` with `AC_TAILSCALE_SERVE=1`
+  (ADR-024) the log names the tailnet user, as Serve reports it; a process on the host can send any name.
+  Tokens are 256-bit, so this bounds log volume rather than guessing.
 - Egress control limits destinations, not content: an agent can still send data to an allowed
   host (a GitHub gist, a model API request). TLS is not inspected, so domain fronting on shared
   CDN addresses is possible. See ADR-007.

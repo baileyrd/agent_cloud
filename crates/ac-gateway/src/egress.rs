@@ -364,7 +364,11 @@ mod tests {
         assert!(s.revoke(&id("zz")).is_ok() && !text(&s).contains("zz"));
         assert!(s.forget(&id("a2")).is_ok());
         // By line start: another agent's random digest can end in "a2", right before " rust".
-        assert!(!text(&s).lines().any(|l| l.starts_with("a2 ")), "{}", text(&s));
+        assert!(
+            !text(&s).lines().any(|l| l.starts_with("a2 ")),
+            "{}",
+            text(&s)
+        );
         let swept = s.sweep(&[id("a1")]).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(swept, [id("a3")]);
         assert!(text(&s).ends_with("a1 - rust\na3 - rust\n"), "{}", text(&s));

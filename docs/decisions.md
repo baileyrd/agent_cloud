@@ -1089,6 +1089,13 @@ viewer travels in a page the browser marks insecure.
   host, and the private-bind check (`bind.rs`) and the unit's `IPAddressAllow` stay as they are.
 - *Who may connect* stays with tailnet ACLs (who reaches the host) and API tokens (what they may do); Serve adds
   no access rule of its own.
+- *Failed authentications per tailnet user* (card #470). rusty_serve does not give a handler the peer's
+  address, and behind Serve every peer is loopback anyway. Serve names the tailnet user in
+  `Tailscale-User-Login` and strips a client's own copy of that header. With `AC_TAILSCALE_SERVE=1` the gateway
+  counts failures per login (20 a minute logged, then 429, as ADR-011), so one user's guessing never answers
+  another's 429. Callers it names no one for (the host itself, tagged devices) share one count, as do logins
+  that are empty, over 256 bytes or unprintable. The setting is refused unless `AC_BIND` is loopback: on any
+  other address a client reaches the gateway directly and writes the header itself.
 
 **To verify on BaileyServ** (`tailscale serve status`, then from another tailnet device): the viewer page
 loads and its `POST`s pass the `Origin` check (Serve must keep the `Host` header the browser sent); the
@@ -1098,5 +1105,6 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
 **Consequences:**
 - The documented way in from another machine is `https://<host>.<tailnet>.ts.net/`; the SSH tunnel still works
   (it reaches loopback). A tailnet `AC_BIND` still starts, for hosts set up that way, but serves plain HTTP.
-- Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it.
-- *Rollback:* `sudo tailscale serve reset`.
+- Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it. It can
+  also send any `Tailscale-User-Login`, which moves its failures to another count but grants nothing.
+- *Rollback:* `sudo tailscale serve reset`, and unset `AC_TAILSCALE_SERVE`.

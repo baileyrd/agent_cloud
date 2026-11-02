@@ -401,6 +401,9 @@ tailscale serve status        # https://<host>.<tailnet>.ts.net (tailnet only) |
 From another tailnet device use `https://<host>.<tailnet>.ts.net/` wherever this page says
 `http://127.0.0.1:8780` or `http://localhost:8780` (the viewer, MCP, the API). The setting survives reboots.
 Never use `tailscale funnel`, which publishes the port to the internet. `sudo tailscale serve reset` turns it off.
+Then set `AC_TAILSCALE_SERVE=1` in `/etc/agent-cloud/gateway.env` and restart the gateway, so failed
+authentications are limited per tailnet user rather than for everyone at once (the gateway refuses the setting
+unless `AC_BIND` is loopback).
 
 *Migrating from `AC_TOKEN_FILE`* (hosts set up before ADR-011). Nothing breaks on upgrade: the old token keeps
 working as an `admin` token for every agent named `legacy`, and the gateway logs that it is deprecated. To move

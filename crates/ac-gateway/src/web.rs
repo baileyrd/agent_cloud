@@ -27,9 +27,14 @@ const FAIL_LIMIT: u32 = 20;
 const FAIL_WINDOW: Duration = Duration::from_secs(60);
 /// Sources tracked at once.
 const FAIL_SOURCES: usize = 1024;
-/// rusty_serve does not tell a handler the peer's address, so every failure counts against one
-/// source: the limit bounds log volume and does not single out an address (ADR-011).
-const SOURCE: &str = "any";
+/// rusty_serve does not tell a handler the peer's address. Behind `tailscale serve` (ADR-024)
+/// failures count against the tailnet user Serve names; otherwise, and for callers it names no one
+/// for (the host itself, tagged devices), against one shared source (ADR-011).
+const SHARED: &str = "any";
+/// The tailnet user `tailscale serve` names. It strips a client's own copy of the header.
+const TAILSCALE_LOGIN: &str = "tailscale-user-login";
+/// Longest login taken as a source; a longer or unprintable one counts as none.
+const LOGIN_MAX: usize = 256;
 
 const PAGE: &str = include_str!("../assets/viewer.html");
 const SCRIPT: &str = include_str!("../assets/viewer.js");
@@ -56,6 +61,8 @@ pub struct App<R, S> {
     failures: Failures,
     hub: Hub,
     jobs: Option<Arc<Jobs>>,
+    /// Behind `tailscale serve`: [`TAILSCALE_LOGIN`] names the caller.
+    tailscale: bool,
 }
 
 impl<R: Runtime, S: SessionStore> App<R, S> {
@@ -67,7 +74,16 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             failures: Failures::new(FAIL_WINDOW, FAIL_LIMIT, FAIL_SOURCES),
             hub,
             jobs: None,
+            tailscale: false,
         }
+    }
+
+    /// Count failed authentications per tailnet user, as `tailscale serve` names them (ADR-024).
+    /// Only for a gateway listening on loopback behind Serve: elsewhere the header is the
+    /// client's own text.
+    pub fn with_tailscale_logins(mut self, behind_serve: bool) -> Self {
+        self.tailscale = behind_serve;
+        self
     }
 
     /// Serve the task API too.
@@ -104,12 +120,14 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
         let keys = self.keys.get();
         let token = match keys.find(r.authorization) {
             Presented::Known(t) if !t.live(tokens::unix_now()) => {
-                return self.refuse(method, path, &format!("token {} expired", t.name))
+                let why = format!("token {} expired", t.name);
+                return self.refuse(r.headers, method, path, &why);
             }
             Presented::Known(t) => t,
-            Presented::Missing => return self.refuse(method, path, "no bearer token"),
+            Presented::Missing => return self.refuse(r.headers, method, path, "no bearer token"),
             Presented::Unknown(prefix) => {
-                return self.refuse(method, path, &format!("unknown token sha256:{prefix}"))
+                let why = format!("unknown token sha256:{prefix}");
+                return self.refuse(r.headers, method, path, &why);
             }
         };
         if path == mcp::PATH && !mcp_version_ok(r.headers) {
@@ -122,17 +140,22 @@ impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
 impl<R: Runtime, S: SessionStore> App<R, S> {
     /// 401, or 429 once a source has failed too often; logged with the token's digest prefix,
     /// never the token or the header.
-    fn refuse(&self, method: &str, path: &str, why: &str) -> Response {
+    fn refuse(&self, headers: &HeaderMap, method: &str, path: &str, why: &str) -> Response {
         let path = shown(path);
-        match self.failures.fail(SOURCE, Instant::now()) {
+        let source = match self.tailscale {
+            true => tailscale_login(headers).unwrap_or(SHARED),
+            false => SHARED,
+        };
+        let from = escape(source);
+        match self.failures.fail(source, Instant::now()) {
             Verdict::Log => {
-                eprintln!("ac-gateway: auth: {why} for {method} {path}");
+                eprintln!("ac-gateway: auth: {why} for {method} {path} from {from}");
                 json(error(401, "unauthorized"))
             }
             Verdict::Limit => {
                 eprintln!(
-                    "ac-gateway: auth: {why} for {method} {path}; {FAIL_LIMIT} failures in \
-                     {}s, further ones answered 429 and not logged",
+                    "ac-gateway: auth: {why} for {method} {path} from {from}; {FAIL_LIMIT} \
+                     failures in {}s, further ones answered 429 and not logged",
                     FAIL_WINDOW.as_secs()
                 );
                 json(error(429, "too many failed attempts"))
@@ -398,6 +421,14 @@ fn shown(path: &str) -> String {
 /// Agent-written bytes as plain text (see [`UNTRUSTED`]).
 fn untrusted(body: Vec<u8>) -> Response {
     with(Response::json(StatusCode::OK, body), &UNTRUSTED)
+}
+
+/// The tailnet user `tailscale serve` named, if it named a printable one of at most
+/// [`LOGIN_MAX`] bytes.
+fn tailscale_login(headers: &HeaderMap) -> Option<&str> {
+    let login = headers.get(TAILSCALE_LOGIN)?;
+    let printable = login.chars().all(|c| c.is_ascii_graphic());
+    (!login.is_empty() && login.len() <= LOGIN_MAX && printable).then_some(login)
 }
 
 /// A browser request from another site is refused. `Origin` (sent on POSTs and cross-origin

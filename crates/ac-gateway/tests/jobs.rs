@@ -1281,10 +1281,21 @@ fn serve(r: &Rig) -> SocketAddr {
 }
 
 fn serve_with(r: &Rig, keys: Keys) -> SocketAddr {
+    serve_app(r, keys, false)
+}
+
+/// Behind `tailscale serve` (ADR-024): failures are counted per `Tailscale-User-Login`.
+fn serve_behind_tailscale(r: &Rig) -> SocketAddr {
+    serve_app(r, legacy(), true)
+}
+
+fn serve_app(r: &Rig, keys: Keys, tailscale: bool) -> SocketAddr {
     let fleet = Fleet::new(Rt, Arc::clone(&r.store));
     let api = Api::new(fleet).with_jobs(r.jobs.clone());
     let hub = Hub::new(NoTerm, r.root.join("history"));
-    let app = App::new(api, hub, keys).with_jobs(Arc::clone(&r.jobs));
+    let app = App::new(api, hub, keys)
+        .with_jobs(Arc::clone(&r.jobs))
+        .with_tailscale_logins(tailscale);
     let server = Server::bind_shared("127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")), app)
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
@@ -1593,6 +1604,59 @@ fn expired_tokens_are_refused_and_live_ones_say_when() {
         .file
         .list()
         .is_ok_and(|l| l.iter().any(|k| k.name == "old")));
+}
+
+/// A guess as tailnet user `login` (no login: a caller on the host itself, or a tagged device).
+fn guess_as(addr: SocketAddr, login: Option<&str>, i: usize) -> u16 {
+    let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
+    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+    let header = login.map_or(String::new(), |l| format!("Tailscale-User-Login: {l}\r\n"));
+    let _ = write!(
+        s,
+        "GET /api/v1/agents HTTP/1.1\r\nHost: {addr}\r\n{header}Authorization: Bearer guess{i}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let mut raw = String::new();
+    let _ = s.read_to_string(&mut raw);
+    raw.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
+}
+
+/// Card #470: behind `tailscale serve`, one tailnet user's failed guesses are limited without
+/// limiting another's, or callers on the host. The header is trusted only there: Serve strips a
+/// client's own copy, and the gateway listens on loopback.
+#[test]
+fn failed_auth_is_limited_per_tailnet_user_behind_tailscale_serve() {
+    let r = rig();
+    let addr = serve_behind_tailscale(&r);
+    let mallory: Vec<u16> = (0..25)
+        .map(|i| guess_as(addr, Some("mallory@example.com"), i))
+        .collect();
+    assert_eq!(mallory[..19], [401; 19]);
+    assert!(mallory[19..].iter().all(|c| *c == 429), "{mallory:?}");
+    assert_eq!(
+        guess_as(addr, Some("alice@example.com"), 0),
+        401,
+        "another user"
+    );
+    assert_eq!(guess_as(addr, None, 0), 401, "a caller on the host");
+    for hostile in ["", "a\u{1}b", &"x".repeat(300)] {
+        assert_eq!(
+            guess_as(addr, Some(hostile), 0),
+            401,
+            "{hostile:?}: counted as no login"
+        );
+    }
+}
+
+/// Without `tailscale serve` in front, the header is a client's own text: ignored.
+#[test]
+fn the_tailscale_login_is_ignored_unless_behind_tailscale_serve() {
+    let r = rig();
+    let addr = serve(&r);
+    for i in 0..20 {
+        guess_as(addr, Some("mallory@example.com"), i);
+    }
+    assert_eq!(guess_as(addr, Some("alice@example.com"), 0), 429);
 }
 
 #[test]

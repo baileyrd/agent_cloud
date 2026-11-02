@@ -1098,5 +1098,9 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
 **Consequences:**
 - The documented way in from another machine is `https://<host>.<tailnet>.ts.net/`; the SSH tunnel still works
   (it reaches loopback). A tailnet `AC_BIND` still starts, for hosts set up that way, but serves plain HTTP.
+- The certificate is public: every certificate Tailscale issues is recorded in the certificate-transparency logs,
+  so `<host>.<tailnet>.ts.net` (the host's name and the tailnet's) becomes public and searchable. It grants no
+  access, since Serve answers only on the tailnet, but rename the host (and pick the tailnet name) before the
+  first `tailscale serve --https` if those names should stay private; a later rename does not remove the entry.
 - Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it.
 - *Rollback:* `sudo tailscale serve reset`.

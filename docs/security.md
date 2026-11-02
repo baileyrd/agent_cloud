@@ -148,7 +148,8 @@ What it does not protect:
   Treat a `viewer:control` token, and a take-over, as equivalent to agent access.
 - Anything the agent prints is shown and recorded, secrets included.
 - The gateway listens on loopback here; reach it over HTTPS on the tailnet through `tailscale serve`
-  (ADR-024) or through an SSH tunnel. There is no TLS in the gateway itself.
+  (ADR-024) or through an SSH tunnel. There is no TLS in the gateway itself. The HTTPS certificate publishes
+  the host's and the tailnet's names in the certificate-transparency logs (no access, but no longer private).
 - A browser that vanishes without closing its connection holds its seat until TCP gives up; a
   closed one is noticed within about 5 s.
 

@@ -391,7 +391,8 @@ claude mcp add --transport http agent-cloud http://127.0.0.1:8780/api/v1/mcp \
 
 *HTTPS on the tailnet* (ADR-024). Keep `AC_BIND` on loopback and let tailscaled serve it over HTTPS with the
 certificate Tailscale provisions for the host's name (HTTPS certificates must be on for the tailnet, in the
-admin console under DNS):
+admin console under DNS). The certificate puts `<host>.<tailnet>.ts.net` in the public certificate-transparency
+logs for good: rename the host first if its name, or the tailnet's, should not be public.
 
 ```bash
 sudo tailscale serve --bg --https=443 http://127.0.0.1:8780

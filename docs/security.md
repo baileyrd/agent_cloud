@@ -29,7 +29,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 
 - [ ] `/dev/kvm` present; every agent runs under the Kata runtime class, never plain runc
 - [ ] SELinux enforcing; denials reviewed instead of disabling it
-- [ ] Gateway reachable only over Tailscale with HTTPS and a bearer token
+- [ ] Gateway reachable only over Tailscale with HTTPS and a bearer token: on loopback behind
+  `tailscale serve` (ADR-024; to verify on BaileyServ)
 - [x] nftables egress rules: agents reach only the egress proxy (verified 2026-10-19 from a1:
   direct connections to the internet, the LAN, 169.254.169.254 and other host ports refused;
   no DNS)
@@ -146,8 +147,9 @@ What it does not protect:
   user can reach: its workspace, its Claude Code login (`/workspace/.claude`), its Git credentials.
   Treat a `viewer:control` token, and a take-over, as equivalent to agent access.
 - Anything the agent prints is shown and recorded, secrets included.
-- The gateway listens on loopback here; reach it through an SSH tunnel (encrypted) or a tailnet
-  address. There is no TLS of its own.
+- The gateway listens on loopback here; reach it over HTTPS on the tailnet through `tailscale serve`
+  (ADR-024) or through an SSH tunnel. There is no TLS in the gateway itself. The HTTPS certificate publishes
+  the host's and the tailnet's names in the certificate-transparency logs (no access, but no longer private).
 - A browser that vanishes without closing its connection holds its seat until TCP gives up; a
   closed one is noticed within about 5 s.
 

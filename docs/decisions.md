@@ -1072,3 +1072,37 @@ memory in `/dev/shm`) is charged to `agents` as file pages. Workspaces sit on th
 
 **Not now:** a different limit per agent or per token (no caller needs one yet); `io.max` (it needs a device and
 per-disk numbers); reporting usage and OOM kills in the agent's JSON; `ac-ctl doctor` rules for the limits.
+
+## ADR-024: HTTPS on the tailnet through `tailscale serve`
+**Status:** proposed (2026-11-02); to verify on BaileyServ (below).
+**Context:** The gateway speaks plain HTTP and has no TLS of its own (security.md). Callers off the host reach
+it through an SSH tunnel or a tailnet bind. Tailnet traffic is already encrypted by WireGuard, but a browser
+sees an `http://` page: no secure context, no certificate naming the host, and the bearer token typed into the
+viewer travels in a page the browser marks insecure.
+
+**Decision:**
+- *TLS ends in tailscaled, not the gateway.* The gateway stays on loopback (`AC_BIND=127.0.0.1:8780`, the
+  default), and `sudo tailscale serve --bg --https=443 --set-path=/ http://127.0.0.1:8780` serves it at
+  `https://<host>.<tailnet>.ts.net/` with the certificate Tailscale provisions for that name. Serve listens only
+  on the tailnet; tailscaled keeps the configuration across reboots. Funnel (public exposure) is never turned on.
+- *No TLS library in the gateway:* no new dependency (ADR-008), no certificate files or renewal to manage on the
+  host, and the private-bind check (`bind.rs`) and the unit's `IPAddressAllow` stay as they are.
+- *Who may connect* stays with tailnet ACLs (who reaches the host) and API tokens (what they may do); Serve adds
+  no access rule of its own.
+
+**To verify on BaileyServ** (`tailscale serve status`, then from another tailnet device): the viewer page
+loads and its `POST`s pass the `Origin` check (Serve must keep the `Host` header the browser sent); the
+terminal stream (`GET .../term`, NDJSON) arrives as it is written, not buffered; an MCP client works against
+the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve configured.
+
+**Consequences:**
+- The documented way in from another machine is `https://<host>.<tailnet>.ts.net/`; the SSH tunnel still works
+  (it reaches loopback). A tailnet `AC_BIND` still starts, for hosts set up that way, but serves plain HTTP.
+- The certificate is public: every certificate Tailscale issues is recorded in the certificate-transparency logs,
+  so `<host>.<tailnet>.ts.net` (the host's name and the tailnet's) becomes public and searchable. It grants no
+  access, since Serve answers only on the tailnet, but rename the host (and pick the tailnet name) before the
+  first `tailscale serve --https` if those names should stay private; a later rename does not remove the entry.
+- Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it.
+- *Rollback:* `sudo tailscale serve --https=443 --set-path=/ off`, which removes this mapping only (without
+  `--set-path` it removes every handler on 443); not `tailscale serve reset`, which clears everything the host
+  serves.

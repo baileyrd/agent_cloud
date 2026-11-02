@@ -1111,6 +1111,8 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
   so `<host>.<tailnet>.ts.net` (the host's name and the tailnet's) becomes public and searchable. It grants no
   access, since Serve answers only on the tailnet, but rename the host (and pick the tailnet name) before the
   first `tailscale serve --https` if those names should stay private; a later rename does not remove the entry.
+- Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it. It can
+  also send any `Tailscale-User-Login`, which only changes the name its failures are logged under.
 - *Rollback:* `sudo tailscale serve --https=443 --set-path=/ off`, which removes this mapping only (without
   `--set-path` it removes every handler on 443; `tailscale serve reset` clears everything the host serves), and
   unset `AC_TAILSCALE_SERVE`.

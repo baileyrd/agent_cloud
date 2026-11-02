@@ -1113,4 +1113,5 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
   first `tailscale serve --https` if those names should stay private; a later rename does not remove the entry.
 - Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it. It can
   also send any `Tailscale-User-Login`, which only changes the name its failures are logged under.
-- *Rollback:* `sudo tailscale serve reset`, and unset `AC_TAILSCALE_SERVE`.
+- *Rollback:* `sudo tailscale serve --https=443 off`, which removes this mapping only (not `tailscale serve reset`,
+  which clears everything else the host serves too), and unset `AC_TAILSCALE_SERVE`.

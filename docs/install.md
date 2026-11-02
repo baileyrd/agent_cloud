@@ -127,7 +127,8 @@ curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
 ```
 
 Build the gateway, spawner and session store (module boundaries in
-[architecture.md](architecture.md)). Put the gateway behind HTTPS on the tailnet only.
+[architecture.md](architecture.md)). Put the gateway behind HTTPS on the tailnet only (ADR-024; see
+*HTTPS on the tailnet* under Host services).
 
 ## Phase 7: Lock it down
 
@@ -388,6 +389,19 @@ claude mcp add --transport http agent-cloud http://127.0.0.1:8780/api/v1/mcp \
   --header "Authorization: Bearer $TOKEN"
 ```
 
+*HTTPS on the tailnet* (ADR-024). Keep `AC_BIND` on loopback and let tailscaled serve it over HTTPS with the
+certificate Tailscale provisions for the host's name (HTTPS certificates must be on for the tailnet, in the
+admin console under DNS):
+
+```bash
+sudo tailscale serve --bg --https=443 http://127.0.0.1:8780
+tailscale serve status        # https://<host>.<tailnet>.ts.net (tailnet only) |-- / proxy http://127.0.0.1:8780
+```
+
+From another tailnet device use `https://<host>.<tailnet>.ts.net/` wherever this page says
+`http://127.0.0.1:8780` or `http://localhost:8780` (the viewer, MCP, the API). The setting survives reboots.
+Never use `tailscale funnel`, which publishes the port to the internet. `sudo tailscale serve reset` turns it off.
+
 *Migrating from `AC_TOKEN_FILE`* (hosts set up before ADR-011). Nothing breaks on upgrade: the old token keeps
 working as an `admin` token for every agent named `legacy`, and the gateway logs that it is deprecated. To move
 off it:
@@ -405,8 +419,8 @@ How to use it:
 
 1. From your own machine, tunnel to the gateway (it listens on loopback):
    `ssh -N -L 8780:127.0.0.1:8780 -p 30556 baileyrd@192.168.50.196` (in general:
-   `ssh -N -L 8780:127.0.0.1:8780 [-p <ssh-port>] <user>@<host>`). With `AC_BIND` on a tailnet address,
-   skip the tunnel and use that address instead of `localhost`.
+   `ssh -N -L 8780:127.0.0.1:8780 [-p <ssh-port>] <user>@<host>`). With HTTPS on the tailnet (above), skip
+   the tunnel and use `https://<host>.<tailnet>.ts.net` instead of `http://localhost:8780`.
 2. Open `http://localhost:8780/ui/<agent-id>` (for example `http://localhost:8780/ui/a1`). The page asks for a
    token with `viewer:read` for that agent (or the owner's, `sudo cat /etc/agent-cloud/owner.token`), shows its
    name and scopes, and keeps it in memory only: reloading asks again. Without `viewer:control` there is no

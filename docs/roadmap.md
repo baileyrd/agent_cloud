@@ -25,7 +25,8 @@
   the gateway on BaileyServ (2026-10-19)
 - [x] Startup reconcile: agents recorded running with no VM become paused and are cleaned up (`ac-ctl reconcile`,
   run by `ac-gateway` at start); verified after a simulated VM crash and across a real reboot (2026-10-20)
-- [x] Gateway lifecycle API with bearer auth, private-bind check (`ac-gateway`); TLS via Tailscale still pending
+- [x] Gateway lifecycle API with bearer auth, private-bind check (`ac-gateway`); HTTPS on the tailnet through `tailscale serve`
+  (ADR-024) still to verify on BaileyServ
 - [x] Task API: jobs with ids, long-poll status, capped output, cancel, timeouts, re-attach after a gateway restart
   (ADR-010; verified on BaileyServ 2026-10-21)
 - [x] Scoped API tokens: one per caller, with scopes and agents, digests only, audit trail, revocable while the

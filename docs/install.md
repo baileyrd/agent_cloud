@@ -395,14 +395,14 @@ admin console under DNS). The certificate puts `<host>.<tailnet>.ts.net` in the 
 logs for good: rename the host first if its name, or the tailnet's, should not be public.
 
 ```bash
-tailscale serve status        # first: anything already served on 443 would be replaced
-sudo tailscale serve --bg --https=443 http://127.0.0.1:8780
+tailscale serve status        # first: anything already served at / on 443 would be replaced
+sudo tailscale serve --bg --https=443 --set-path=/ http://127.0.0.1:8780
 tailscale serve status        # https://<host>.<tailnet>.ts.net (tailnet only) |-- / proxy http://127.0.0.1:8780
 ```
 
 From another tailnet device use `https://<host>.<tailnet>.ts.net/` wherever this page says
 `http://127.0.0.1:8780` or `http://localhost:8780` (the viewer, MCP, the API). The setting survives reboots.
-Never use `tailscale funnel`, which publishes the port to the internet. `sudo tailscale serve --https=443 off` turns off
+Never use `tailscale funnel`, which publishes the port to the internet. `sudo tailscale serve --https=443 --set-path=/ off` turns off
 this mapping only (the same flags as when it was turned on); `tailscale serve reset` would clear every
 application the host serves, so keep it for a host that serves nothing else.
 Then set `AC_TAILSCALE_SERVE=1` in `/etc/agent-cloud/gateway.env` and restart the gateway, so each failed

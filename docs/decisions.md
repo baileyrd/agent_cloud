@@ -1082,7 +1082,7 @@ viewer travels in a page the browser marks insecure.
 
 **Decision:**
 - *TLS ends in tailscaled, not the gateway.* The gateway stays on loopback (`AC_BIND=127.0.0.1:8780`, the
-  default), and `sudo tailscale serve --bg --https=443 http://127.0.0.1:8780` serves it at
+  default), and `sudo tailscale serve --bg --https=443 --set-path=/ http://127.0.0.1:8780` serves it at
   `https://<host>.<tailnet>.ts.net/` with the certificate Tailscale provisions for that name. Serve listens only
   on the tailnet; tailscaled keeps the configuration across reboots. Funnel (public exposure) is never turned on.
 - *No TLS library in the gateway:* no new dependency (ADR-008), no certificate files or renewal to manage on the
@@ -1111,7 +1111,6 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
   so `<host>.<tailnet>.ts.net` (the host's name and the tailnet's) becomes public and searchable. It grants no
   access, since Serve answers only on the tailnet, but rename the host (and pick the tailnet name) before the
   first `tailscale serve --https` if those names should stay private; a later rename does not remove the entry.
-- Any process on the host can still reach the gateway on loopback, as before; tokens are what stop it. It can
-  also send any `Tailscale-User-Login`, which only changes the name its failures are logged under.
-- *Rollback:* `sudo tailscale serve --https=443 off`, which removes this mapping only (not `tailscale serve reset`,
-  which clears everything else the host serves too), and unset `AC_TAILSCALE_SERVE`.
+- *Rollback:* `sudo tailscale serve --https=443 --set-path=/ off`, which removes this mapping only (without
+  `--set-path` it removes every handler on 443; `tailscale serve reset` clears everything the host serves), and
+  unset `AC_TAILSCALE_SERVE`.

@@ -1116,3 +1116,63 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
 - *Rollback:* `sudo tailscale serve --https=443 --set-path=/ off`, which removes this mapping only (without
   `--set-path` it removes every handler on 443; `tailscale serve reset` clears everything the host serves), and
   unset `AC_TAILSCALE_SERVE`.
+
+## ADR-025: agent_cloud is the isolation wall for untrusted agents; desktop parked
+**Status:** proposed (2026-11-09); Nano to pick an option. Mill Board card #1057.
+**Context:** agent_cloud was planned as a whole product: agents with a shell and a desktop, watched and taken
+over from a browser (ADR-006), a per-job event stream (AG-UI, card #471) and a web UI (#516). Since then, Let Em
+Loose (LEL) settled who does what around it, and #471, #473 and #516 were put on hold on 2026-11-05:
+- *LEL D101* (#726 D-a, after spike #727): agents act through tools behind an MCP gateway, from a jailed
+  process (namespaces, overlayfs + rusty_sandbox Landlock, seccomp, no secrets, egress only to the gateway).
+  An agent_cloud microVM is optional, and required for untrusted agents. Audit comes from a witness outside
+  the jail (upper-layer diff, exec log, gateway call log) as digests on the BBP claim.
+- *rusty_term D81/D82* (#732): agents run in rusty_mux-hosted ptys with an owner-only take-over lease. rusty_mux
+  is where agents are watched and taken over.
+- *LEL D53:* LEL's own services all run on BaileyAi. agent_cloud runs on BaileyServ (KVM, Kata, btrfs verified
+  there). Its gateway is an API on the tailnet (ADR-024), so a launcher on BaileyAi can drive it from there.
+- Mill Board already shows the work: cards, claims, the decision inbox, roadmap and metrics.
+
+What no other part provides is what agent_cloud already has: a hardware boundary (one Kata VM per agent,
+ADR-001), hostname-allowlist egress per agent (ADR-007, ADR-016), resource limits (ADR-023), workspace
+checkpoints, forks and backups (ADR-018, ADR-021), and per-job changed paths taken from outside the VM
+(ADR-019). rusty_sandbox is unprivileged, per turn and same-uid. It is a complementary layer inside the VM,
+not a replacement (2026-10-26 comparison).
+
+**Options:**
+- *A. Wall only.* agent_cloud becomes the outer boundary for untrusted agents, driven by LEL through the job
+  API and MCP. Supersede #471 (event stream), #473 (desktop streaming) and #516 (web UI). Drop #472 and #474
+  (desktop image, end-to-end with desktop) and the desktop part of ADR-004/ADR-006. Cheapest. It loses the only
+  place a browser-driving agent could run safely; bringing that back later means re-opening the design.
+- *B. Status quo.* Keep the wall and also build the desktop, the AG-UI stream and the web UI. This duplicates
+  rusty_mux (watch and take over), Mill Board (status and work) and the BBP witness (events), so there are two
+  surfaces for each concern. It is the most work and blocks nothing LEL needs.
+- *C. Wall now, desktop parked (recommended).* As A for the event stream and the web UI (supersede #471,
+  #516), and build the R4 cards (#1063–#1067: gateway-only egress, a per-job credential, witness digests, the
+  launch contract, an end-to-end run). The desktop is moved to *Later*, not dropped: #472, #473 and #474 stay
+  closed until a real task needs an agent that drives a GUI browser. When that happens, the stream is decided
+  again next to rusty_mux and not assumed to be ac-viewer's.
+
+**Recommendation: C.** It spends effort only where agent_cloud is the sole provider (the wall). It removes
+the two duplicates that have a clear owner elsewhere (events, UI). It keeps the one capability nobody else
+plans (a sandboxed desktop) available without building it on speculation.
+
+**What ac-viewer becomes:**
+- *A and C:* frozen as it is. The terminal viewer is built and verified (2026-10-20/22). It stays as the owner's
+  break-glass way into a VM when rusty_mux cannot reach it. Fixes only, no new features. Under A its desktop
+  section is deleted from ADR-006. Under C it is marked parked.
+- *B:* grows the desktop stream on the same transport and lock (ADR-006 open part).
+
+**Consequences (C):**
+- *Unit:* agent_cloud keeps one VM per agent. Mapping LEL work onto it (one agent_cloud agent per project, or
+  per claim) is LEL's choice. It is an agent create plus jobs, with no new agent_cloud concept.
+- *API stays the contract:* REST and MCP (ADR-010, ADR-017, ADR-020). The R4 additions are a `gateway` egress
+  profile, an opaque per-job credential that is never logged or stored, and a per-job witness record with a
+  digest. Each gets its own ADR when built.
+- *Trust:* the jail inside the VM (D101) and the VM itself are two layers. A jail escape still lands in a VM
+  that can reach only the MCP gateway and that holds no long-lived secret.
+- *Roadmap:* R3 (safe to leave running) is unchanged. R5 shrinks to the parked desktop. docs/architecture.md
+  goal 3 ("watch and take over from any device") moves to rusty_mux, with ac-viewer kept as the fallback.
+- *Host:* nothing here depends on the host choice (#1058). If agent_cloud moves to BaileyAi, that is a
+  migration card under R3.
+- *Revisit when:* a task needs a GUI browser agent (un-park the desktop), or LEL stops requiring a VM for
+  untrusted agents (agent_cloud's reason to exist narrows to backups and checkpoints).

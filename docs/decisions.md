@@ -1116,3 +1116,41 @@ the `https://` URL; `post-reboot-check.sh` passes after a reboot with Serve conf
 - *Rollback:* `sudo tailscale serve --https=443 --set-path=/ off`, which removes this mapping only (without
   `--set-path` it removes every handler on 443; `tailscale serve reset` clears everything the host serves), and
   unset `AC_TAILSCALE_SERVE`.
+
+## ADR-025: agent_cloud stays a full product next to Let Em Loose
+**Status:** accepted (2026-11-09, Nano). Mill Board card #1057.
+**Context:** On 2026-11-05 the desktop stream (#473), the per-job event stream (#471) and the web UI (#516) were
+put on hold. The reason was that Let Em Loose (LEL) had settled roles around agent_cloud:
+- *LEL D101* (#726 D-a): agents act through tools behind an MCP gateway, from a jailed process. An agent_cloud
+  microVM is required for untrusted agents. Audit comes from a witness outside the jail.
+- *rusty_term D81/D82* (#732): rusty_mux hosts agent ptys and gives an owner-only take-over lease.
+- *LEL D53:* LEL's services run on BaileyAi. agent_cloud runs on BaileyServ and is reached over the tailnet
+  (ADR-024).
+
+Three roles were weighed: (A) only the isolation wall, (B) the wall plus agent_cloud's own desktop, viewer,
+event stream and UI, and (C) the wall now with the desktop parked.
+
+**Decision: B.** agent_cloud stays a complete product. It is the isolation wall for untrusted LEL agents, and
+it also keeps its own way to watch, steer and manage agents.
+- *Wall:* build the R4 cards (#1063–#1067). These are gateway-only egress, an opaque per-job credential, a
+  per-job witness record with a digest, a launch contract for LEL, and an end-to-end untrusted run.
+- *Desktop:* build the desktop image (#472) and the end-to-end shell + desktop task (#474), as M1 planned.
+- *Viewer:* the desktop stream (#473) uses the same transport and take-over lock as the terminal viewer
+  (ADR-006, open part). ac-viewer stays agent_cloud's own watch and take-over surface.
+- *Events and UI:* the per-job AG-UI stream (#471) and the web UI (#516) go ahead. #516 still needs its own
+  stack ADR first.
+- The holds from 2026-11-05 are lifted.
+
+**Consequences:**
+- *Two watch surfaces:* agents launched through LEL can be watched in rusty_mux. Any agent_cloud agent can be
+  watched in ac-viewer. Each tool keeps its own take-over lock. A tool may only send input into an agent it
+  launched, unless the owner forces take-over in the other tool.
+- *Overlap is accepted:* the AG-UI stream, the web UI and Mill Board/the BBP witness show some of the same
+  facts. agent_cloud's copies are built from its own API and add no new backend surface (ADR-020). The witness
+  record (#1065) stays the evidence LEL trusts. The AG-UI stream is for watching, not for evidence.
+- *Order:* R1 and R3 come first (verify, then make it safe to leave running), then R4 and R5. R5 goes in the
+  order #472, #474/#473, #471, #516.
+- *Unit:* one VM per agent (ADR-001). Mapping LEL work onto agents (per project or per claim) is LEL's choice.
+- *Host:* nothing here depends on the host choice (#1058).
+- *Revisit when:* keeping both watch surfaces in step costs more than it gives, or LEL stops requiring a VM
+  for untrusted agents.

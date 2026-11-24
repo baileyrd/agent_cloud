@@ -837,7 +837,8 @@ without trusting the agent.
   `\ooo`), so none holds whitespace or a control character.
 - *Note:* one history line after the job's end state, `job <id> changed <n> paths: <path> <path> ...`, the
   runner's own files (`.jobs/`, the root's `.job-*`) left out, at most `CHANGE_NOTE_CAP` (2 KiB) of paths and
-  then `(and <k> more)`. It is shown by `GET .../history` and the `get_history` tool, with no new route.
+  then `(and <k> more)`; Claude Code's `.claude/` files are listed last (#1624), so its session churn cannot
+  push the job's own changes out. It is shown by `GET .../history` and the `get_history` tool, with no new route.
 - *Where it cannot:* a plain-directory workspace takes no snapshot and gets no note; a failed diff is logged to
   the journal with its cause and noted as `job <id> changes could not be listed`, so a job cannot hide what it
   did by making its listing fail; the job is unaffected.

@@ -587,6 +587,18 @@ fn change_notes_leave_out_the_runner_and_are_capped() {
         jobs::change_note(&id, &paths(&["a/.job-x", r"b\ c"])),
         r"job j1 changed 2 paths: a/.job-x b\ c"
     );
+    // #1624: Claude Code's .claude/ churn is listed after the workspace's own changes.
+    let mut churn: Vec<String> = (0..150)
+        .map(|i| format!(".claude/projects/-workspace/{i:032}.jsonl"))
+        .collect();
+    churn.insert(70, "src/main.rs".into());
+    churn.extend(paths(&["README.md", ".claude", "docs/a.md"]));
+    let note = jobs::change_note(&id, &churn);
+    assert!(
+        note.starts_with("job j1 changed 154 paths: src/main.rs README.md docs/a.md .claude/"),
+        "{note}"
+    );
+    assert!(note.ends_with(" more)"), "{note}");
     let many: Vec<String> = (0..1000).map(|i| format!("dir/file{i:04}")).collect();
     let note = jobs::change_note(&id, &many);
     assert!(note.len() <= "job j1 changed 1000 paths:".len() + jobs::CHANGE_NOTE_CAP + 20);

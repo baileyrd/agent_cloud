@@ -268,14 +268,18 @@ pub fn too_many_note(id: &JobId) -> String {
 
 /// The history note for the paths job `id` changed, leaving out the runner's own files (the
 /// `.jobs` directory and the root's `.job-*` names, see `START`). Paths are listed, space-separated,
-/// until [`CHANGE_NOTE_CAP`] bytes; the rest are counted.
+/// until [`CHANGE_NOTE_CAP`] bytes; the rest are counted. Claude Code's own `.claude/` files come
+/// last, so its session churn never pushes the job's real changes out of the note (#1624).
 pub fn change_note(id: &JobId, paths: &[String]) -> String {
     let ours = |p: &&String| {
         p.as_str() == ".jobs"
             || p.starts_with(".jobs/")
             || (p.starts_with(".job-") && !p.contains('/'))
     };
-    let paths: Vec<&String> = paths.iter().filter(|p| !ours(p)).collect();
+    let tool = |p: &&String| p.as_str() == ".claude" || p.starts_with(".claude/");
+    let (work, churn): (Vec<&String>, Vec<&String>) =
+        paths.iter().filter(|p| !ours(p)).partition(|p| !tool(p));
+    let paths: Vec<&String> = work.into_iter().chain(churn).collect();
     let mut note = match paths.len() {
         0 => return format!("job {id} changed no paths"),
         1 => format!("job {id} changed 1 path:"),

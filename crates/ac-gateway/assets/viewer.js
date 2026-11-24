@@ -201,8 +201,6 @@
 
   function keyOf(e) {
     if (e.isComposing || e.metaKey) return null;
-    // Ctrl+V and Ctrl+Shift+V paste, as in most terminals: leave them to the browser's paste event.
-    if (e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'v') return null;
     const mods = (e.ctrlKey ? 'C-' : '') + (e.altKey ? 'M-' : '');
     if (e.key === 'Tab') return { key: e.shiftKey ? 'BTab' : `${mods}Tab` };
     if (NAMED[e.key]) return { key: mods + (e.shiftKey && e.key.startsWith('Arrow') ? 'S-' : '') + NAMED[e.key] };

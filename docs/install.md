@@ -467,6 +467,8 @@ would otherwise fail the next start with `duplicate allocation is not allowed`. 
 and shim and restarting the gateway (2026-10-19), and across real reboots (2026-10-20): with a1 running at the
 reboot, the gateway logged `reconcile: a1 had no VM; marked paused` and `scripts/post-reboot-check.sh` passed
 (no netns, Kata processes, task or lease left; a1 resumed with its login).
+Not part of agent_cloud, but easy to miss: a `claude remote-control` session used to operate the host does not
+start again after a reboot. Start it by hand, or run it as a systemd user service with lingering enabled.
 
 **Task API** (ADR-010): run a prompt in an agent as a job, with an id, live status and the result. Nothing to
 install; the gateway serves it. Jobs run `claude -p` in the agent's tmux session `main`, in a window named

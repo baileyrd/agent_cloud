@@ -1,5 +1,10 @@
 # Roadmap
 
+**Status (2026-11-24):** the live plan is on Mill Board, project `agent_cloud`, as milestones R1 to R5 (R1 verify
+merged work on BaileyServ, R2 decide agent_cloud's role and host, R3 safe to leave running, R4 the wall for
+untrusted Let Em Loose agents, R5 desktop, viewer, event stream and UI). ADR-025 kept the desktop, viewer and UI
+items below in scope (R5). This file records what shipped and how it was verified.
+
 ## M0: Host ready
 - [x] KVM verified on the Fedora server (BaileyServ: VT-x enabled in BIOS, `/dev/kvm` present)
 - [x] containerd and Kata installed; VM smoke test passes (`scripts/m0-smoke.sh`)
@@ -26,13 +31,16 @@
 - [x] Startup reconcile: agents recorded running with no VM become paused and are cleaned up (`ac-ctl reconcile`,
   run by `ac-gateway` at start); verified after a simulated VM crash and across a real reboot (2026-10-20)
 - [x] Gateway lifecycle API with bearer auth, private-bind check (`ac-gateway`); HTTPS on the tailnet through `tailscale serve`
-  (ADR-024) still to verify on BaileyServ
+  (ADR-024; verified on BaileyServ 2026-11-24 from the host and a second tailnet device, and again after a reboot)
 - [x] Task API: jobs with ids, long-poll status, capped output, cancel, timeouts, re-attach after a gateway restart
   (ADR-010; verified on BaileyServ 2026-10-21)
 - [x] Scoped API tokens: one per caller, with scopes and agents, digests only, audit trail, revocable while the
   gateway runs (ADR-011; verified on BaileyServ 2026-10-22)
 - [x] Token expiry: opt-in `--expires`, refused from then on, streams ended (ADR-022)
-- [ ] Failure limits per source address (needs the peer address from rusty_serve)
+- [x] One operation catalog for REST and MCP, kept in step by a test; `ac-ctl` stays local (ADR-020)
+- [x] Failed-authentication limit: one shared count for the gateway (20 per 60 s, then 429 for failures only, so
+  valid tokens still work), each failure logged with the tailnet user behind Serve (ADR-024, PR #35; verified on
+  BaileyServ 2026-11-24). Per-address limits are not possible behind Serve, where every peer is loopback
 - [x] Drop the deprecated `AC_TOKEN_FILE` (#640; BaileyServ confirmed off it 2026-11-24)
 - [ ] Per-job event stream (AG-UI via `rusty_agui`)
 - [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
@@ -43,7 +51,9 @@
   2026-10-19
 - [x] Per-agent egress profiles (`rust`, `python`, `node`) keyed by a per-boot proxy credential, attached with an
   `egress:write` token, no restart (ADR-016; verified on BaileyServ 2026-10-25, a reboot still to test)
-- [ ] Verify the `python` and `node` profiles with a real `pip install` and `npm install` (only `curl -I` so far)
+- [x] The `python` and `node` profiles with real installs (verified on BaileyServ 2026-11-24: `pip install --user
+  requests numpy`, `npm install left-pad esbuild`, no profile changes needed; hosts outside the profile refused).
+  The image had no pip then (`python3 -m ensurepip --user` worked offline); it now installs `python3-pip`
 - [x] `tini` as the agent image's PID 1, so killed jobs leave no zombies; no Claude Code self-update
   (`DISABLE_AUTOUPDATER=1`) (verified on BaileyServ 2026-10-22)
 - [x] Per-agent CPU, memory and disk limits: `cpu.max` and `memory.max` on each sandbox's cgroup and a btrfs
@@ -52,8 +62,8 @@
 - [ ] Backups with a tested restore: workspaces as incremental `btrfs send` stream files in any directory (a share
   on another machine), daily by `ac-backup.timer`, with `ac-ctl restore-backup` replaying a chain (ADR-021; verified
   on BaileyServ 2026-10-29 against an SMB share on Beast: full and incremental backups of a1 and a2, a restore of
-  a2). To do: boot a restored workspace and read it back inside the VM; back up the registry, tokens and egress
-  agents file too
+  a2; `ac-backup.timer` ran unattended every day 2026-10-30 to 2026-11-23, across a reboot). To do: boot a
+  restored workspace and read it back inside the VM; back up the registry, tokens and egress agents file too
 - [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
   (BaileyServ, 2026-10-22)
 - [x] The watchdog tells slow from wedged: it acts only on sustained failures on an idle host, through a logged
@@ -102,13 +112,14 @@
   `scripts/real-build-bench.sh`, so doctor can mark them measured there
 - [x] `ac-gateway.service` is `Type=notify` (ADR-015): a restart returns once the gateway listens, with its
   status (`reconcile done` or `failed`); verified 2026-10-24 (restart then curl with no sleep, gateway SIGKILL
-  with a1 running and with a1's VM killed). A reboot is still to test.
+  with a1 running and with a1's VM killed), and after a reboot on 2026-11-24 the gateway came up on its own.
 - [x] MCP interface on the gateway (`POST /api/v1/mcp`), one tool per route, listed by the token's scopes
   (ADR-017); verified 2026-10-28 with Claude Code as the client on BaileyServ
 - [x] Workspace checkpoints, restore and forks on btrfs subvolumes, through the gateway and `ac-ctl` (ADR-018;
   verified on BaileyServ with live VMs 2026-10-28: checkpoint mid-write, fork, restore and undo)
 - [x] Each job's changed paths in the agent's history, from btrfs snapshots at its start and end (ADR-019;
-  tested on a loopback btrfs; not yet on BaileyServ)
+  verified on BaileyServ 2026-11-24: create, edit, rename and delete listed exactly, a cancelled job listed too,
+  no snapshots left behind)
 
 ## Later
 - Local model option for an offline posture

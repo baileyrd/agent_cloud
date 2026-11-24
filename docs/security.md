@@ -29,8 +29,9 @@ may execute untrusted code or be steered by prompt injection from web content.
 
 - [ ] `/dev/kvm` present; every agent runs under the Kata runtime class, never plain runc
 - [ ] SELinux enforcing; denials reviewed instead of disabling it
-- [ ] Gateway reachable only over Tailscale with HTTPS and a bearer token: on loopback behind
-  `tailscale serve` (ADR-024; to verify on BaileyServ)
+- [x] Gateway reachable only over Tailscale with HTTPS and a bearer token: on loopback behind
+  `tailscale serve` (ADR-024; verified on BaileyServ 2026-11-24: 401 without a token, 403 for a foreign Origin,
+  the same after a reboot)
 - [x] nftables egress rules: agents reach only the egress proxy (verified 2026-10-19 from a1:
   direct connections to the internet, the LAN, 169.254.169.254 and other host ports refused;
   no DNS)
@@ -51,7 +52,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] No git remotes with embedded tokens in workspaces
 - [ ] Data directory (registry + event logs) owned by the control-plane user, mode 0700; one process per directory is enforced by a lock
 - [ ] Backups for the data directory and workspace volumes, with a tested restore (workspaces: ADR-021, verified on
-  BaileyServ to an encrypted SMB share on Beast; the rest of the data directory: not yet)
+  BaileyServ to an encrypted SMB share on Beast, daily timer running unattended since 2026-10-30; the rest of
+  the data directory: not yet, Mill Board #467)
 - [ ] Production desktop image: Chromium managed policy applied; DevTools policy decided
 - [x] Terminal viewer: view-only by default, enforced in the gateway; one take-over holder;
   agent output sanitised to text and SGR before the browser (verified 2026-10-20, see [Viewer](#viewer))

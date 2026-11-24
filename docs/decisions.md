@@ -1154,3 +1154,46 @@ it also keeps its own way to watch, steer and manage agents.
 - *Host:* nothing here depends on the host choice (#1058).
 - *Revisit when:* keeping both watch surfaces in step costs more than it gives, or LEL stops requiring a VM
   for untrusted agents.
+
+## ADR-026: Which host runs agent VMs
+**Status:** proposed (2026-11-24). Mill Board card #1058. Nano picks.
+**Context:** ADR-025 left the host open. Four candidates. Facts are from measurements on record (dates below);
+the facts files are in `deploy/hosts/`, and the forecasts come from `ac-ctl doctor --facts-file <f> --profile
+build` (ADR-014). A forecast counts the whole machine, so on a shared host it is a ceiling, not a plan.
+
+| | BaileyServ (today) | MS-01 host (Fedora, after migration) | MS-01 LXC 107 `agentos` | BaileyAi |
+|---|---|---|---|---|
+| CPU / threads | i5-3550, 4 | i9-12900H, 20 | 4 vCPU | Ryzen AI MAX+ 395, 32 |
+| RAM agents can use | 24 GiB, all ours | 32 GiB shared with the router VM, Home Assistant and every service | 8 GiB | ~30 GiB (96 of 128 GiB is GPU), shared with LEL, orch, Hermes |
+| Disk | 5400 rpm HDD | 1 TB QLC DRAM-less NVMe | same NVMe | NVMe (assumed, not measured) |
+| `/dev/kvm` for Kata | yes, verified 2026-10-18 | yes (nested KVM on) | **no**: unprivileged, not passed through | assumed, not checked |
+| btrfs for workspaces (ADR-018/021/023) | yes, root btrfs, quotas on | no: needs a btrfs volume set up | no | not checked |
+| Tailscale | yes, HTTPS via Serve (ADR-024) | to set up | to set up | yes |
+| To the LEL gateway / orch | tailnet hop | LAN hop | LAN hop | same host |
+| Doctor forecast (agents at 2 GiB / builds at once) | 7 / 2, measured | 11 / 10, ceiling | 1 / 2, and `/dev/kvm` error | 10 / 16, ceiling |
+| What else breaks if an agent escapes its VM | nothing else runs there | the router and the house | the router and the house | LEL, its BBP witness store, the models |
+| Work to switch | none | Fedora migration first, then a full install | `/dev/kvm` and vhost passthrough into an LXC; rootless Podman already fails in these LXCs | a full install, beside a box that is busy |
+
+Sources: BaileyServ and MS-01 hardware 2026-10-18; MS-01 inventory and Fedora migration target 2026-11-24;
+LXC 107 2026-09-16; BaileyAi memory split 2026-11-17. LEL D53 put LEL's own services on BaileyAi; it did not
+decide where agent_cloud runs.
+
+**Proposed decision:** BaileyServ stays the host. Add an SSD for the data directory (#1060 measures it).
+- *Why:* it works today with backups, limits and HTTPS verified, and nothing else lives on it. R4 makes agent_cloud
+  the wall for *untrusted* agents, and a wall is worth more on a box whose compromise costs little. BaileyAi would
+  put untrusted VMs on the same kernel as the witness store that is meant to check them. The MS-01 would put them
+  next to the router.
+- *Cost:* 4 cores cap builds at 2 at once, and cold boots are 18-19 s on the HDD. Both are known and measured, and
+  R3/R4 need correctness more than throughput.
+- *LXC 107 is ruled out:* Kata needs `/dev/kvm`, and 8 GiB admits one agent.
+
+**Revisit when:** BaileyServ is retired (the November homelab diagram marks it for retirement), or R4/R5 need more
+than 2 builds or 7 agents at once. The replacement should then be a dedicated box: the mini-PC purchase deferred on
+2026-10-18. It should not be the router host or the inference host. Moving hosts is a card under R3: restore from the
+ADR-021 backups, then re-run `post-reboot-check.sh` and `ac-ctl doctor`.
+
+**Alternatives:**
+- *BaileyAi:* follows LEL D53, keeps it to one host and the shortest path to the gateway. It costs memory that LEL
+  and inference already use, and it shares a kernel with the evidence store.
+- *MS-01 after its Fedora migration:* the most cores. It waits on the migration, and it shares memory and the
+  kernel with the router.

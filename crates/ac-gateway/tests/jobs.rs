@@ -598,6 +598,37 @@ fn change_notes_leave_out_the_runner_and_are_capped() {
     );
 }
 
+/// Claude Code's churn under the root's `.claude` goes after the job's real changes, so the cap cuts
+/// it, not them (#1624).
+#[test]
+fn change_notes_list_real_changes_before_claude_churn() {
+    let id = job_id("j1");
+    let mut paths: Vec<String> = (0..150)
+        .map(|i| format!(".claude/projects/-workspace/s{i:03}.jsonl"))
+        .collect();
+    paths.insert(40, "src/main.rs".to_owned());
+    paths.insert(90, "repo/.claude/settings.json".to_owned());
+    paths.push("README.md".to_owned());
+    let note = jobs::change_note(&id, &paths);
+    assert!(
+        note.starts_with(
+            "job j1 changed 153 paths: src/main.rs repo/.claude/settings.json README.md \
+             .claude/projects/-workspace/s000.jsonl "
+        ),
+        "{note}"
+    );
+    let shown = note.matches(".jsonl").count();
+    assert!(shown < 150, "{note}");
+    assert!(
+        note.ends_with(&format!(" (and {} more)", 150 - shown)),
+        "{note}"
+    );
+    assert_eq!(
+        jobs::change_note(&id, &[".claude".to_owned(), "a".to_owned()]),
+        "job j1 changed 2 paths: a .claude"
+    );
+}
+
 /// Wait up to 5 s for `done`; whether it came.
 fn within_5s(done: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);

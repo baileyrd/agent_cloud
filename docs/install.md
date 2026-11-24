@@ -430,8 +430,9 @@ How to use it:
    token with `viewer:read` for that agent (or the owner's, `sudo cat /etc/agent-cloud/owner.token`), shows its
    name and scopes, and keeps it in memory only: reloading asks again. Without `viewer:control` there is no
    **Take over** button (and the gateway refuses take-over and input anyway).
-3. You watch the agent's tmux session `main`, view-only. **Take over** gives you the keyboard (paste works;
-   the window follows your browser's size); **Release** hands it back. If another viewer has control you get
+3. You watch the agent's tmux session `main`, view-only. **Take over** gives you the keyboard (Ctrl+V,
+   Ctrl+Shift+V, Cmd+V and right-click paste; a literal Ctrl+V keystroke is not sent from the keyboard, so
+   send `C-v` to the `keys` route instead; the window follows your browser's size); **Release** hands it back. If another viewer has control you get
    **Force take over**. Closing the tab leaves the session running; the next viewer sees its scrollback.
    The bar under the header lists the session's windows (`*` marks the agent's current one; `job-*` windows
    from the task API are highlighted). Click one to watch it, and while you have control your keys go to it;

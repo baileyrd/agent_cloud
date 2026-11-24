@@ -215,17 +215,23 @@ fn tokens_file() -> Result<TokenFile, String> {
     Ok(TokenFile::new(env("AC_TOKENS", TOKENS), euid()?))
 }
 
-/// The tokens at startup, from the file (a bad one refuses the start). `AC_TOKEN_FILE` was removed
-/// (#640): a gateway.env that still sets it refuses the start, so its callers are not locked out silently.
-fn load_tokens(file: &mut TokenFile) -> Result<Tokens, String> {
-    if std::env::var_os("AC_TOKEN_FILE").is_some() {
-        return Err(
+/// `AC_TOKEN_FILE` was removed (#640): a gateway.env that still sets it refuses the start, so its
+/// callers are not locked out silently.
+fn refuse_token_file(value: Option<std::ffi::OsString>) -> Result<(), String> {
+    match value {
+        None => Ok(()),
+        Some(_) => Err(
             "AC_TOKEN_FILE is no longer read: create an admin token with \
              `ac-gateway token create owner --scopes admin`, then remove AC_TOKEN_FILE from \
              gateway.env (docs/install.md)"
                 .into(),
-        );
+        ),
     }
+}
+
+/// The tokens at startup, from the file (a bad one refuses the start).
+fn load_tokens(file: &mut TokenFile) -> Result<Tokens, String> {
+    refuse_token_file(std::env::var_os("AC_TOKEN_FILE"))?;
     let tokens = file.reload(true)?.unwrap_or_default();
     if tokens.is_empty() {
         return Err(format!(
@@ -656,6 +662,22 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             eprintln!("ac-gateway: {e}");
             std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_token_file;
+
+    #[test]
+    fn a_set_ac_token_file_refuses_the_start() {
+        assert_eq!(refuse_token_file(None), Ok(()));
+        for value in ["/etc/agent-cloud/gateway.token", ""] {
+            let err = refuse_token_file(Some(value.into()))
+                .err()
+                .unwrap_or_default();
+            assert!(err.starts_with("AC_TOKEN_FILE is no longer read"), "{err}");
         }
     }
 }

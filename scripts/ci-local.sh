@@ -1,6 +1,6 @@
 #!/bin/sh
 # The checks CI runs (.github/workflows/ci.yml calls this script, so local and CI cannot drift).
-# Usage: scripts/ci-local.sh rust|scripts   (run from anywhere; it works from the repo root)
+# Usage: scripts/ci-local.sh rust|scripts|web   (run from anywhere; it works from the repo root)
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -28,8 +28,14 @@ scripts() {
     return "$rc"
 }
 
+# The viewer page's JavaScript, in a stub DOM with node's built-in test runner (no npm packages).
+web() {
+    node --test 'crates/ac-gateway/tests/*.test.mjs'
+}
+
 case "${1:-}" in
     rust) rust ;;
     scripts) scripts ;;
-    *) echo "usage: $0 rust|scripts" >&2; exit 2 ;;
+    web) web ;;
+    *) echo "usage: $0 rust|scripts|web" >&2; exit 2 ;;
 esac

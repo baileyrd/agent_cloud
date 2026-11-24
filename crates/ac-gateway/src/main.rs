@@ -3,8 +3,7 @@
 //!
 //! Env: `AC_TOKENS` (the tokens file, default /etc/agent-cloud/tokens: owned by the gateway's
 //! user, mode 0600; re-read on SIGHUP and when it changes, checked each second),
-//! `AC_TOKEN_FILE` (deprecated: a file holding one token, served as the `admin` token `legacy`;
-//! refused if group/world readable), `AC_BIND` (default 127.0.0.1:8780), `AC_IMAGE` (required),
+//! `AC_BIND` (default 127.0.0.1:8780), `AC_IMAGE` (required),
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
 //! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_TAILSCALE_SERVE=1` (behind
@@ -41,8 +40,8 @@
 //! /etc/kata-containers/configuration.toml), `AC_SHM_LIMIT_MIB` (testing only: treat `/dev/shm` as
 //! this big; logged as a warning at startup).
 //!
-//! It refuses to start without a token, or with a tokens file that is unreadable, too open, owned
-//! by someone else or malformed. A bad later version is logged and the previous tokens stay.
+//! It refuses to start without a token, with `AC_TOKEN_FILE` set (removed, #640), or with a tokens
+//! file that is unreadable, too open, owned by someone else or malformed. A bad later version is logged and the previous tokens stay.
 //!
 //! Readiness (ADR-015): with `NOTIFY_SOCKET` set (`Type=notify`) it sends `READY=1` once the
 //! tokens are loaded, the reconcile has run, admission is set up and the listener is bound; a
@@ -68,7 +67,7 @@
 //! after each step.
 
 use std::net::SocketAddr;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,7 +85,7 @@ use ac_fleet::Fleet;
 use ac_gateway::egress::EgressStore;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::notify::{self, Notify};
-use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
+use ac_gateway::tokens::{self, Agents, Keys, Scopes, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::watchdog::Watchdog;
 use ac_gateway::web::App;
@@ -205,21 +204,6 @@ fn agent_limits(capacity: &HostCapacity) -> Result<AgentLimits, String> {
     Ok(limits)
 }
 
-fn read_token(path: &str) -> Result<String, String> {
-    let mode = std::fs::metadata(path)
-        .map_err(|e| format!("token file {path}: {e}"))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "token file {path} must not be group/world accessible (mode {:o})",
-            mode & 0o777
-        ));
-    }
-    let token = std::fs::read_to_string(path).map_err(|e| format!("token file {path}: {e}"))?;
-    Ok(token.trim().to_owned())
-}
-
 /// The uid this process runs as (the owner of `/proc/self`), which must own the tokens file.
 fn euid() -> Result<u32, String> {
     std::fs::metadata("/proc/self")
@@ -231,43 +215,31 @@ fn tokens_file() -> Result<TokenFile, String> {
     Ok(TokenFile::new(env("AC_TOKENS", TOKENS), euid()?))
 }
 
-/// The legacy token joins every version of the file.
-fn with_legacy(mut tokens: Tokens, legacy: Option<&Token>) -> Result<Tokens, String> {
-    if let Some(l) = legacy {
-        tokens.add(l.clone())?;
+/// The tokens at startup, from the file (a bad one refuses the start). `AC_TOKEN_FILE` was removed
+/// (#640): a gateway.env that still sets it refuses the start, so its callers are not locked out silently.
+fn load_tokens(file: &mut TokenFile) -> Result<Tokens, String> {
+    if std::env::var_os("AC_TOKEN_FILE").is_some() {
+        return Err(
+            "AC_TOKEN_FILE is no longer read: create an admin token with \
+             `ac-gateway token create owner --scopes admin`, then remove AC_TOKEN_FILE from \
+             gateway.env (docs/install.md)"
+                .into(),
+        );
     }
-    Ok(tokens)
-}
-
-/// The tokens at startup: the file (a bad one refuses the start) plus the legacy token.
-fn load_tokens(file: &mut TokenFile) -> Result<(Tokens, Option<Token>), String> {
-    let legacy = match std::env::var("AC_TOKEN_FILE") {
-        Ok(path) => match read_token(&path)? {
-            t if t.is_empty() => return Err(format!("token file {path} is empty")),
-            t => Some(Token::admin(tokens::LEGACY, &t)),
-        },
-        Err(_) => None,
-    };
-    let from_file = file.reload(true)?.unwrap_or_default();
-    let n = from_file.iter().count();
-    let all = with_legacy(from_file, legacy.as_ref())?;
-    if all.is_empty() {
+    let tokens = file.reload(true)?.unwrap_or_default();
+    if tokens.is_empty() {
         return Err(format!(
             "no API tokens: create one with `ac-gateway token create <name> --scopes admin` \
-             (writes {}), or set AC_TOKEN_FILE",
+             (writes {})",
             file.path().display()
         ));
     }
     eprintln!(
-        "ac-gateway: tokens: {n} from {}{}",
-        file.path().display(),
-        if legacy.is_some() {
-            ", plus legacy from AC_TOKEN_FILE (deprecated; see docs/install.md)"
-        } else {
-            ""
-        }
+        "ac-gateway: tokens: {} from {}",
+        tokens.iter().count(),
+        file.path().display()
     );
-    Ok((all, legacy))
+    Ok(tokens)
 }
 
 /// Each second: on SIGTERM or SIGINT, send `STOPPING=1` and stop the server; otherwise re-read
@@ -276,7 +248,6 @@ fn load_tokens(file: &mut TokenFile) -> Result<(Tokens, Option<Token>), String> 
 fn watch(
     signals: LinuxSignalSource,
     mut file: TokenFile,
-    legacy: Option<Token>,
     keys: Keys,
     notify: Notify,
     stop: ShutdownHandle,
@@ -290,12 +261,9 @@ fn watch(
             return stop.shutdown();
         }
         let force = signal == Some(SignalEvent::Hangup);
-        let next = file
-            .reload(force)
-            .and_then(|t| t.map(|t| with_legacy(t, legacy.as_ref())).transpose());
-        match next {
+        match file.reload(force) {
             Ok(Some(tokens)) => {
-                let n = tokens.iter().filter(|t| t.name != tokens::LEGACY).count();
+                let n = tokens.iter().count();
                 keys.set(tokens);
                 eprintln!("ac-gateway: tokens reloaded: {n} from the file");
             }
@@ -389,7 +357,7 @@ fn log_volumes(rt: &CtrRuntime<LinuxSpawner>) {
 fn run() -> Result<(), String> {
     let notify = Notify::from_env();
     let mut file = tokens_file()?;
-    let (tokens, legacy) = load_tokens(&mut file)?;
+    let tokens = load_tokens(&mut file)?;
     let keys = Keys::new(tokens);
     let image = std::env::var("AC_IMAGE").map_err(|_| "AC_IMAGE is required")?;
     let addr: SocketAddr = env("AC_BIND", "127.0.0.1:8780")
@@ -600,7 +568,7 @@ fn run() -> Result<(), String> {
     notify.send(&notify::ready(&format!(
         "listening on {bound}; {agents} agents ({running} running); {reconciled}"
     )));
-    watch(signals, file, legacy, keys, notify, stop);
+    watch(signals, file, keys, notify, stop);
     server.run().map_err(|e| e.to_string())
 }
 

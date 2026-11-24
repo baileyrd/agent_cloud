@@ -14,7 +14,7 @@ use ac_ctr::Exec;
 use ac_domain::{AgentId, State};
 use ac_fleet::Fleet;
 use ac_gateway::egress::EgressStore;
-use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
+use ac_gateway::tokens::{Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::{Hub, Terminal, ViewClient, ViewCommand, Writer};
 use ac_gateway::web::App;
 use ac_gateway::Api;
@@ -409,7 +409,7 @@ impl Runtime for Rt {
 
 fn serve(fake: &Fake, history: &std::path::Path, per_agent: usize, total: usize) -> SocketAddr {
     let mut t = Tokens::default();
-    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let _ = t.add(Token::admin("owner", TOKEN));
     serve_with(fake, history, per_agent, total, Keys::new(t))
 }
 
@@ -910,7 +910,7 @@ fn viewer_scopes_and_viewer_ids_belong_to_their_token() {
         make("ctl", "viewer:read,viewer:control"),
     );
     let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
-    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let _ = t.add(Token::admin("owner", TOKEN));
     let keys = Keys::new(t);
     let addr = serve_with(&fake, &dir, 4, 16, keys.clone());
 
@@ -958,7 +958,7 @@ fn viewer_scopes_and_viewer_ids_belong_to_their_token() {
     // Revoking a token ends its open streams too (at the next message or keep-alive).
     assert!(file.revoke("watch").is_ok());
     let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
-    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let _ = t.add(Token::admin("owner", TOKEN));
     keys.set(t);
     let end = Instant::now() + Duration::from_secs(15);
     while v.next().is_some() {
@@ -1116,7 +1116,7 @@ fn egress_routes_need_egress_write_and_are_audited() {
     let life = make("life", "agents:read,agents:write", "*");
     let attach = make("attach", "agents:read,egress:write", "a1");
     let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
-    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let _ = t.add(Token::admin("owner", TOKEN));
     let fleet = Fleet::new(Rt, Store::default()).with_egress(store.clone());
     let api = Api::new(fleet).with_egress(store.clone());
     let addr = serve_api(&fake, &dir, 4, 16, Keys::new(t), api);
@@ -1181,7 +1181,7 @@ fn egress_routes_need_egress_write_and_are_audited() {
     for (history, line) in [
         (
             &a2,
-            "audit token=legacy action=create profiles=rust status=201",
+            "audit token=owner action=create profiles=rust status=201",
         ),
         (
             &a1,
@@ -1228,7 +1228,7 @@ fn mcp_tools_follow_the_token_scopes() {
         .create("worker", scopes, agents, 1, None)
         .unwrap_or_else(|e| panic!("{e}"));
     let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
-    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let _ = t.add(Token::admin("owner", TOKEN));
     let addr = serve_with(&fake, &dir, 4, 16, Keys::new(t));
     let rpc = |token: &str, extra: &[&str], body: &str| {
         request_as(addr, token, "POST", "/api/v1/mcp", extra, body)
@@ -1280,7 +1280,7 @@ fn mcp_tools_follow_the_token_scopes() {
     assert!(!failed && text.contains(r#""state":"running""#), "{text}");
     let (_, history) = tool(addr, TOKEN, "get_history", r#"{"agent_id":"a1"}"#);
     assert!(
-        history.contains("audit token=legacy action=create status=201"),
+        history.contains("audit token=owner action=create status=201"),
         "{history}"
     );
 

@@ -409,16 +409,14 @@ Then set `AC_TAILSCALE_SERVE=1` in `/etc/agent-cloud/gateway.env` and restart th
 authentication is logged with the tailnet user Serve names (the gateway refuses the setting unless `AC_BIND` is
 loopback).
 
-*Migrating from `AC_TOKEN_FILE`* (hosts set up before ADR-011). Nothing breaks on upgrade: the old token keeps
-working as an `admin` token for every agent named `legacy`, and the gateway logs that it is deprecated. To move
-off it:
+*Hosts set up before ADR-011* used one token from `AC_TOKEN_FILE`. It was removed on 2026-11-24 (#640), and a
+gateway whose `gateway.env` still sets it refuses to start and says why. To move off it:
 1. `sudo sh -c 'umask 077; ac-gateway token create owner --scopes admin > /etc/agent-cloud/owner.token'`, and a
    scoped token for each other caller (a script that only runs jobs gets `jobs:read,jobs:write` for its agents).
 2. Point clients at their token: the viewer page asks for it; `scripts/ac-job.sh` takes `AC_TOKEN` or reads
-   `owner.token`; `scripts/post-reboot-check.sh` reads `owner.token` once `AC_TOKEN_FILE` is gone.
+   `owner.token`; `scripts/post-reboot-check.sh` reads `owner.token`.
 3. Remove `AC_TOKEN_FILE` from `/etc/agent-cloud/gateway.env`, `sudo systemctl restart ac-gateway`, then
    `sudo shred -u /etc/agent-cloud/gateway.token`.
-`AC_TOKEN_FILE` will be removed in a later release.
 
 **Terminal viewer** (ADR-006): served by the gateway, nothing else to install. Agents need an image with tmux
 (`images/agent-shell` has it since 2026-10-20); a paused agent picks up a re-imported image when it is resumed.

@@ -99,7 +99,7 @@ What a stolen token gives its holder (on the private bind, until revoked):
 | `viewer:read` | Watch the listed agents' terminals live (any of their tmux windows) and read their history, which shows whatever the agents printed, secrets included | Type, take over, run jobs or change any agent's state; picking a window changes only its own view |
 | `viewer:control` (with `viewer:read`) | Take over the listed agents' shells: everything their agent users can do, including their logins | Change agent state or run jobs through the API (its shell access makes this moot inside those agents) |
 | `egress:write` (with `agents:read`) | Attach any installed profile to the listed agents, so those agents can reach its hosts (for `rust`, fetch and build any published crate) | Define hosts, change the base list, or reach anything itself; every change is audited |
-| `admin` (or the legacy `AC_TOKEN_FILE` token) | Everything on every agent: create, destroy and purge workspaces, run jobs, take over shells | Reach the host beyond what the agents' VMs and the egress allowlist allow |
+| `admin` | Everything on every agent: create, destroy and purge workspaces, run jobs, take over shells | Reach the host beyond what the agents' VMs and the egress allowlist allow |
 
 Revoke with `sudo ac-gateway token revoke <name>`; the gateway stops honouring it within a second. Audit lines
 (`audit token=<name> action=...`) in the journal and in each agent's history show what a token did.

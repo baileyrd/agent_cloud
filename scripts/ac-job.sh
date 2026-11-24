@@ -4,7 +4,7 @@
 #   sudo scripts/ac-job.sh a1 - < prompt.txt        # prompt from stdin
 # Env: TIMEOUT=<secs> (default 1800), KEY=<idempotency key>, STREAM=1 (print the stream log instead).
 # The gateway address comes from /etc/agent-cloud/gateway.env (AC_BIND) or AC_URL; the token from
-# AC_TOKEN, else the file AC_TOKEN_FILE names, else /etc/agent-cloud/owner.token. It needs jobs:read and
+# AC_TOKEN, else /etc/agent-cloud/owner.token. It needs jobs:read and
 # jobs:write for the agent (ADR-011). Progress goes to stderr, the result to stdout.
 # Exit: 0 succeeded, 1 the job ended otherwise, 2 usage or API error.
 set -u
@@ -13,7 +13,7 @@ agent=$1 prompt=$2
 ENV=/etc/agent-cloud/gateway.env
 val() { sed -n "s/^$1=//p" "$ENV" 2>/dev/null | tail -n 1; }
 url=${AC_URL:-http://$(val AC_BIND)}
-token=${AC_TOKEN:-$(cat "$(val AC_TOKEN_FILE)" 2>/dev/null || cat /etc/agent-cloud/owner.token 2>/dev/null)}
+token=${AC_TOKEN:-$(cat /etc/agent-cloud/owner.token 2>/dev/null)}
 [ -n "$token" ] || { echo "no token: set AC_TOKEN or run as root" >&2; exit 2; }
 
 umask 077

@@ -1151,12 +1151,12 @@ it also keeps its own way to watch, steer and manage agents.
 - *Order:* R1 and R3 come first (verify, then make it safe to leave running), then R4 and R5. R5 goes in the
   order #472, #474/#473, #471, #516.
 - *Unit:* one VM per agent (ADR-001). Mapping LEL work onto agents (per project or per claim) is LEL's choice.
-- *Host:* nothing here depends on the host choice (#1058).
+- *Host:* nothing here depends on the host choice; ADR-026 keeps BaileyServ (#1058).
 - *Revisit when:* keeping both watch surfaces in step costs more than it gives, or LEL stops requiring a VM
   for untrusted agents.
 
 ## ADR-026: Which host runs agent VMs
-**Status:** proposed (2026-11-24). Mill Board card #1058. Nano picks.
+**Status:** accepted (2026-11-24, Nano). Mill Board card #1058.
 **Context:** ADR-025 left the host open. Four candidates. Facts are from measurements on record (dates below);
 the facts files are in `deploy/hosts/`, and the forecasts come from `ac-ctl doctor --facts-file <f> --profile
 build` (ADR-014). A forecast counts the whole machine, so on a shared host it is a ceiling, not a plan.
@@ -1178,7 +1178,7 @@ Sources: BaileyServ and MS-01 hardware 2026-10-18; MS-01 inventory and Fedora mi
 LXC 107 2026-09-16; BaileyAi memory split 2026-11-17. LEL D53 put LEL's own services on BaileyAi; it did not
 decide where agent_cloud runs.
 
-**Proposed decision:** BaileyServ stays the host. Add an SSD for the data directory (#1060 measures it).
+**Decision:** BaileyServ stays the host. Add an SSD for the data directory (#1060 measures it).
 - *Why:* it works today with backups, limits and HTTPS verified, and nothing else lives on it. R4 makes agent_cloud
   the wall for *untrusted* agents, and a wall is worth more on a box whose compromise costs little. BaileyAi would
   put untrusted VMs on the same kernel as the witness store that is meant to check them. The MS-01 would put them

@@ -122,7 +122,10 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
             if changed.is_empty() {
                 return Ok("nothing to reconcile".to_owned());
             }
-            let lines: Vec<String> = changed.iter().map(|id| format!("{id} paused")).collect();
+            let lines: Vec<String> = changed
+                .iter()
+                .map(|(id, state)| format!("{id} {state:?}").to_lowercase())
+                .collect();
             return Ok(lines.join("\n"));
         }
     };

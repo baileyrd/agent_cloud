@@ -1200,3 +1200,28 @@ ADR-021 backups, then re-run `post-reboot-check.sh` and `ac-ctl doctor`.
   and inference already use, and it shares a kernel with the evidence store.
 - *MS-01 after its Fedora migration:* the most cores. It waits on the migration, and it shares memory and the
   kernel with the router.
+
+## ADR-027: A create boots its VM outside the lifecycle lock
+**Status:** proposed (2026-11-25). Mill Board card #479.
+**Context:** The gateway serves every lifecycle call under one lock (`App`'s `Mutex<Api>`), and a create held
+it for the whole VM boot, so a 4-agent create storm took 4 + 4 + 4 + 4 s (roadmap M4). The lock is what keeps
+admission (ADR-012) correct: the check and the start of two creates cannot interleave.
+**Decision:** A create runs in three steps. *Reserve* under the lock: validate the body, admit the guest,
+issue the proxy credential (ADR-016) and record the agent `Creating`. *Boot* without the lock: the runtime's
+create alone. *Commit* under the lock: `Running`, or on a failed boot the credential is revoked and the agent
+stays `Creating`, as a failed create always has. Pause, resume, destroy, checkpoints and forks still hold the
+lock throughout.
+- *Admission stays correct* because a reservation is `Creating`, which admission already counts at the
+  configured guest size. No new state was added to the lifecycle.
+- *An agent that is booting* is in a set the gateway keeps. Every change to it is refused with 409 (`agent
+  {id} is being created`): a second create, pause, destroy, egress, checkpoints, restore, a fork to or from it.
+  Reads are served and show `creating`. The entry goes when the commit is done, also if the boot panics.
+- *After a crash between boot and commit* the startup reconcile marks a `Creating` agent whose VM is up as
+  `Running`. One whose VM is not stays `Creating` (retry the create, or destroy it); its credential is swept.
+**Consequences:** Creates of different agents boot at the same time, so a storm is bounded by the host
+(containerd, CNI with host-local IPAM, disk), not by the gateway. The runtime must be `Sync`; `CtrRuntime` is.
+Forks still boot under the lock: they are rarer and also copy a workspace. To measure: a 4-create storm on the
+host, recorded in sizing.md.
+**Alternative:** release the reservation on a failed boot (forget the record). Rejected for now: a failed
+create has always stayed visible as `Creating` so its leftovers can be destroyed, and admission keeps counting
+it until then.

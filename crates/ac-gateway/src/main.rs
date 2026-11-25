@@ -49,7 +49,8 @@
 //! within a second.
 //!
 //! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
-//! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
+//! host reboot, agents recorded running have no VM and become paused, and an agent recorded
+//! creating whose VM is up (the gateway stopped mid-create) becomes running. A failed reconcile is
 //! logged and the gateway serves anyway. It then SIGKILLs `ctr` clients an earlier gateway left
 //! and detaches their tmux control clients in every running agent. The job supervisor then starts
 //! on its own thread and ticks at once and every second after: it re-attaches running jobs of
@@ -441,8 +442,12 @@ fn run() -> Result<(), String> {
     }
     let reconciled = match fleet.reconcile() {
         Ok(changed) => {
-            for id in changed {
-                eprintln!("ac-gateway: reconcile: {id} had no VM; marked paused");
+            for (id, state) in changed {
+                let why = match state {
+                    State::Running => "its VM booted before a restart; marked running",
+                    _ => "had no VM; marked paused",
+                };
+                eprintln!("ac-gateway: reconcile: {id} {why}");
             }
             "reconcile done"
         }

@@ -55,7 +55,7 @@ pub const CSP: &str =
     img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// The gateway's handler. Lifecycle calls take the API's lock; token checks and viewer calls
-/// never do.
+/// never do. A create holds it only to reserve and to commit, not while its VM boots (ADR-027).
 pub struct App<R, S> {
     api: Mutex<Api<R, S>>,
     keys: Keys,
@@ -99,7 +99,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
     }
 }
 
-impl<R: Runtime + Send, S: SessionStore + Send> SharedHandler for App<R, S> {
+impl<R: Runtime + Send + Sync, S: SessionStore + Send> SharedHandler for App<R, S> {
     fn handle(&self, r: &Request<'_>) -> Response {
         if !same_origin(r.headers) {
             return json(error(403, "cross-origin request refused"));
@@ -253,8 +253,11 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             None => match jobs::route(method, path) {
                 Some(route) => self.job(route, target, body),
                 None => {
-                    let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
                     let may_attach = token.scopes.allows(Scope::EgressWrite);
+                    if let Some(id) = crate::create_target(method, target) {
+                        return json(crate::create(&self.api, &id, body, may_attach));
+                    }
+                    let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
                     json(api.request(method, target, body, &token.agents, may_attach))
                 }
             },

@@ -7,6 +7,11 @@
 //! fails, forgotten on purge, and swept by the reconcile for agents without a VM. With
 //! [`Fleet::with_snapshots`], workspaces can be checkpointed, restored and forked (ADR-018), and a
 //! purge deletes the agent's checkpoints too.
+//!
+//! A create can run in three steps so the slow VM boot needs no lock: [`Fleet::reserve`] (checks,
+//! admission, credential, record `Creating`), [`Reserved::boot`] (the runtime alone), and
+//! [`Fleet::commit`]. A reservation is `Creating`, which admission already counts, so concurrent
+//! creates cannot over-admit.
 
 use std::fmt;
 use std::sync::Arc;
@@ -105,9 +110,33 @@ pub struct Report {
     pub margin_mib: u64,
 }
 
+/// A create that passed its checks and was recorded `Creating`, with its credential issued. Boot
+/// it with [`Self::boot`] (no fleet borrow needed, so no lock), then hand the outcome to
+/// [`Fleet::commit`]. Dropping it uncommitted leaves the agent `Creating`, as a failed boot does.
+#[must_use = "a reservation must be booted and committed"]
+pub struct Reserved<R> {
+    id: AgentId,
+    boot: Boot,
+    runtime: Arc<R>,
+}
+
+impl<R> Reserved<R> {
+    /// The agent being created.
+    pub fn id(&self) -> &AgentId {
+        &self.id
+    }
+}
+
+impl<R: Runtime> Reserved<R> {
+    /// Provision and start the VM: the slow part of a create.
+    pub fn boot(&self) -> Result<(), PortError> {
+        self.runtime.create(&self.id, &self.boot)
+    }
+}
+
 /// The set of agents, driven through a runtime and a store.
 pub struct Fleet<R, S> {
-    runtime: R,
+    runtime: Arc<R>,
     store: S,
     admission: Option<Admission>,
     egress: Option<Arc<dyn Egress + Send + Sync>>,
@@ -118,7 +147,7 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     /// Compose a fleet from its two adapters.
     pub fn new(runtime: R, store: S) -> Self {
         Self {
-            runtime,
+            runtime: Arc::new(runtime),
             store,
             admission: None,
             egress: None,
@@ -144,7 +173,8 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     /// Refuse a create or resume whose guest would not fit `/dev/shm` with `margin_mib` to spare.
     /// Every guest running or being created counts at its configured size, since touched guest
     /// pages are never given back. The caller serializes lifecycle calls (the gateway holds one
-    /// lock across them), so the check and the start cannot interleave with another's.
+    /// lock across them), so the check and the start cannot interleave with another's; a create
+    /// split by [`Self::reserve`] holds its slot as `Creating` while it boots unlocked.
     pub fn with_admission(mut self, capacity: Box<dyn Capacity + Send>, margin_mib: u64) -> Self {
         self.admission = Some(Admission {
             capacity,
@@ -187,26 +217,63 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         id: &AgentId,
         profiles: Option<&[ProfileName]>,
     ) -> Result<State, FleetError> {
-        // Only a running or paused agent blocks the id. A destroyed one can be reused, and one
-        // stuck in `Creating` (a previous create failed) is retried.
+        let reserved = self.reserve(id, profiles)?;
+        let booted = reserved.boot();
+        self.commit(&reserved, booted)
+    }
+
+    /// The fast first step of [`Self::create_attached`]: refuse a running or paused id, admit the
+    /// guest, issue its credential and record it `Creating`. A destroyed id can be reused, and one
+    /// stuck in `Creating` (a previous create failed) is retried; the caller keeps a second
+    /// create of an id whose reservation is still booting out.
+    pub fn reserve(
+        &self,
+        id: &AgentId,
+        profiles: Option<&[ProfileName]>,
+    ) -> Result<Reserved<R>, FleetError> {
         if matches!(self.store.state(id)?, Some(State::Running | State::Paused)) {
             return Err(FleetError::AlreadyExists(id.clone()));
         }
         self.admit(id)?;
-        self.boot_new(id, profiles)
+        self.stage(id, profiles)
     }
 
-    /// Issue `id`'s credential, record it `Creating` and boot it on its workspace (made if
-    /// missing). A failed boot leaves it `Creating`.
+    /// The last step: a booted reservation becomes `Running`; a failed boot revokes its
+    /// credential and leaves the agent `Creating` (retry with a create, or destroy it).
+    pub fn commit(
+        &self,
+        reserved: &Reserved<R>,
+        booted: Result<(), PortError>,
+    ) -> Result<State, FleetError> {
+        self.started(&reserved.id, booted)?;
+        self.persist(&reserved.id, State::Creating, Command::Ready)
+    }
+
+    /// Issue `id`'s credential and record it `Creating`.
+    fn stage(
+        &self,
+        id: &AgentId,
+        profiles: Option<&[ProfileName]>,
+    ) -> Result<Reserved<R>, FleetError> {
+        let boot = self.issue(id, profiles)?;
+        self.store.set_state(id, State::Creating)?;
+        Ok(Reserved {
+            id: id.clone(),
+            boot,
+            runtime: Arc::clone(&self.runtime),
+        })
+    }
+
+    /// Stage `id` and boot it on its workspace (made if missing). A failed boot leaves it
+    /// `Creating`.
     fn boot_new(
         &self,
         id: &AgentId,
         profiles: Option<&[ProfileName]>,
     ) -> Result<State, FleetError> {
-        let boot = self.issue(id, profiles)?;
-        self.store.set_state(id, State::Creating)?;
-        self.started(id, self.runtime.create(id, &boot))?;
-        self.persist(id, State::Creating, Command::Ready)
+        let reserved = self.stage(id, profiles)?;
+        let booted = reserved.boot();
+        self.commit(&reserved, booted)
     }
 
     /// Stop the agent's VM, keeping its volume. Its credential is revoked first.
@@ -350,17 +417,25 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
 
     /// Bring the registry in line with the runtime after a host reboot or a VM crash: an agent
     /// recorded `Running` whose VM is gone has what it left behind (network, Kata state) cleaned
-    /// up and becomes `Paused`, so `resume` boots it again on its workspace. Returns those
-    /// agents. Stops at the first failure; running it again is safe.
-    pub fn reconcile(&self) -> Result<Vec<AgentId>, FleetError> {
+    /// up and becomes `Paused`, so `resume` boots it again on its workspace. An agent recorded
+    /// `Creating` whose VM is up (the gateway stopped between its boot and the commit) becomes
+    /// `Running`; one whose VM is not stays `Creating`, like a failed create. Returns the agents
+    /// it changed and their new state. Stops at the first failure; running it again is safe.
+    pub fn reconcile(&self) -> Result<Vec<(AgentId, State)>, FleetError> {
         let live = self.runtime.running()?;
         let mut changed = Vec::new();
         for (id, state) in self.store.list()? {
-            if state == State::Running && !live.contains(&id) {
+            let up = live.contains(&id);
+            let command = match (state, up) {
+                (State::Running, false) => Command::Pause,
+                (State::Creating, true) => Command::Ready,
+                _ => continue,
+            };
+            if command == Command::Pause {
                 self.runtime.pause(&id)?;
-                self.persist(&id, state, Command::Pause)?;
-                changed.push(id);
             }
+            let next = self.persist(&id, state, command)?;
+            changed.push((id, next));
         }
         if let Some(e) = &self.egress {
             e.sweep(&live)?;
@@ -542,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_pauses_running_agents_whose_vm_is_gone() {
+    fn reconcile_pauses_running_agents_whose_vm_is_gone_and_finishes_booted_creates() {
         let store = FakeStore::default();
         for (name, state) in [
             ("up", State::Running),
@@ -550,21 +625,30 @@ mod tests {
             ("asleep", State::Paused),
             ("dead", State::Destroyed),
             ("half", State::Creating),
+            ("booted", State::Creating),
         ] {
             let _ = store.set_state(&agent(name), state);
         }
         let rt = FakeRuntime {
-            live: vec![agent("up")],
+            live: vec![agent("up"), agent("booted")],
             ..Default::default()
         };
         let fleet = Fleet::new(&rt, store);
-        let changed = fleet.reconcile().unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(changed, [agent("gone")]);
+        let mut changed = fleet.reconcile().unwrap_or_else(|e| panic!("{e}"));
+        changed.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        assert_eq!(
+            changed,
+            [
+                (agent("booted"), State::Running),
+                (agent("gone"), State::Paused)
+            ]
+        );
         assert_eq!(*rt.calls.borrow(), ["running", "pause"]);
         let state = |n| fleet.state(&agent(n)).ok().flatten();
         assert_eq!(state("gone"), Some(State::Paused));
         assert_eq!(state("up"), Some(State::Running));
         assert_eq!(state("half"), Some(State::Creating));
+        assert_eq!(state("booted"), Some(State::Running));
         // Nothing left to do the second time; the agent can be resumed.
         assert!(matches!(fleet.reconcile().as_deref(), Ok([])));
         assert!(matches!(fleet.resume(&agent("gone")), Ok(State::Running)));
@@ -847,7 +931,7 @@ mod tests {
             Err(FleetError::AlreadyExists(_))
         ));
         assert!(egress.calls().is_empty());
-        assert_eq!(fleet.reconcile().ok(), Some(vec![id()]));
+        assert_eq!(fleet.reconcile().ok(), Some(vec![(id(), State::Paused)]));
         assert_eq!(egress.calls(), ["sweep up"]);
     }
 

@@ -47,6 +47,13 @@
     await refresh();
   }
 
+  // The agent's id, linking to its jobs page.
+  function link(id) {
+    const td = el('td');
+    td.append(el('a', id, { href: `/ui/jobs/${encodeURIComponent(id)}` }));
+    return td;
+  }
+
   function row(agent) {
     const buttons = el('td', undefined, { className: 'actions' });
     if (may('agents:write')) {
@@ -56,7 +63,7 @@
     }
     const tr = el('tr');
     tr.append(
-      el('td', agent.id),
+      link(agent.id),
       el('td', agent.state, { className: 'state' }),
       el('td', agent.health ?? ''),
       buttons,

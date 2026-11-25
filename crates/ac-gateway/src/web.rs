@@ -45,9 +45,15 @@ const UI_SCRIPT: &str = include_str!("../assets/ui.js");
 const UI_STYLE: &str = include_str!("../assets/ui.css");
 const AGENTS_PAGE: &str = include_str!("../assets/agents.html");
 const AGENTS_SCRIPT: &str = include_str!("../assets/agents.js");
+const JOBS_PAGE: &str = include_str!("../assets/jobs.html");
+const JOBS_SCRIPT: &str = include_str!("../assets/jobs.js");
 /// The management pages' scripts, whose API calls must all be in the catalog.
 #[cfg(test)]
-const UI_SCRIPTS: [(&str, &str); 2] = [("ui.js", UI_SCRIPT), ("agents.js", AGENTS_SCRIPT)];
+const UI_SCRIPTS: [(&str, &str); 3] = [
+    ("ui.js", UI_SCRIPT),
+    ("agents.js", AGENTS_SCRIPT),
+    ("jobs.js", JOBS_SCRIPT),
+];
 
 /// For agent-written text: never sniffed, never rendered as a page.
 const UNTRUSTED: [(&str, &str); 4] = [
@@ -506,6 +512,13 @@ fn asset(method: &str, path: &str) -> Option<Response> {
         "ui.js" => (UI_SCRIPT, JS),
         "ui.css" => (UI_STYLE, CSS),
         "agents.js" => (AGENTS_SCRIPT, JS),
+        "jobs.js" => (JOBS_SCRIPT, JS),
+        jobs if jobs
+            .strip_prefix("jobs/")
+            .is_some_and(|id| ac_domain::AgentId::parse(id).is_ok()) =>
+        {
+            (JOBS_PAGE, "text/html; charset=utf-8")
+        }
         id if ac_domain::AgentId::parse(id).is_ok() => (PAGE, "text/html; charset=utf-8"),
         _ => return Some(json(error(404, "not found"))),
     };
@@ -621,7 +634,12 @@ mod tests {
         assert!(index.is_some_and(|r| r.status == StatusCode::OK
             && r.headers.get("content-security-policy") == Some(CSP)
             && r.headers.get("content-type") == Some("text/html; charset=utf-8")));
-        for js in ["/ui/ui.js", "/ui/agents.js"] {
+        assert!(
+            asset("GET", "/ui/jobs/a1").is_some_and(|r| r.status == StatusCode::OK
+                && r.headers.get("content-type") == Some("text/html; charset=utf-8"))
+        );
+        assert!(asset("GET", "/ui/jobs/..").is_some_and(|r| r.status == StatusCode::from_u16(404)));
+        for js in ["/ui/ui.js", "/ui/agents.js", "/ui/jobs.js"] {
             assert!(asset("GET", js).is_some_and(
                 |r| r.headers.get("content-type") == Some("text/javascript; charset=utf-8")
             ));
@@ -645,6 +663,13 @@ mod tests {
             calls.push((method, path));
         }
         calls
+    }
+
+    /// The pages hide controls a token cannot use with `hidden`; a `display` rule in the style
+    /// sheet would otherwise show them again (forms are `display: flex`).
+    #[test]
+    fn hidden_wins_over_display_rules() {
+        assert!(UI_STYLE.contains("[hidden] { display: none !important; }"));
     }
 
     #[test]
@@ -687,6 +712,8 @@ mod tests {
             ("ui.css", UI_STYLE),
             ("agents.html", AGENTS_PAGE),
             ("agents.js", AGENTS_SCRIPT),
+            ("jobs.html", JOBS_PAGE),
+            ("jobs.js", JOBS_SCRIPT),
         ] {
             for banned in [
                 "http://",
@@ -702,7 +729,7 @@ mod tests {
                 assert!(!text.contains(banned), "{name} contains {banned}");
             }
         }
-        for page in [PAGE, AGENTS_PAGE] {
+        for page in [PAGE, AGENTS_PAGE, JOBS_PAGE] {
             assert!(
                 !page.contains("<script>") && !page.contains("style="),
                 "no inline script or style"

@@ -19,8 +19,9 @@
     return q ? `${path}?${q}` : path;
   }
 
-  // One API call. Resolves to { status, ok, data }; data is the JSON reply, or {} if it had none.
-  async function api(method, pattern, params = {}, { query = {}, body } = {}) {
+  // One API call. Resolves to { status, ok, data }: data is the JSON reply ({} if it had none), or
+  // with `text` the reply as text (agent-written: show it with textContent only).
+  async function api(method, pattern, params = {}, { query = {}, body, text = false } = {}) {
     if (!token) throw new Error('Not signed in.');
     const headers = { Authorization: `Bearer ${token}` };
     const init = { method, headers, cache: 'no-store' };
@@ -29,7 +30,7 @@
       init.body = JSON.stringify(body);
     }
     const r = await fetch(url(pattern, params, query), init);
-    const data = await r.json().catch(() => ({}));
+    const data = text && r.ok ? await r.text() : await r.json().catch(() => ({}));
     return { status: r.status, ok: r.ok, data };
   }
 

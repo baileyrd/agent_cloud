@@ -23,7 +23,8 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [x] Window list in the viewer: watch any of the session's windows (job windows marked) without moving the
   agent, and type into the one shown (ADR-006; verified on BaileyServ 2026-10-22; Ctrl-b never reached tmux
   from a browser)
-- [ ] Desktop streaming layer (ADR-006, open part) on the same transport and take-over lock
+- [ ] Desktop streaming layer on the same transport and take-over lock: JPEG frames over an exec pipe,
+  `xdotool` input (ADR-006 desktop addendum, #473); a live check on BaileyServ is still to do
 
 ## M3: Control plane
 - [x] Spawner: create, pause (stops the VM), resume, destroy (keeps the workspace) and purge, verified through

@@ -422,6 +422,38 @@ pub const ROUTES: &[Rule] = &[
         S(ViewerControl),
         None,
     ),
+    // The desktop stream (ADR-006 desktop addendum): the same scopes, lock and audit.
+    rule("GET", "/api/v1/agents/{id}/desk", S(ViewerRead), None),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/desk/{viewer}/takeover",
+        S(ViewerControl),
+        Some("takeover"),
+    ),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/desk/{viewer}/release",
+        S(ViewerControl),
+        Some("release"),
+    ),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/desk/{viewer}/pointer",
+        S(ViewerControl),
+        None,
+    ),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/desk/{viewer}/keys",
+        S(ViewerControl),
+        None,
+    ),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/desk/{viewer}/text",
+        S(ViewerControl),
+        None,
+    ),
 ];
 
 /// The rule for a request and the agent segment of its path, if it has one. 404 if no rule's
@@ -556,6 +588,7 @@ mod tests {
     fn route_to_scope_table() {
         let job = "/api/v1/agents/a1/jobs/0123456789abcdef";
         let term = "/api/v1/agents/a1/term/0011223344556677";
+        let desk = "/api/v1/agents/a1/desk/0011223344556677";
         for (method, path, want) in [
             ("GET", "/api/v1/whoami", Need::Token),
             ("POST", "/api/v1/mcp", Need::Token),
@@ -589,12 +622,18 @@ mod tests {
             ("POST", &format!("{term}/text"), S(ViewerControl)),
             ("POST", &format!("{term}/paste"), S(ViewerControl)),
             ("POST", &format!("{term}/resize"), S(ViewerControl)),
+            ("GET", "/api/v1/agents/a1/desk", S(ViewerRead)),
+            ("POST", &format!("{desk}/takeover"), S(ViewerControl)),
+            ("POST", &format!("{desk}/release"), S(ViewerControl)),
+            ("POST", &format!("{desk}/pointer"), S(ViewerControl)),
+            ("POST", &format!("{desk}/keys"), S(ViewerControl)),
+            ("POST", &format!("{desk}/text"), S(ViewerControl)),
         ] {
             assert_eq!(need(method, path), Some(want), "{method} {path}");
         }
         assert_eq!(
             ROUTES.len(),
-            32,
+            38,
             "a new route needs a row above and in ADR-011"
         );
     }

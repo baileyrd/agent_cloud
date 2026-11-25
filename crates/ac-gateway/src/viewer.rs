@@ -22,7 +22,8 @@
 //!   [`ac_viewer::windows`] messages);
 //! - `POST /api/v1/agents/{id}/term/{viewer}/{keys|text|paste|resize|takeover|release}`;
 //! - `POST /api/v1/agents/{id}/term/{viewer}/window`, body `@<n>` or `active`: watch that window;
-//! - `GET /api/v1/agents/{id}/history?limit=N`: recorded output as plain text.
+//! - `GET /api/v1/agents/{id}/history?limit=N`: recorded output as plain text;
+//! - the desktop stream under `.../desk` ([`desk`]), on the same lock.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
@@ -46,6 +47,10 @@ use ac_viewer::windows::{self, PaneId, Target, Window, WindowId, LIST_FORMAT};
 use platform::process::Spawner;
 
 use crate::{error, Reply};
+
+mod desk;
+pub use desk::Desktop;
+use desk::{Desk, DeskAction};
 
 /// Viewers of one agent at once.
 pub const PER_AGENT: usize = 4;
@@ -265,6 +270,8 @@ pub(crate) enum Route<'a> {
     Stream(AgentId),
     Action(AgentId, &'a str, Action),
     History(AgentId),
+    Desk(AgentId),
+    DeskAction(AgentId, &'a str, DeskAction),
 }
 
 /// What a viewer asks for under `term/{viewer}/`: a closed set.
@@ -300,9 +307,10 @@ pub(crate) fn route<'a>(method: &str, path: &'a str) -> Option<Result<Route<'a>,
     let parts: Vec<&str> = rest.split('/').collect();
     let (id, tail) = parts.split_first()?;
     let want = match tail {
-        ["term"] | ["history"] => "GET",
+        ["term"] | ["history"] | ["desk"] => "GET",
         ["term", v, a] if !v.is_empty() && Action::parse(a).is_some() => "POST",
-        ["term", _, _] => return Some(Err(error(404, "not found"))),
+        ["desk", v, a] if !v.is_empty() && DeskAction::parse(a).is_some() => "POST",
+        ["term" | "desk", _, _] => return Some(Err(error(404, "not found"))),
         _ => return None,
     };
     let id = match AgentId::parse(id) {
@@ -315,6 +323,8 @@ pub(crate) fn route<'a>(method: &str, path: &'a str) -> Option<Result<Route<'a>,
     Some(Ok(match tail {
         ["term"] => Route::Stream(id),
         ["history"] => Route::History(id),
+        ["desk"] => Route::Desk(id),
+        ["desk", viewer, action] => Route::DeskAction(id, viewer, DeskAction::parse(action)?),
         [_, viewer, action] => Route::Action(id, viewer, Action::parse(action)?),
         _ => return None,
     }))
@@ -328,6 +338,7 @@ pub struct Hub {
 
 struct Inner {
     term: Box<dyn Terminal>,
+    desktop: Option<Box<dyn Desktop>>,
     state: Mutex<State>,
     recorder: Recorder,
     picks: AtomicUsize,
@@ -336,6 +347,8 @@ struct Inner {
 struct State {
     registry: Registry,
     views: HashMap<String, View>,
+    /// Watched desktops, by agent.
+    desks: HashMap<String, Desk>,
     /// The token (name) each viewer id belongs to.
     tokens: HashMap<String, String>,
     next_gen: u64,
@@ -419,9 +432,11 @@ impl Hub {
         Self {
             inner: Arc::new(Inner {
                 term: Box::new(term),
+                desktop: None,
                 state: Mutex::new(State {
                     registry: Registry::new(per_agent, total),
                     views: HashMap::new(),
+                    desks: HashMap::new(),
                     tokens: HashMap::new(),
                     next_gen: 0,
                 }),
@@ -432,6 +447,16 @@ impl Hub {
                 picks: AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// Serve desktop streams through `desktop` (without it, `.../desk` is 404). Call before the
+    /// hub is cloned; on a shared hub it is refused and logged.
+    pub fn with_desktop(mut self, desktop: impl Desktop) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.desktop = Some(Box::new(desktop)),
+            None => eprintln!("ac-gateway: viewer: desktop set on a shared hub; ignored"),
+        }
+        self
     }
 
     /// The terminal, for the watchdog and startup cleanup.
@@ -460,6 +485,10 @@ impl Hub {
             }
             Route::Action(id, viewer, action) => {
                 Answer::Json(self.action(&id, viewer, action, query, body, who))
+            }
+            Route::Desk(id) => self.desk_open(&id, who),
+            Route::DeskAction(id, viewer, action) => {
+                Answer::Json(self.desk_action(&id, viewer, action, query, body, who))
             }
         })
     }
@@ -522,6 +551,7 @@ impl Hub {
             hub: self.clone(),
             id: id.clone(),
             viewer,
+            kind: Kind::Term,
         })
     }
 
@@ -530,18 +560,17 @@ impl Hub {
             let mut st = self.inner.lock();
             st.tokens.remove(viewer);
             let event = st.registry.leave(id.as_str(), viewer);
+            if let Some(view) = st.views.get_mut(id.as_str()) {
+                view.viewers.remove(viewer);
+                view.prune();
+            }
             if let Some(e) = &event {
                 self.inner.recorder.event(id, &e.to_string());
+                self.owner_changed(&mut st, id, None);
             }
-            let Some(view) = st.views.get_mut(id.as_str()) else {
+            let Some(view) = st.views.get(id.as_str()) else {
                 return;
             };
-            view.viewers.remove(viewer);
-            view.prune();
-            if event.is_some() {
-                view.owner = None;
-                broadcast(view, &screen::mode(None));
-            }
             if !view.viewers.is_empty() {
                 return;
             }
@@ -563,7 +592,11 @@ impl Hub {
         who: &str,
     ) -> Reply {
         let mut st = self.inner.lock();
-        if !st.owns(id, viewer, who) {
+        let term_viewer = st
+            .views
+            .get(id.as_str())
+            .is_some_and(|v| v.viewers.contains_key(viewer));
+        if !st.owns(id, viewer, who) || !term_viewer {
             return error(404, "no such viewer");
         }
         match action {
@@ -577,16 +610,7 @@ impl Hub {
                         if let Some(e) = event {
                             self.inner.recorder.event(id, &e.to_string());
                         }
-                        if let Some(view) = st.views.get_mut(id.as_str()) {
-                            if view.owner.is_none() {
-                                let (tx, rx) = mpsc::sync_channel(INPUT_QUEUE);
-                                view.owner = Some(tx);
-                                let inner = Arc::clone(&self.inner);
-                                let id = id.clone();
-                                std::thread::spawn(move || writer(inner, id, rx));
-                            }
-                            broadcast(view, &screen::mode(Some(viewer)));
-                        }
+                        self.owner_changed(&mut st, id, Some(viewer));
                         ok(&format!(r#"{{"owner":"{viewer}"}}"#))
                     }
                 }
@@ -595,10 +619,7 @@ impl Hub {
                 None => error(409, "you do not have control"),
                 Some(e) => {
                     self.inner.recorder.event(id, &e.to_string());
-                    if let Some(view) = st.views.get_mut(id.as_str()) {
-                        view.owner = None;
-                        broadcast(view, &screen::mode(None));
-                    }
+                    self.owner_changed(&mut st, id, None);
                     ok(r#"{"owner":null}"#)
                 }
             },
@@ -640,6 +661,35 @@ impl Hub {
                 }
             }
             Action::Window => error(500, "a window pick is not an input action"),
+        }
+    }
+
+    /// The take-over lock of `id` moved to `owner` (or nobody): the terminal and the desktop each
+    /// keep their input client only while one of their own viewers holds it, and every viewer of
+    /// either is told.
+    fn owner_changed(&self, st: &mut State, id: &AgentId, owner: Option<&str>) {
+        let msg = screen::mode(owner);
+        if let Some(view) = st.views.get_mut(id.as_str()) {
+            let ours = owner.is_some_and(|o| view.viewers.contains_key(o));
+            if !ours {
+                view.owner = None;
+            } else if view.owner.is_none() {
+                let (tx, rx) = mpsc::sync_channel(INPUT_QUEUE);
+                view.owner = Some(tx);
+                let inner = Arc::clone(&self.inner);
+                let id = id.clone();
+                std::thread::spawn(move || writer(inner, id, rx));
+            }
+            broadcast(view, &msg);
+        }
+        if let Some(desk) = st.desks.get_mut(id.as_str()) {
+            let ours = owner.is_some_and(|o| desk.viewers.contains_key(o));
+            if !ours {
+                desk.owner = None;
+            } else if desk.owner.is_none() {
+                desk.owner = Some(self.desk_writer(id));
+            }
+            desk::broadcast(desk, &msg);
         }
     }
 
@@ -833,6 +883,14 @@ pub struct Stream {
     hub: Hub,
     id: AgentId,
     viewer: String,
+    kind: Kind,
+}
+
+/// Which stream a viewer has.
+#[derive(Clone, Copy)]
+enum Kind {
+    Term,
+    Desk,
 }
 
 impl Iterator for Stream {
@@ -849,7 +907,10 @@ impl Iterator for Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        self.hub.leave(&self.id, &self.viewer);
+        match self.kind {
+            Kind::Term => self.hub.leave(&self.id, &self.viewer),
+            Kind::Desk => self.hub.desk_leave(&self.id, &self.viewer),
+        }
     }
 }
 

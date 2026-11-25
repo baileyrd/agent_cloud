@@ -1,6 +1,6 @@
-//! The whole HTTP surface, in order: the Origin check (every request), the viewer page and its
-//! script and style (no data in them, so no token: a browser cannot send a header when it
-//! navigates), then under `/api/`: the token, the route's scope and agents ([`access`]), and the
+//! The whole HTTP surface, in order: the Origin check (every request), the viewer pages (terminal
+//! and desktop) and their scripts and style (no data in them, so no token: a browser cannot send a
+//! header when it navigates), then under `/api/`: the token, the route's scope and agents ([`access`]), and the
 //! viewer, job, lifecycle or MCP handler; an MCP tool call goes through the same checks as the
 //! route it names ([`mcp`]). State-changing calls are audited: one line in the gateway's
 //! log and one event in the agent's history, with the token's name, never the token.
@@ -40,6 +40,8 @@ const LOGIN_MAX: usize = 256;
 const PAGE: &str = include_str!("../assets/viewer.html");
 const SCRIPT: &str = include_str!("../assets/viewer.js");
 const STYLE: &str = include_str!("../assets/viewer.css");
+const DESK_PAGE: &str = include_str!("../assets/desk.html");
+const DESK_SCRIPT: &str = include_str!("../assets/desk.js");
 
 /// For agent-written text: never sniffed, never rendered as a page.
 const UNTRUSTED: [(&str, &str); 4] = [
@@ -463,7 +465,14 @@ fn asset(method: &str, path: &str) -> Option<Response> {
     let (body, kind) = match name {
         "viewer.js" => (SCRIPT, "text/javascript; charset=utf-8"),
         "viewer.css" => (STYLE, "text/css; charset=utf-8"),
+        "desk.js" => (DESK_SCRIPT, "text/javascript; charset=utf-8"),
         id if ac_domain::AgentId::parse(id).is_ok() => (PAGE, "text/html; charset=utf-8"),
+        desk if desk
+            .strip_prefix("desk/")
+            .is_some_and(|id| ac_domain::AgentId::parse(id).is_ok()) =>
+        {
+            (DESK_PAGE, "text/html; charset=utf-8")
+        }
         _ => return Some(json(error(404, "not found"))),
     };
     Some(with(

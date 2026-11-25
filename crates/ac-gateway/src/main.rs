@@ -500,7 +500,8 @@ fn run() -> Result<(), String> {
     let hub = Hub::new(
         CtrRuntime::new(LinuxSpawner, cfg.clone()),
         data.join("history"),
-    );
+    )
+    .with_desktop(CtrRuntime::new(LinuxSpawner, cfg.clone()));
     let notes = hub.clone();
     let mut jobs = Jobs::new(
         store.clone(),

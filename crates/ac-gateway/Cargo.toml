@@ -27,6 +27,7 @@ rusty_serve.workspace = true
 rusty_http.workspace = true
 rusty_json.workspace = true
 rusty_sha2.workspace = true
+rusty_base64.workspace = true
 rusty_crypto_key.workspace = true
 rusty_atomic_file.workspace = true
 rusty_time.workspace = true

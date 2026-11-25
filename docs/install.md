@@ -433,6 +433,10 @@ How to use it:
    viewers stay where they are (no `select-window`). If the window closes the page falls back to the agent's.
 4. What was shown while someone watched, with take-over and audit events: `GET /api/v1/agents/<id>/history?limit=N`
    (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
+5. A desktop agent (`images/agent-desktop`): open `/ui/desk/<agent-id>`, or **Desktop** in the terminal page's
+   header. You see display `:0` at about 4 frames a second, view-only. **Take over** gives you the mouse and
+   keyboard (the same lock as the terminal: one of the two pages holds it at a time); typing goes in as key
+   presses, so paste by typing. Needs the image's `ffmpeg` and `xdotool` (ADR-006, desktop addendum).
 
 The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off).
 A probe answering within 10 s is healthy. Failures while the host is busy are logged "slow, host busy, not acting".

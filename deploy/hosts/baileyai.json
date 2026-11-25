@@ -1,0 +1,8 @@
+{
+  "note": "BaileyAi (GMKtec EVO-X2, Ryzen AI MAX+ 395, 16 cores / 32 threads), recorded 2026-11-17: 128 GiB installed, 96 GiB carved out for the GPU, so the OS sees ~30 GiB. That 30 GiB also carries Let Em Loose, orch, Hermes and the llama-swap host process. Disk class, phys_bits and /dev/kvm access are assumed, not measured. Card #1058.",
+  "mem_total_mib": 30720,
+  "cores": 32,
+  "phys_bits": 48,
+  "virt": "svm",
+  "disk": "solid"
+}

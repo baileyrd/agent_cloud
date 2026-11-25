@@ -1,0 +1,9 @@
+{
+  "note": "MS-01 (promox) as a bare-metal Fedora Server host, the 2026-11-24 migration target. Recorded 2026-11-18 and 2026-11-24: i9-12900H (20 threads), 32 GiB on one DIMM, 1 TB QLC DRAM-less NVMe, nested KVM on. Shared with the router VM, Home Assistant and the service Quadlets, so agents get what those leave. MemTotal assumed ~97% of installed. phys_bits is the usual value for this CPU, not measured. Card #1058.",
+  "mem_total_mib": 31880,
+  "cores": 20,
+  "phys_bits": 39,
+  "virt": "vmx",
+  "disk": "solid",
+  "kvm": "usable"
+}

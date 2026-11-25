@@ -1,0 +1,8 @@
+{
+  "note": "LXC 107 agentos on the MS-01, as configured 2026-09-16: 4 vCPU, 8 GiB, unprivileged, nesting=1, no /dev/kvm passed through. Kata cannot start here until /dev/kvm (and vhost devices) are passed into the container. Card #1058.",
+  "mem_total_mib": 8192,
+  "cores": 4,
+  "virt": "vmx",
+  "disk": "solid",
+  "kvm": null
+}

@@ -87,11 +87,13 @@ host RAM: MemAvailable was still 9.6 GiB at that moment.
 | Resume (API call to first exec) | 3.63 / 3.69 / 3.84 | n=12 |
 | Create while 1 agent runs the load | 16.71 / 16.74 | n=2 |
 | Create while 6 agents run the load | **failed**: vsock timeout | 1 run |
-| Storm of 4 creates at once | 4.44 / 8.15 / 17.02 | 2 runs, n=8 |
+| Storm of 4 creates at once, before ADR-027 | 4.44 / 8.15 / 17.02 | 2 runs, n=8 |
+| Storm of 4 creates at once, after ADR-027 (2026-11-25, 4d1406f) | 6.53 / 7.72 / 8.12; 8.1 s wall | 1 run, n=4 |
 
-The storm mostly measures the gateway, not the disk. The gateway held one lock across a create, so the four
-creates ran one after another, and each create call lasted as long as its boot. ADR-027 moves the boot out of
-the lock; this table is from before it.
+Before ADR-027 the gateway held one lock across a create, so the four creates ran one after another and each
+call lasted as long as its boot. Since ADR-027 the boots overlap: four creates took 8.1 s wall against 30.1 s
+summed (s1 7.40, s2 8.03, s3 6.53, s4 8.12 s, all 201), each a little slower than a lone create because the
+four boots share the disk. A second POST for s1 one second in got 409 "agent s1 is being created" (#479).
 
 ## Claude Code (measured on a1)
 
@@ -555,7 +557,6 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
 - Free page reporting, virtio-mem. The `/dev/shm` resize and admission were checked live (ADR-012), but the
   staircase was not re-run with them.
 - A create while the load runs at N = 2–4; it was measured only at N=1 and N=6.
-- A truly parallel create storm. Since ADR-027 creates boot outside the gateway's lock; not measured yet.
 
 ## Requirements that still hold
 

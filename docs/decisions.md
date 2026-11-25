@@ -1465,3 +1465,9 @@ and `ui.css`. The agents page is the UI's index, `/ui/`, so it cannot clash with
 Every call is written as a single-quoted method and catalog pattern side by side (for example `'POST'` then
 the pause route with its `{id}` segment); `web::tests::the_management_pages_call_only_catalog_routes` reads
 the scripts and fails on any pair that is not in `access::ROUTES`, or any API path written another way.
+
+**Addendum (2026-11-25, slice 2):** each agent's jobs are at `/ui/jobs/<agent>`, linked from the agents page.
+The picked job is followed with `GET .../jobs/{job}?wait=25` (a reply sooner than 1 s is followed by a 1 s
+pause, so an immediate answer never becomes a tight loop); once it ends the page reads its output as text and
+its witness. The page polls rather than using the AG-UI stream (#471): it shows state and the final output,
+not a live transcript, and long-polls need no stream slot (`MAX_STREAMS`).

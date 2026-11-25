@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Jobs</title>
+<link rel="stylesheet" href="/ui/ui.css">
+</head>
+<body>
+<header>
+  <a href="/ui/">Agents</a>
+  <strong>Jobs · <span id="agent"></span></strong>
+  <span id="who"></span>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<main>
+  <form id="submit" class="stack" hidden>
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" rows="4" spellcheck="false"></textarea>
+    <span>
+      <label for="timeout">Timeout (seconds, optional)</label>
+      <input id="timeout" type="number" min="1" inputmode="numeric">
+      <button type="submit">Submit</button>
+    </span>
+  </form>
+  <p id="note" role="status"></p>
+  <table>
+    <thead><tr><th>Job</th><th>State</th><th>Created</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p id="empty" hidden>No jobs yet.</p>
+  <section id="detail" hidden>
+    <h2>Job <span id="picked"></span></h2>
+    <p id="state"></p>
+    <h3>Output</h3>
+    <pre id="output"></pre>
+    <h3>Witness</h3>
+    <pre id="witness"></pre>
+  </section>
+</main>
+<script src="/ui/ui.js"></script>
+<script src="/ui/jobs.js"></script>
+</body>
+</html>

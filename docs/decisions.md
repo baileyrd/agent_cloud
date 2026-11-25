@@ -715,13 +715,17 @@ hosts to the base list, on ports 443 and 80, to public addresses; LEL's gateway 
   host is a name (no IP literal), from the operator's file, never hardcoded or set through the API. `!exclusive`
   means an agent with this profile attached loses the base list: it reaches only what its profiles allow. Other
   attached profiles still add their hosts, so package mirrors compose (`["gateway","rust"]`).
+- *Profiles only:* the base allowlist refuses both directives (the proxy keeps its previous list, and the
+  gateway reports the file as bad), since a base `endpoint` would reach every agent and anonymous callers.
 - *Shipped as config, not code:* `/etc/agent-cloud/egress/profiles/gateway.txt` is two lines the operator writes
   (docs/install.md); nothing in this repo names the gateway. The name `gateway` is a convention, not reserved.
 - *No generic CONNECT target:* an endpoint matches host and port together. The same host on any other port goes
   through the ordinary rules (and is refused unless some list has it on 443/80).
 - *Private addresses:* an endpoint's addresses are vetted by `vet_endpoint`, which accepts private ranges (the
   tailnet's 100.64.0.0/10, RFC 1918, ULA) but refuses loopback, unspecified, link-local, multicast, broadcast and
-  IPv4-mapped forms. Every other host keeps `vet`, which refuses all non-public addresses. An endpoint pointed at
+  IPv4-mapped forms, and the agent bridge (`AC_EGRESS_AGENT_NET`, default 10.89.0.0/16), which the proxy's unit
+  may reach: a name that resolves there (a rebind of a name the operator does not control) would reach another
+  agent or the host's bridge address. Every other host keeps `vet`, which refuses all non-public addresses. An endpoint pointed at
   this host's own LAN or tailnet address would reach its services: name another machine. The proxy's unit
   (`IPAddressDeny=` of private ranges) still blocks the address until the operator allows exactly it with a
   drop-in (`IPAddressAllow=<address>/32`, docs/install.md), so a profile alone cannot open a private range.

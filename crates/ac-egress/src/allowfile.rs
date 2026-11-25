@@ -12,7 +12,7 @@ const MAX_BYTES: u64 = 64 * 1024;
 
 /// Parse the file format. Returns the list and how many entries it has.
 pub fn parse(text: &str) -> Result<(Allowlist, usize), AllowlistError> {
-    let list = Allowlist::parse_file(text)?;
+    let list = Allowlist::parse_base(text)?;
     let n = list.len();
     Ok((list, n))
 }

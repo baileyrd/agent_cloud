@@ -206,7 +206,7 @@ impl Profiles for EgressStore {
 
     fn base_hosts(&self) -> Result<usize, String> {
         let text = read_private(&self.base, self.owner)?.unwrap_or_default();
-        Allowlist::parse_file(&text)
+        Allowlist::parse_base(&text)
             .map(|l| l.len())
             .map_err(|e| format!("{}: {e}", self.base.display()))
     }

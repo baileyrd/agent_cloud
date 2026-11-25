@@ -253,28 +253,75 @@ pub fn vet(mut addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, Reason> {
     Ok(addrs)
 }
 
+/// The agents' bridge subnet, IPv4 `a.b.c.d/n`: an endpoint must never resolve into it (another
+/// agent, or the host's bridge address, which the proxy's unit may reach).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentNet {
+    base: u32,
+    prefix: u8,
+}
+
+impl AgentNet {
+    /// The default CNI bridge, `10.89.0.0/16`.
+    pub const DEFAULT: Self = Self {
+        base: u32::from_be_bytes([10, 89, 0, 0]),
+        prefix: 16,
+    };
+
+    /// Parse `a.b.c.d/n` with `n` in 8..=32; host bits are cleared.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad = || format!("{s:?}: expected an IPv4 subnet such as 10.89.0.0/16");
+        let (ip, prefix) = s.split_once('/').ok_or_else(bad)?;
+        let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| bad())?;
+        let prefix: u8 = prefix.parse().map_err(|_| bad())?;
+        if !(8..=32).contains(&prefix) {
+            return Err(bad());
+        }
+        let base = u32::from(ip) & Self::mask(prefix);
+        Ok(Self { base, prefix })
+    }
+
+    fn mask(prefix: u8) -> u32 {
+        u32::MAX << (32 - u32::from(prefix))
+    }
+
+    /// Whether `ip` is in it (an IPv6 address never is; v4-mapped ones are refused anyway).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => u32::from(v4) & Self::mask(self.prefix) == self.base,
+            IpAddr::V6(_) => false,
+        }
+    }
+}
+
 /// The addresses the proxy may connect to for an endpoint: all of `addrs`, IPv4 first, unless
 /// one is this host's own (loopback, unspecified), link-local, multicast or broadcast. Private
 /// ranges (the tailnet, the LAN) are what endpoints are for. Pointing an endpoint at this host's
 /// own LAN or tailnet address would reach the host's services: the operator must name another
 /// machine.
-pub fn vet_endpoint(mut addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, Reason> {
-    let local = |ip: IpAddr| match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_unspecified()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.octets()[0] == 0
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some()
-        }
+pub fn vet_endpoint(
+    mut addrs: Vec<SocketAddr>,
+    agents: AgentNet,
+) -> Result<Vec<SocketAddr>, Reason> {
+    let local = |ip: IpAddr| {
+        agents.contains(ip)
+            || match ip {
+                IpAddr::V4(v4) => {
+                    v4.is_loopback()
+                        || v4.is_unspecified()
+                        || v4.is_link_local()
+                        || v4.is_multicast()
+                        || v4.is_broadcast()
+                        || v4.octets()[0] == 0
+                }
+                IpAddr::V6(v6) => {
+                    v6.is_loopback()
+                        || v6.is_unspecified()
+                        || v6.is_multicast()
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        || v6.to_ipv4_mapped().is_some()
+                }
+            }
     };
     if let Some(bad) = addrs.iter().find(|a| local(a.ip())) {
         return Err(Reason::Private(bad.ip()));
@@ -551,16 +598,16 @@ mod tests {
     fn endpoints_may_be_private_but_never_this_host() {
         let addr = |s: &str| s.parse::<SocketAddr>().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            vet_endpoint(vec![
-                addr("[fd7a:115c:a1e0::1]:8443"),
-                addr("100.101.2.3:8443")
-            ]),
+            vet_endpoint(
+                vec![addr("[fd7a:115c:a1e0::1]:8443"), addr("100.101.2.3:8443")],
+                AgentNet::DEFAULT
+            ),
             Ok(vec![
                 addr("100.101.2.3:8443"),
                 addr("[fd7a:115c:a1e0::1]:8443")
             ])
         );
-        assert!(vet_endpoint(vec![addr("192.168.50.10:8443")]).is_ok());
+        assert!(vet_endpoint(vec![addr("192.168.50.10:8443")], AgentNet::DEFAULT).is_ok());
         for bad in [
             "127.0.0.1:8443",
             "0.0.0.0:8443",
@@ -569,16 +616,27 @@ mod tests {
             "[::1]:8443",
             "[fe80::1]:8443",
             "[::ffff:127.0.0.1]:8443",
+            "10.89.0.1:8443",
+            "10.89.3.7:8443",
         ] {
             assert!(
                 matches!(
-                    vet_endpoint(vec![addr("10.0.0.2:8443"), addr(bad)]),
+                    vet_endpoint(vec![addr("10.0.0.2:8443"), addr(bad)], AgentNet::DEFAULT),
                     Err(Reason::Private(_))
                 ),
                 "{bad}"
             );
         }
-        assert_eq!(vet_endpoint(Vec::new()), Err(Reason::NoAddress));
+        assert_eq!(
+            vet_endpoint(Vec::new(), AgentNet::DEFAULT),
+            Err(Reason::NoAddress)
+        );
+        let other = AgentNet::parse("10.200.1.9/24").unwrap_or_else(|e| panic!("{e}"));
+        assert!(vet_endpoint(vec![addr("10.89.0.1:8443")], other).is_ok());
+        assert!(vet_endpoint(vec![addr("10.200.1.250:8443")], other).is_err());
+        for bad in ["10.89.0.0", "10.89.0.0/7", "10.89.0.0/33", "x/16", "::1/64"] {
+            assert!(AgentNet::parse(bad).is_err(), "{bad}");
+        }
         // The ordinary check still refuses the tailnet.
         assert!(vet(vec![addr("100.101.2.3:8443")]).is_err());
     }

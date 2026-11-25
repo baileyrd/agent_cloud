@@ -100,6 +100,21 @@ impl Allowlist {
         Ok(list)
     }
 
+    /// Parse the base allowlist file: [`Self::parse_file`] without its profile-only directives.
+    /// An `endpoint` there would give every agent (and callers with no credential) a private
+    /// address, and `!exclusive` means nothing, so both are refused.
+    pub fn parse_base(text: &str) -> Result<Self, AllowlistError> {
+        let list = Self::parse_file(text)?;
+        if let Some(e) = list.endpoints.first() {
+            let line = format!("endpoint {}:{} (only in a profile)", e.host, e.port);
+            return Err(AllowlistError(line));
+        }
+        if list.exclusive {
+            return Err(AllowlistError("!exclusive (only in a profile)".into()));
+        }
+        Ok(list)
+    }
+
     /// How many entries: exact, wildcard and endpoints.
     pub fn len(&self) -> usize {
         self.exact.len() + self.suffixes.len() + self.endpoints.len()
@@ -192,6 +207,11 @@ mod tests {
         assert_eq!(l.len(), 2);
         assert!(Allowlist::parse_file("ok.com\nhttp://bad\n").is_err());
         assert!(Allowlist::parse_file("# nothing\n").is_ok_and(|l| l.is_empty()));
+        assert!(Allowlist::parse_base("api.anthropic.com\n").is_ok());
+        for bad in ["endpoint mcp.test:8443\n", "a.com\n!exclusive\n"] {
+            let e = Allowlist::parse_base(bad).err().map(|e| e.to_string());
+            assert!(e.is_some_and(|e| e.contains("only in a profile")), "{bad}");
+        }
         let extra = Allowlist::new(["index.crates.io", "*.pythonhosted.org"]).unwrap_or_default();
         assert!(!l.permits("index.crates.io"));
         l.merge(&extra);

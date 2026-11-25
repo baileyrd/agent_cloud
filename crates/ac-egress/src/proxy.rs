@@ -15,7 +15,9 @@ use ac_domain::Allowlist;
 use crate::auth;
 use crate::egressfile::EgressFiles;
 use crate::head::{read_head, Head, HeadLimits};
-use crate::policy::{judge, vet, vet_endpoint, would_allow, Decision, Policy, Reason, Verdict};
+use crate::policy::{
+    judge, vet, vet_endpoint, would_allow, AgentNet, Decision, Policy, Reason, Verdict,
+};
 
 /// Name resolution and connecting, injectable so tests can point names anywhere.
 pub trait Upstream: Send + Sync + 'static {
@@ -71,6 +73,7 @@ pub struct Proxy<U> {
     files: Option<Mutex<EgressFiles>>,
     upstream: U,
     limits: Limits,
+    agents: AgentNet,
     active: Arc<AtomicUsize>,
 }
 
@@ -138,8 +141,15 @@ impl<U: Upstream> Proxy<U> {
             files: None,
             upstream,
             limits,
+            agents: AgentNet::DEFAULT,
             active: Arc::default(),
         }
+    }
+
+    /// Refuse endpoints that resolve into `agents` (default [`AgentNet::DEFAULT`]).
+    pub fn with_agent_net(mut self, agents: AgentNet) -> Self {
+        self.agents = agents;
+        self
     }
 
     /// Also enforce per-agent profiles from `files` (ADR-016), re-checked before each decision.
@@ -288,15 +298,15 @@ impl<U: Upstream> Proxy<U> {
             Verdict::Decided(caller, Decision::Endpoint) => (caller, true),
         };
         drop(policy);
-        let check = match endpoint {
-            true => vet_endpoint,
-            false => vet,
-        };
+        let agents = self.agents;
         let addrs = self
             .upstream
             .resolve(&head.host, head.port)
             .map_err(|_| Reason::Lookup)
-            .and_then(check);
+            .and_then(|addrs| match endpoint {
+                true => vet_endpoint(addrs, agents),
+                false => vet(addrs),
+            });
         (caller.label(), addrs.map_err(|r| Denied::policy(&r)))
     }
 

@@ -222,6 +222,9 @@ pub enum JobInputError {
     Timeout(u64),
     /// The idempotency key is empty, too long, or has characters outside `[A-Za-z0-9._:-]`.
     Key,
+    /// The credential is empty, longer than [`MAX_CREDENTIAL`] bytes, or has a byte outside
+    /// printable ASCII without space.
+    Credential,
 }
 
 impl fmt::Display for JobInputError {
@@ -233,6 +236,10 @@ impl fmt::Display for JobInputError {
             Self::Key => write!(
                 f,
                 "idempotency_key must be 1 to {MAX_KEY} characters of [A-Za-z0-9._:-]"
+            ),
+            Self::Credential => write!(
+                f,
+                "credential must be 1 to {MAX_CREDENTIAL} bytes of printable ASCII without spaces"
             ),
         }
     }
@@ -269,9 +276,55 @@ pub fn check_key(key: &str) -> Result<(), JobInputError> {
     Ok(())
 }
 
+/// Longest credential a job may carry.
+pub const MAX_CREDENTIAL: usize = 4096;
+
+/// A job's opaque credential (ADR-028): handed into the VM for that job only, never stored,
+/// logged or shown. `Debug` hides it; only [`Credential::expose`] reads it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential(String);
+
+impl Credential {
+    /// 1 to [`MAX_CREDENTIAL`] bytes of `!`..=`~`: one line, safe to pass on a pipe.
+    pub fn parse(s: &str) -> Result<Self, JobInputError> {
+        let ok = s.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        match !s.is_empty() && s.len() <= MAX_CREDENTIAL && ok {
+            true => Ok(Self(s.to_owned())),
+            false => Err(JobInputError::Credential),
+        }
+    }
+
+    /// The secret itself, for the one place it goes.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Credential(..)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{JobEvent::*, JobState::*, *};
+
+    #[test]
+    fn credentials_are_one_printable_line_and_hidden_from_debug() {
+        let c = Credential::parse("lel.tok_ABC-123/=").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.expose(), "lel.tok_ABC-123/=");
+        assert_eq!(format!("{c:?}"), "Credential(..)");
+        let long = "x".repeat(MAX_CREDENTIAL + 1);
+        for bad in ["", "a b", "a\nb", "tab\t", "é", long.as_str()] {
+            assert_eq!(
+                Credential::parse(bad),
+                Err(JobInputError::Credential),
+                "{bad:?}"
+            );
+        }
+        assert!(Credential::parse(&"x".repeat(MAX_CREDENTIAL)).is_ok());
+    }
 
     const EVENTS: [JobEvent; 7] = [Start, Exit(0), Exit(3), Fail, Cancel, Timeout, Interrupt];
 

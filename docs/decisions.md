@@ -1284,3 +1284,37 @@ host, recorded in sizing.md.
 **Alternative:** release the reservation on a failed boot (forget the record). Rejected for now: a failed
 create has always stayed visible as `Creating` so its leftovers can be destroyed, and admission keeps counting
 it until then.
+
+## ADR-028: A job may carry an opaque, short-lived credential
+**Status:** proposed (2026-11-25). Mill Board card #1064.
+**Context:** LEL D101: no long-lived secret inside the jail; each untrusted job gets a short-lived token scoped to
+its lens and claim, minted by LEL. agent_cloud must pass it through without storing, logging or showing it, and
+remove it when the job ends, however it ends.
+**Decision.**
+- *API:* `POST /api/v1/agents/{id}/jobs` (and MCP `submit_job`) accepts `credential`: 1 to 4096 bytes of `!`..`~`
+  (one line, safe on a pipe). agent_cloud does not read it and sets no TTL of its own: its life is the job's
+  (bounded by `timeout_secs`); LEL mints it with its own expiry.
+- *In the gateway:* an in-memory map from job id to credential, from submit until the job's terminal transition.
+  The job's host directory gets an empty `needs-credential` marker. At start, a job with the marker but no
+  credential in memory (a restart came between) fails: "its credential was lost when the gateway restarted;
+  submit it again". `Credential`'s `Debug` prints `Credential(..)`.
+- *Into the VM:* the start exec gets a `1` flag in its argv and the credential as one line on stdin (stdin never
+  reaches EOF, ADR-006, so the script reads a line, not to the end). The script writes it to
+  `/dev/shm/ac-job-<id>/credential` (umask 077) on the guest's tmpfs; the runner exports
+  `AC_JOB_CREDENTIAL_FILE`. `CtrRuntime::exec_once_with_input` writes the line; it is never traced.
+- *Removal:* the runner removes the directory once `claude` exits, before writing `exit_code` and the done
+  marker, and in an `EXIT` trap; the kill script removes it first and again once the processes are gone, so a
+  timeout, a cancel, an interrupt with `force` and a vanished runner (now also killed for cleanup) all remove it.
+  A stopped VM loses its tmpfs. A gateway restart while the job runs leaves it in place until the job ends, as
+  the job still needs it.
+- *Redaction:* the collected result and stream log, and the live stream, have every exact copy replaced with
+  `[credential redacted]` while the gateway holds the credential.
+**Consequences:** the credential is readable by every process of the agent user in that VM while the job runs
+(as intended), and an agent can leak it in a form redaction does not catch; LEL should mint it narrow and short.
+Output collected after a restart is not redacted. No registry schema change.
+**Tests:** a credential reaches its job only; nothing under the host's data, jobs or workspace directories, no
+note, reply or list holds it; output and the live stream are redacted; bad credentials are 400; a restart
+before the start fails the job instead of starting it bare; timeout, cancel and a vanished runner all run the
+kill that removes the file; the `ctr` start puts it on stdin, never in argv, never under the workspace root.
+Still to check live (with #1067): the file exists during the job and is gone after each kind of end.
+

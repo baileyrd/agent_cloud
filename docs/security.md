@@ -197,6 +197,24 @@ agent can fake its own job's result and exit code (it runs the job), never anoth
 `O_CREAT|O_EXCL` at the root of the bind mount, which follows no symlink, and output is read in the VM, as
 the agent user, by capped execs. Prompts are never in an argv; history records only job ids and states.
 
+**Job credentials (ADR-028):** a submit may carry `credential`, an opaque string (1-4096 bytes of printable
+ASCII), such as a short-lived token Let Em Loose mints for one claim. It is for the job's process only, so the VM
+holds no long-lived secret:
+- *Delivered* on the start exec's stdin (never an argv) into `/dev/shm/ac-job-<id>/credential` in the guest,
+  0600 in a 0700 directory, on the guest's tmpfs: never in the workspace, so never in a checkpoint, backup,
+  change note or host file. The job finds it at `$AC_JOB_CREDENTIAL_FILE`.
+- *Removed* by the runner as soon as `claude` exits (before the job reports its end), by the window's exit trap,
+  and by every kill (timeout, cancel, a vanished runner, a pause or destroy with `force`). A paused or destroyed
+  VM takes its tmpfs with it.
+- *Never kept* on the host: held in the gateway's memory from submit until the job ends, never written to the
+  registry, the job's host directory (only an empty `needs-credential` marker), history, audit lines or any reply
+  (REST or MCP). A queued job whose credential a gateway restart lost fails ("submit it again") instead of
+  starting without it.
+- *Redacted* from the collected result and stream log, and from the live stream, by exact match while the
+  gateway knows it. Limits: an agent can still leak it encoded (base64, split), and output collected after a
+  gateway restart is not redacted. Treat the credential as readable by the job, which is the point: mint it
+  short-lived and scoped to the one task.
+
 ## Known gaps
 
 - A container-in-VM boundary is only as strong as the hypervisor and guest kernel config.

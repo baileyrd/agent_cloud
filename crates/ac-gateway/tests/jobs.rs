@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use ac_ctr::{CtrConfig, CtrRuntime};
 use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
+use ac_domain::job::Credential;
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
@@ -45,6 +46,10 @@ fn agent(s: &str) -> AgentId {
 struct World {
     /// (job, prompt, timeout, flags) per start.
     starts: Vec<(String, Vec<u8>, u32, Vec<String>)>,
+    /// The credential each start was handed (job, secret).
+    credentials: Vec<(String, Option<String>)>,
+    /// What every `read` appends, as an agent echoing its credential would.
+    echo: String,
     /// What `status` reports per job; `Running` if absent.
     status: HashMap<String, Probe>,
     statuses: usize,
@@ -116,6 +121,7 @@ impl JobRunner for Fake {
         _: &AgentId,
         job: &JobId,
         prompt: &[u8],
+        credential: Option<&Credential>,
         timeout: u32,
         claude: &[String],
     ) -> Result<(), String> {
@@ -123,6 +129,8 @@ impl JobRunner for Fake {
         if w.start_fails {
             return Err("no VM".into());
         }
+        w.credentials
+            .push((job.to_string(), credential.map(|c| c.expose().to_owned())));
         w.starts
             .push((job.to_string(), prompt.to_vec(), timeout, claude.to_vec()));
         Ok(())
@@ -152,9 +160,10 @@ impl JobRunner for Fake {
         Ok(())
     }
     fn read(&self, _: &AgentId, job: &JobId, part: Part) -> Result<Vec<u8>, String> {
+        let echo = self.w().echo.clone();
         Ok(match part {
-            Part::Result => format!("result of {job} <script>").into_bytes(),
-            Part::Stream => b"{\"type\":\"result\"}\n".to_vec(),
+            Part::Result => format!("result of {job} <script>{echo}").into_bytes(),
+            Part::Stream => format!("{{\"type\":\"result\"}}\n{echo}").into_bytes(),
         })
     }
 }
@@ -1150,6 +1159,125 @@ fn stopped_agent_interrupts_running_and_cancels_queued() {
     );
 }
 
+const CRED: &str = "LEL-SECRET-token.42";
+
+#[test]
+fn a_credential_reaches_its_job_only_and_is_kept_nowhere() {
+    let r = rig();
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#);
+    let (status, reply) = r.submit("a1", &body);
+    assert_eq!(status, 202, "{reply}");
+    assert!(!reply.contains(CRED), "{reply}");
+    let id = field(&reply, "job_id");
+    let plain = r.ok("a2", "no secret");
+    r.fake.w().echo = format!(" leaked {CRED} twice {CRED}");
+    r.jobs.tick();
+    let handed = r.fake.w().credentials.clone();
+    assert!(
+        handed.contains(&(id.clone(), Some(CRED.to_owned()))),
+        "{handed:?}"
+    );
+    assert!(handed.contains(&(plain.clone(), None)), "{handed:?}");
+    // The live stream is redacted.
+    let live = r
+        .json(Route::Output(agent("a1"), job_id(&id)), "part=stream")
+        .1;
+    assert!(
+        !live.contains(CRED) && live.contains("[credential redacted]"),
+        "{live}"
+    );
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    assert_eq!(r.state("a1", &id), "succeeded");
+    // Nothing on the host holds it: registry, job copies, notes, replies.
+    for p in walk(&r.root) {
+        let b = std::fs::read(&p).unwrap_or_default();
+        assert!(
+            !b.windows(CRED.len()).any(|w| w == CRED.as_bytes()),
+            "{}",
+            p.display()
+        );
+    }
+    let result = r.json(Route::Output(agent("a1"), job_id(&id)), "").1;
+    assert!(
+        result.contains("leaked [credential redacted] twice [credential redacted]"),
+        "{result}"
+    );
+    let notes = r.notes.lock().map(|v| v.join("\n")).unwrap_or_default();
+    assert!(!notes.contains(CRED), "{notes}");
+    assert!(!r.json(Route::List(agent("a1")), "").1.contains(CRED));
+}
+
+#[test]
+fn bad_credentials_are_refused() {
+    let r = rig();
+    for body in [
+        r#"{"prompt":"go","credential":""}"#,
+        r#"{"prompt":"go","credential":"has space"}"#,
+        r#"{"prompt":"go","credential":42}"#,
+    ] {
+        let (status, reply) = r.submit("a1", body);
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+    let long = "x".repeat(4097);
+    assert_eq!(
+        r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{long}"}}"#))
+            .0,
+        400
+    );
+}
+
+#[test]
+fn a_restart_before_the_start_fails_the_job_instead_of_starting_it_bare() {
+    let r = rig();
+    let busy = r.ok("a1", "first");
+    let (_, reply) = r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#));
+    let queued = field(&reply, "job_id");
+    r.jobs.tick();
+    let mut r = r;
+    let root = std::mem::take(&mut r.root);
+    let fake = r.fake.clone();
+    drop(r);
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let r = with_store(store, fake, root);
+    r.fake.set(&busy, Probe::Exited(Some(0)));
+    r.tick();
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &queued), "failed");
+    assert!(r.get("a1", &queued).contains("credential was lost"));
+    assert!(!r.started().contains(&queued), "never started without it");
+}
+
+#[test]
+fn ending_a_job_any_way_removes_its_credential_file() {
+    // Timeout and cancel go through kill (which removes the file); a vanished runner too.
+    let r = rig();
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}","timeout_secs":10}}"#);
+    let timed = field(&r.submit("a1", &body).1, "job_id");
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#);
+    let cancelled = field(&r.submit("a2", &body).1, "job_id");
+    r.jobs.tick();
+    let _ = r.json(Route::Cancel(agent("a2"), job_id(&cancelled)), "");
+    r.advance(11_000);
+    r.jobs.tick();
+    let gone = field(
+        &r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#))
+            .1,
+        "job_id",
+    );
+    r.jobs.tick();
+    r.fake.set(&gone, Probe::Gone);
+    r.fake.w().status.insert(gone.clone(), Probe::Gone);
+    r.tick();
+    let kills = r.fake.w().kills.clone();
+    for job in [&timed, &cancelled, &gone] {
+        assert!(kills.contains(job), "{job} not cleaned: {kills:?}");
+    }
+    assert_eq!(r.state("a1", &timed), "timed_out");
+    assert_eq!(r.state("a2", &cancelled), "cancelled");
+    assert_eq!(r.state("a1", &gone), "failed");
+}
+
 #[test]
 fn restart_reattaches_without_starting_again() {
     let r = rig();
@@ -1807,7 +1935,7 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
     for (n, prompt) in hostile_prompts().iter().enumerate() {
         let job = JobId::from_random([n as u8, 1, 2, 3, 4, 5, 6, 7]);
-        let r = rt.start(&agent("a1"), &job, prompt.as_bytes(), 60, &flags);
+        let r = rt.start(&agent("a1"), &job, prompt.as_bytes(), None, 60, &flags);
         assert!(r.is_ok(), "{r:?}");
         let file = root.join(format!("workspaces/a1/.job-{job}.prompt"));
         assert_eq!(
@@ -1816,14 +1944,17 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
         );
         let argv = argvs(&log).pop().unwrap_or_default();
         // timeout -s TERM -k 3 30 ctr -n agents task exec --exec-id <x> a1 sh -c <START>
-        // ac-job-start <RUN> <job> <secs> <flags...>: constants, the job id and the operator's
-        // flags only.
+        // ac-job-start <RUN> <job> <0|1> <secs> <flags...>: constants, the job id, whether a
+        // credential follows on stdin, and the operator's flags only.
         assert_eq!(argv[..6], ["timeout", "-s", "TERM", "-k", "3", "30"]);
         assert_eq!(argv[6..11], ["ctr", "-n", "agents", "task", "exec"]);
         assert_eq!(argv[13..16], ["a1", "sh", "-c"]);
         assert_eq!(argv[17], "ac-job-start");
-        assert_eq!(argv[19..21], [job.to_string(), "360".to_owned()]);
-        assert_eq!(argv[21..], flags[..]);
+        assert_eq!(
+            argv[19..22],
+            [job.to_string(), "0".to_owned(), "360".to_owned()]
+        );
+        assert_eq!(argv[22..], flags[..]);
         let held = log.lock().map(|l| {
             l.iter()
                 .all(|r| matches!(r.stdin, platform_mock::process::StdioKind::Pipe))
@@ -1843,12 +1974,58 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let _ = std::fs::write(&victim, "keep");
     let link = root.join(format!("workspaces/a1/.job-{job}.prompt"));
     let _ = std::os::unix::fs::symlink(&victim, &link);
-    assert!(rt.start(&agent("a1"), &job, b"evil", 60, &flags).is_err());
+    assert!(rt
+        .start(&agent("a1"), &job, b"evil", None, 60, &flags)
+        .is_err());
     assert_eq!(
         std::fs::read_to_string(&victim).ok().as_deref(),
         Some("keep")
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn ctr_start_hands_a_credential_on_stdin_never_in_argv_or_the_workspace() {
+    let root = tmp();
+    let (rt, log) = ctr(&root, "");
+    let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
+    let job = JobId::from_random([7; 8]);
+    let cred = Credential::parse("LEL-SECRET-token.42").unwrap_or_else(|e| panic!("{e}"));
+    let r = rt.start(&agent("a1"), &job, b"go", Some(&cred), 60, &flags);
+    assert!(r.is_ok(), "{r:?}");
+    let argv = argvs(&log).pop().unwrap_or_default();
+    assert_eq!(
+        argv[19..22],
+        [job.to_string(), "1".to_owned(), "360".to_owned()]
+    );
+    assert!(
+        argv.iter().all(|a| !a.contains("LEL-SECRET")),
+        "credential in argv"
+    );
+    // The start script reads one line into the guest's tmpfs and the runner removes it.
+    assert!(argv[16].contains("IFS= read -r secret") && argv[16].contains("/dev/shm/ac-job-"));
+    assert!(argv[18].contains("rm -rf -- \"$c\""), "runner cleanup");
+    let leaked = walk(&root.join("workspaces"))
+        .into_iter()
+        .any(|p| std::fs::read(&p).is_ok_and(|b| b.windows(10).any(|w| w == b"LEL-SECRET")));
+    assert!(!leaked, "credential written under the workspace root");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Every file under `dir`.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        match p.is_dir() {
+            true => out.extend(walk(&p)),
+            false => out.push(p),
+        }
+    }
+    out
 }
 
 #[test]

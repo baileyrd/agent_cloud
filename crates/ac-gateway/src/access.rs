@@ -305,6 +305,12 @@ pub const ROUTES: &[Rule] = &[
                 false,
                 "A repeat with the same key returns the existing job.",
             ),
+            arg(
+                "credential",
+                Kind::Text,
+                false,
+                "An opaque short-lived secret for this job only, found in $AC_JOB_CREDENTIAL_FILE; never stored or shown.",
+            ),
         ],
     }),
     offer(rule("GET", "/api/v1/agents/{id}/jobs/{job}", S(JobsRead), None), Tool {

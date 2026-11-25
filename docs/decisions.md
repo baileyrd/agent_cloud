@@ -283,8 +283,10 @@ CopilotKit or any AG-UI client renders the run live. It is not evidence: the wit
 - *Resuming:* each line's events carry the line number as their SSE `id`, on the last of them. A client
   that reconnects passes the last id it saw as `?after=N` and gets `RUN_STARTED`, the state, then the
   lines after N. Browsers cannot set `Authorization` on an `EventSource`, so clients use `fetch` and
-  resume explicitly. `Last-Event-ID` is not read. After a long log (over 1 MiB) has ended, line numbers
-  count from the start of the host's copy.
+  resume explicitly. `Last-Event-ID` is not read. Ids always count from the log's start. When the job ended
+  the gateway marks a host copy that holds the whole log (`stream.whole`). A copy without the mark may
+  be only the log's last 1 MiB: it is replayed without ids, and `?after=N` against it ends at once with
+  `RUN_ERROR` code `replay_unavailable`, rather than resuming from the wrong line.
 - *Not done:* partial messages (`--include-partial-messages`) and reasoning events. The log has whole
   messages only, so text arrives one message at a time.
 

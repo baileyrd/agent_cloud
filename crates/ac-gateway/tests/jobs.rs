@@ -169,8 +169,9 @@ impl JobRunner for Fake {
         Ok(())
     }
     fn read(&self, _: &AgentId, job: &JobId, part: Part) -> Result<Vec<u8>, String> {
+        // Like the real `tail -c STREAM_CAP`: a long log's host copy is its end.
         if let (Part::Stream, Some(log)) = (part, self.w().logs.get(job.as_str())) {
-            return Ok(log.clone());
+            return Ok(log[log.len().saturating_sub(jobs::STREAM_CAP)..].to_vec());
         }
         let echo = self.w().echo.clone();
         Ok(match part {
@@ -2984,6 +2985,64 @@ fn a_running_job_streams_live_and_ends_when_it_does() {
         "{body}"
     );
     assert!(body.contains(": keep-alive"), "{body}");
+}
+
+/// A log of `n` numbered assistant lines, each about 1 KiB.
+fn long_log(n: usize) -> String {
+    let pad = "x".repeat(1000);
+    (1..=n)
+        .map(|i| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{i}","content":[{{"type":"text","text":"line {i} {pad}"}}]}}}}"#
+            ) + "\n"
+        })
+        .collect()
+}
+
+#[test]
+fn a_cursor_from_the_live_stream_is_not_replayed_against_a_capped_log() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "long");
+    r.jobs.tick();
+    let log = long_log(1200);
+    assert!(log.len() > jobs::STREAM_CAP);
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let live = path.clone();
+    let reader = std::thread::spawn(move || request(addr, "GET", &live, ""));
+    r.fake.w().logs.insert(id.clone(), log.into_bytes());
+    std::thread::sleep(Duration::from_millis(200));
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (_, _, body) = reader.join().unwrap_or_else(|_| panic!("reader panicked"));
+    let ids: Vec<u64> = events_of(&body).iter().filter_map(|e| e.1).collect();
+    assert_eq!(
+        ids.last(),
+        Some(&1200),
+        "live ids count from the log's start"
+    );
+    // The VM is gone; only the host's capped copy (its last 1 MiB) is left.
+    r.fake.w().logs.remove(&id);
+
+    // A cursor issued while running is refused, not applied to the copy's own line numbers.
+    let (status, _, again) = request(addr, "GET", &format!("{path}?after=1100"), "");
+    assert_eq!(status, 200);
+    assert_eq!(
+        types(&events_of(&again)),
+        ["RUN_STARTED", "STATE_SNAPSHOT", "RUN_ERROR"],
+        "{again}"
+    );
+    assert!(again.contains(r#""code":"replay_unavailable""#), "{again}");
+
+    // A replay from the start sends the copy without ids, so it hands out no wrong cursor.
+    let (_, _, all) = request(addr, "GET", &path, "");
+    let events = events_of(&all);
+    assert_eq!(types(&events).last(), Some(&"RUN_FINISHED"), "{all}");
+    assert!(events.iter().all(|e| e.1.is_none()), "{all}");
+    assert!(
+        all.contains("line 1200 ") && !all.contains("line 1 x"),
+        "capped"
+    );
 }
 
 #[test]

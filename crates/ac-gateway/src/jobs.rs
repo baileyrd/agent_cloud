@@ -89,6 +89,9 @@ const STATUS_LIMIT: Duration = Duration::from_secs(10);
 const BACKSTOP_SECS: u32 = 300;
 /// In a job's host directory: the job was submitted with a credential (empty; never the secret).
 const NEEDS_CREDENTIAL: &str = "needs-credential";
+/// Empty marker: the host's copy of the log is all of it, not its last [`STREAM_CAP`], so its line
+/// numbers match the live stream's (#471). Without it a copy may be capped.
+const STREAM_WHOLE: &str = "stream.whole";
 /// What stands in for a credential in collected output.
 pub const REDACTED: &[u8] = b"[credential redacted]";
 
@@ -864,7 +867,9 @@ impl Jobs {
 
     /// `GET .../jobs/{job}/events[?after=N]`: the job as an AG-UI run (#471), live while it runs.
     /// `after` skips the log's first N lines: each event from the log carries its line number as
-    /// its SSE id, so a client that reconnects passes the last id it saw. 429 past [`MAX_STREAMS`].
+    /// its SSE id, so a client that reconnects passes the last id it saw. An ended job whose host
+    /// copy was capped has no such numbering: its replay carries no ids, and with `after` it ends at
+    /// once with `RUN_ERROR` code `replay_unavailable`. 429 past [`MAX_STREAMS`].
     pub fn events(
         jobs: &Arc<Self>,
         agent: &AgentId,
@@ -893,6 +898,7 @@ impl Jobs {
             overlong: false,
             lines: 0,
             skip,
+            ids: true,
             last: None,
             live: false,
             done: false,
@@ -1406,7 +1412,12 @@ impl Jobs {
     fn collect(&self, j: &Job) {
         for part in [Part::Result, Part::Stream] {
             let copied = self.runner.read(&j.agent, &j.id, part).and_then(|bytes| {
-                write_private(&self.job_dir(j).join(part.file()), &self.redact(j, bytes))
+                let whole = part == Part::Stream && bytes.len() < STREAM_CAP;
+                write_private(&self.job_dir(j).join(part.file()), &self.redact(j, bytes))?;
+                match whole {
+                    true => write_private(&self.job_dir(j).join(STREAM_WHOLE), b""),
+                    false => Ok(()),
+                }
             });
             if let Err(e) = copied {
                 eprintln!(
@@ -1712,7 +1723,8 @@ impl Jobs {
 /// registry says the job ended. While the job runs the log is read from the VM from where the last
 /// read stopped, redacted with the job's credential (captured at open: the registry drops it when
 /// the job ends, before the last read). A job that had already ended is replayed from the host's
-/// copy (its last [`STREAM_CAP`], so line numbers count from there when the log was longer).
+/// copy, which is redacted; line numbers stay those of the live stream only when the copy is the
+/// whole log ([`STREAM_WHOLE`]).
 pub struct EventStream {
     jobs: Arc<Jobs>,
     agent: AgentId,
@@ -1730,6 +1742,8 @@ pub struct EventStream {
     lines: u64,
     /// Lines the client already has (`after`).
     skip: u64,
+    /// Events carry their line number as SSE id: false when replaying a capped copy.
+    ids: bool,
     /// The job as last sent.
     last: Option<String>,
     /// The log was read from the VM (the job ran while streamed).
@@ -1791,9 +1805,8 @@ impl EventStream {
                 if self.live {
                     // The whole rest of the log; it no longer grows.
                     self.read_live(STREAM_CAP.div_ceil(EVENTS_CHUNK) * 16);
-                } else {
-                    let copy = self.jobs.job_dir(&j).join(Part::Stream.file());
-                    self.feed(&std::fs::read(copy).unwrap_or_default());
+                } else if !self.replay_copy(&j) {
+                    return;
                 }
                 self.feed(b"\n");
                 if let Some(end) = agui::ended(&j, &rendered) {
@@ -1802,6 +1815,25 @@ impl EventStream {
                 self.done = true;
             }
         }
+    }
+
+    /// Feed the host's copy of an ended job's log. A capped copy starts mid-log, so its line
+    /// numbers are not the live stream's: it is sent without ids, and a cursor into it is refused.
+    fn replay_copy(&mut self, j: &Job) -> bool {
+        let dir = self.jobs.job_dir(j);
+        let copy = std::fs::read(dir.join(Part::Stream.file())).unwrap_or_default();
+        if !dir.join(STREAM_WHOLE).exists() {
+            if self.skip > 0 {
+                self.fail(
+                    "the job's log was capped when it ended; replay from this cursor is unavailable",
+                    "replay_unavailable",
+                );
+                return false;
+            }
+            self.ids = false;
+        }
+        self.feed(&copy);
+        true
     }
 
     /// Read up to `reads` chunks of the log from the VM; stop at its end or on an error (no log
@@ -1850,7 +1882,7 @@ impl EventStream {
             let events = agui::line(String::from_utf8_lossy(&line).trim_end());
             let last = events.len().saturating_sub(1);
             for (i, kind) in events.into_iter().enumerate() {
-                self.send(kind, (i == last).then_some(self.lines));
+                self.send(kind, (self.ids && i == last).then_some(self.lines));
             }
         }
     }

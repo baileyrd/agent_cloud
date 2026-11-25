@@ -1,0 +1,44 @@
+#!/bin/sh
+# The desktop agent's main process (under tini): keeps display :0 (Xorg, dummy driver) and an Xfce
+# session running as the agent user. Either one is restarted if it exits; the container lives on.
+set -u
+: "${DISPLAY:=:0}" "${XDG_RUNTIME_DIR:=/tmp/runtime-agent}"
+export DISPLAY XDG_RUNTIME_DIR
+logs=$HOME/.local/share/xorg
+mkdir -p "$logs" "$XDG_RUNTIME_DIR" /workspace/Downloads
+chmod 0700 "$XDG_RUNTIME_DIR"
+
+xorg() {
+    while :; do
+        Xorg "$DISPLAY" -noreset -novtswitch -nolisten tcp -config /etc/agent-desktop/xorg.conf \
+            -logfile "$logs/Xorg.log"
+        echo "desktop-session: Xorg exited ($?); restarting in 2 s" >&2
+        sleep 2
+    done
+}
+
+# Wait up to 20 s for the X socket; 0 when it is there.
+wait_x() {
+    n=0
+    while [ ! -S "/tmp/.X11-unix/X${DISPLAY#:}" ]; do
+        n=$((n + 1))
+        [ "$n" -gt 40 ] && return 1
+        sleep 0.5
+    done
+}
+
+session() {
+    while :; do
+        if wait_x; then
+            dbus-launch --exit-with-session xfce4-session
+            echo "desktop-session: Xfce exited ($?); restarting in 2 s" >&2
+        else
+            echo "desktop-session: no X socket after 20 s; see $logs/Xorg.log" >&2
+        fi
+        sleep 2
+    done
+}
+
+xorg &
+session &
+wait

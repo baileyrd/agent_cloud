@@ -1,0 +1,21 @@
+{
+  "ExtensionInstallBlocklist": ["*"],
+  "DeveloperToolsAvailability": 2,
+  "RemoteDebuggingAllowed": false,
+  "DownloadDirectory": "/workspace/Downloads",
+  "PromptForDownloadLocation": false,
+  "DownloadRestrictions": 1,
+  "BrowserSignin": 0,
+  "SyncDisabled": true,
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "BrowserGuestModeEnabled": false,
+  "BrowserAddPersonEnabled": false,
+  "AudioCaptureAllowed": false,
+  "VideoCaptureAllowed": false,
+  "MetricsReportingEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "BackgroundModeEnabled": false,
+  "BookmarkBarEnabled": false
+}

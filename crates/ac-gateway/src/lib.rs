@@ -459,7 +459,11 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
                 let items: Vec<String> = all
                     .iter()
                     .map(|(name, hosts)| match hosts {
-                        Ok(n) => format!(r#"{{"name":"{name}","hosts":{n}}}"#),
+                        Ok(l) if l.exclusive() => format!(
+                            r#"{{"name":"{name}","hosts":{},"exclusive":true}}"#,
+                            l.len()
+                        ),
+                        Ok(l) => format!(r#"{{"name":"{name}","hosts":{}}}"#, l.len()),
                         Err(e) => format!(r#"{{"name":"{name}","error":"{}"}}"#, escape(e)),
                     })
                     .collect();
@@ -473,7 +477,8 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
     }
 
     /// `{"id","profiles","effective_hosts"}`, plus `"missing"` for attached profiles with no
-    /// file (they add nothing).
+    /// usable file. An exclusive or missing profile leaves the base list out of the count, as the
+    /// proxy leaves it out of the agent's list.
     fn egress(&self, id: &AgentId) -> Reply {
         let Some(egress) = &self.egress else {
             return no_egress();
@@ -485,13 +490,20 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         }
         let figures = egress.attached(id).and_then(|attached| {
             let listed = egress.list()?;
-            let mut hosts = egress.base_hosts()?;
-            let mut missing = Vec::new();
+            let mut hosts = 0;
+            let (mut missing, mut exclusive) = (Vec::new(), false);
             for p in &attached {
                 match listed.iter().find(|(n, _)| n == p) {
-                    Some((_, Ok(n))) => hosts += n,
+                    Some((_, Ok(l))) => {
+                        hosts += l.len();
+                        exclusive |= l.exclusive();
+                    }
                     _ => missing.push(format!(r#""{p}""#)),
                 }
+            }
+            // As the proxy does: an exclusive or missing profile drops the base list.
+            if !exclusive && missing.is_empty() {
+                hosts += egress.base_hosts()?;
             }
             Ok((attached, hosts, missing))
         });
@@ -1148,7 +1160,15 @@ mod tests {
             let p = |s| ProfileName::parse(s).map_err(|e| e.to_string());
             Ok(vec![
                 (p("node")?, Err("mode 644".into())),
-                (p("rust")?, Ok(2)),
+                (
+                    p("rust")?,
+                    ac_domain::Allowlist::new(["a.test", "b.test"]).map_err(|e| e.to_string()),
+                ),
+                (
+                    p("wall")?,
+                    ac_domain::Allowlist::parse_file("!exclusive\nendpoint mcp.test:8443\n")
+                        .map_err(|e| e.to_string()),
+                ),
             ])
         }
         fn base_hosts(&self) -> Result<usize, String> {
@@ -1183,7 +1203,7 @@ mod tests {
             call(&a, "GET", PROFILES),
             (
                 200,
-                r#"{"profiles":[{"name":"node","error":"mode 644"},{"name":"rust","hosts":2}]}"#
+                r#"{"profiles":[{"name":"node","error":"mode 644"},{"name":"rust","hosts":2},{"name":"wall","hosts":1,"exclusive":true}]}"#
                     .into()
             )
         );
@@ -1220,6 +1240,11 @@ mod tests {
             )
         );
         assert_eq!(e.of("a1"), ["rust"]);
+        // An exclusive profile drops the base list from the count.
+        assert_eq!(
+            send(&a, "PUT", path, r#"{"profiles":["wall","rust"]}"#, true).1,
+            r#"{"id":"a1","profiles":["wall","rust"],"effective_hosts":3}"#
+        );
         assert_eq!(
             send(&a, "PUT", path, r#"{"profiles":[]}"#, true).1,
             r#"{"id":"a1","profiles":[],"effective_hosts":3}"#
@@ -1233,7 +1258,7 @@ mod tests {
         );
         assert_eq!(
             call(&a, "GET", path).1,
-            r#"{"id":"a1","profiles":["gone"],"effective_hosts":3,"missing":["gone"]}"#
+            r#"{"id":"a1","profiles":["gone"],"effective_hosts":0,"missing":["gone"]}"#
         );
         let _ = call(&a, "DELETE", "/api/v1/agents/a1");
         assert_eq!(send(&a, "PUT", path, r#"{"profiles":[]}"#, true).0, 409);

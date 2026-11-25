@@ -708,6 +708,36 @@ not reach. Adding it to the base list would open a code-delivery channel to ever
 **Not now:** per-profile ports (443 and 80 as the base list); per-agent base lists; binding a credential to a VM's
 MAC or IP; profiles editable through the API.
 
+**Addendum (2026-11-25, proposed; Mill Board card #1063): gateway-only agents.** LEL D101 jails an untrusted
+agent deny-by-default except its MCP gateway, and ADR-025 makes agent_cloud that wall. Profiles only ever *added*
+hosts to the base list, on ports 443 and 80, to public addresses; LEL's gateway is on the tailnet on its own port.
+- *Two directives in a profile file:* `endpoint <host>:<port>` allows exactly that host on exactly that port; the
+  host is a name (no IP literal), from the operator's file, never hardcoded or set through the API. `!exclusive`
+  means an agent with this profile attached loses the base list: it reaches only what its profiles allow. Other
+  attached profiles still add their hosts, so package mirrors compose (`["gateway","rust"]`).
+- *Shipped as config, not code:* `/etc/agent-cloud/egress/profiles/gateway.txt` is two lines the operator writes
+  (docs/install.md); nothing in this repo names the gateway. The name `gateway` is a convention, not reserved.
+- *No generic CONNECT target:* an endpoint matches host and port together. The same host on any other port goes
+  through the ordinary rules (and is refused unless some list has it on 443/80).
+- *Private addresses:* an endpoint's addresses are vetted by `vet_endpoint`, which accepts private ranges (the
+  tailnet's 100.64.0.0/10, RFC 1918, ULA) but refuses loopback, unspecified, link-local, multicast, broadcast and
+  IPv4-mapped forms. Every other host keeps `vet`, which refuses all non-public addresses. An endpoint pointed at
+  this host's own LAN or tailnet address would reach its services: name another machine.
+- *Nothing else leaks:* `agentfw.nft` already rejects every packet from `acbr0` but TCP to the proxy port, so an
+  agent has no DNS and no direct IP egress; names are resolved by the proxy only. Anonymous callers and other
+  agents never get another agent's endpoint.
+- *API:* unchanged. `GET /api/v1/egress/profiles` adds `"exclusive":true`; `effective_hosts` leaves the base list
+  out for an agent with an exclusive profile, and counts an endpoint as one entry.
+- *Tests:* policy unit tests (only the endpoint answers; other ports, the base list and other agents refused; a
+  mirror composes; `vet_endpoint` ranges) and a loopback proxy test with a tailnet-addressed fake upstream. The live
+  check is part of #1067.
+- *Fails closed:* an attached profile with no usable version (deleted, or never parsed since the proxy started)
+  now also drops the base list, since it may have been the exclusive one; before, it only added nothing. The proxy
+  warns about it, and `effective_hosts` shows the smaller count. A profile that turns bad keeps its last good
+  version, as before.
+- *Rollback:* an older proxy or gateway refuses a profile with these directives as malformed (the proxy keeps that
+  profile's last good version, so the agent gets base list + nothing); remove `gateway.txt` before downgrading.
+
 ## ADR-017: An MCP interface on the gateway, split by token scope
 **Status:** accepted (2026-10-28; verified on BaileyServ the same day with Claude Code 2.1.312 added by
 `claude mcp add`: 21 of 22 tools listed for a token without `egress:write`, checkpoint tools and a 409 passed through).

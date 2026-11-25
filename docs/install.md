@@ -287,6 +287,20 @@ The log's `agent=` field is the agent the credential named. It is `-` without a 
 and gets the base list: pause and resume it through the gateway. `ac-ctl doctor` checks the agents file's mode
 and that every attached profile is installed.
 
+*Gateway-only agents* (ADR-016 addendum, for untrusted Let Em Loose agents): a profile can name one MCP gateway
+and drop the base list. Write it with your gateway's own name and port (another machine, not this host):
+
+```bash
+printf '!exclusive\nendpoint <gateway-host>:<port>\n' | sudo tee /etc/agent-cloud/egress/profiles/gateway.txt >/dev/null
+sudo chmod 0600 /etc/agent-cloud/egress/profiles/gateway.txt
+curl -sS -H "Authorization: Bearer $TOKEN" -X PUT --data-binary '{"profiles":["gateway"]}' \
+    http://127.0.0.1:8780/api/v1/agents/a1/egress
+# {"id":"a1","profiles":["gateway"],"effective_hosts":1}   add "rust" etc. for package mirrors
+```
+
+The agent then reaches that host on that port only (also on the tailnet or LAN), and nothing else: not the model
+API, not GitHub, not the gateway host on any other port.
+
 *Upgrading (install order):* install the proxy first, then the profiles, then the gateway. Either order is safe.
 A new proxy with an old gateway finds no agents file and gives everyone the base list. A new gateway with an old
 proxy hands out credentials the old proxy ignores, so attachments do nothing until the proxy is upgraded.

@@ -15,7 +15,7 @@ use ac_domain::Allowlist;
 use crate::auth;
 use crate::egressfile::EgressFiles;
 use crate::head::{read_head, Head, HeadLimits};
-use crate::policy::{judge, vet, would_allow, Decision, Policy, Reason, Verdict};
+use crate::policy::{judge, vet, vet_endpoint, would_allow, Decision, Policy, Reason, Verdict};
 
 /// Name resolution and connecting, injectable so tests can point names anywhere.
 pub trait Upstream: Send + Sync + 'static {
@@ -264,7 +264,7 @@ impl<U: Upstream> Proxy<U> {
     fn admit(&self, head: &Head) -> (String, Result<Vec<SocketAddr>, Denied>) {
         let presented = auth::parse(&head.proxy_authorization);
         let policy = self.policy.read().unwrap_or_else(|e| e.into_inner());
-        let caller = match judge(&policy, &presented, &head.host, head.port) {
+        let (caller, endpoint) = match judge(&policy, &presented, &head.host, head.port) {
             Verdict::Refused(refused) => {
                 let denied = Denied {
                     status: 407,
@@ -284,14 +284,19 @@ impl<U: Upstream> Proxy<U> {
                 }
                 return (caller.label(), Err(denied));
             }
-            Verdict::Decided(caller, Decision::Allow) => caller,
+            Verdict::Decided(caller, Decision::Allow) => (caller, false),
+            Verdict::Decided(caller, Decision::Endpoint) => (caller, true),
         };
         drop(policy);
+        let check = match endpoint {
+            true => vet_endpoint,
+            false => vet,
+        };
         let addrs = self
             .upstream
             .resolve(&head.host, head.port)
             .map_err(|_| Reason::Lookup)
-            .and_then(vet);
+            .and_then(check);
         (caller.label(), addrs.map_err(|r| Denied::policy(&r)))
     }
 

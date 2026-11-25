@@ -71,6 +71,7 @@ dependencies = [
  "platform",
  "platform-linux",
  "platform-mock",
+ "rusty_agui",
  "rusty_atomic_file",
  "rusty_crypto_key",
  "rusty_http",
@@ -245,6 +246,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusty_agui"
+version = "0.1.0"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+dependencies = [
+ "rusty_json",
+ "rusty_json_patch",
+]
+
+[[package]]
 name = "rusty_atomic_file"
 version = "0.1.0"
 source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
@@ -280,6 +290,14 @@ dependencies = [
 name = "rusty_json"
 version = "0.1.0"
 source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+
+[[package]]
+name = "rusty_json_patch"
+version = "0.1.0"
+source = "git+https://github.com/Rusty-Mill/rusty_mill?rev=84eeeb42faa1f41d4d7ae39ca7de47197f049555#84eeeb42faa1f41d4d7ae39ca7de47197f049555"
+dependencies = [
+ "rusty_json",
+]
 
 [[package]]
 name = "rusty_libc"

@@ -239,7 +239,7 @@ impl fmt::Display for JobInputError {
             ),
             Self::Credential => write!(
                 f,
-                "credential must be 1 to {MAX_CREDENTIAL} bytes of printable ASCII without spaces"
+                "credential must be 1 to {MAX_CREDENTIAL} bytes of A-Z, a-z, 0-9 and -._~+/="
             ),
         }
     }
@@ -285,9 +285,12 @@ pub const MAX_CREDENTIAL: usize = 4096;
 pub struct Credential(String);
 
 impl Credential {
-    /// 1 to [`MAX_CREDENTIAL`] bytes of `!`..=`~`: one line, safe to pass on a pipe.
+    /// 1 to [`MAX_CREDENTIAL`] bytes of `A-Za-z0-9` and `-._~+/=` (base64, base64url and JWT
+    /// tokens): one line, never escaped in JSON, so redaction finds it as written.
     pub fn parse(s: &str) -> Result<Self, JobInputError> {
-        let ok = s.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        let ok = s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b));
         match !s.is_empty() && s.len() <= MAX_CREDENTIAL && ok {
             true => Ok(Self(s.to_owned())),
             false => Err(JobInputError::Credential),
@@ -316,7 +319,17 @@ mod tests {
         assert_eq!(c.expose(), "lel.tok_ABC-123/=");
         assert_eq!(format!("{c:?}"), "Credential(..)");
         let long = "x".repeat(MAX_CREDENTIAL + 1);
-        for bad in ["", "a b", "a\nb", "tab\t", "é", long.as_str()] {
+        for bad in [
+            "",
+            "a b",
+            "a\nb",
+            "tab\t",
+            "é",
+            "quote\"",
+            "back\\slash",
+            "a<b",
+            long.as_str(),
+        ] {
             assert_eq!(
                 Credential::parse(bad),
                 Err(JobInputError::Credential),

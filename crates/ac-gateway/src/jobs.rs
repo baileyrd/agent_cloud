@@ -113,19 +113,18 @@ const MODES: [&str; 5] = ["acceptEdits", "auto", "dontAsk", "manual", "plan"];
 /// Start a job, as the agent user (argv: this, the runner script, the job id, `1` if a credential
 /// follows on stdin else `0`, the backstop timeout, then `claude`'s permission flags). Refuses a
 /// job whose directory exists, so a job never starts twice. Keeps the newest 5 job directories.
-/// A credential is read as one line from stdin (which never reaches EOF, see `exec_once`) into
-/// `/dev/shm/ac-job-<id>/credential`, 0600 in a 0700 directory, on the guest's tmpfs: never in the
-/// workspace, so never in a snapshot, backup or change note.
+/// A credential is read as one line from stdin (which never reaches EOF, see `exec_once`) and
+/// written, last before the window opens, to `/dev/shm/ac-job-<id>/credential`, 0600 in a 0700
+/// directory, on the guest's tmpfs: never in the workspace, so never in a snapshot, backup or
+/// change note. A start that fails after that removes it again (and the gateway's kill does too,
+/// for a start the exec timeout cut short).
 const START: &str = r#"set -eu
 run=$1 id=$2 cred=$3
 shift 3
 c=/dev/shm/ac-job-$id
-if [ "$cred" = 1 ]; then
-    IFS= read -r secret
-    rm -rf -- "$c"
-    (umask 077 && mkdir "$c" && printf '%s' "$secret" > "$c/credential")
-    unset secret
-fi
+secret=
+if [ "$cred" = 1 ]; then IFS= read -r secret; fi
+trap 'rc=$?; [ "$rc" = 0 ] || rm -rf -- "$c"' EXIT
 cd /workspace
 mkdir -p -m 700 .jobs
 mkdir -m 700 ".jobs/$id"
@@ -133,10 +132,18 @@ mv ".job-$id.prompt" ".jobs/$id/prompt.txt"
 ls -1t .jobs | grep -E '^[a-z0-9-]+$' | tail -n +6 | while read -r old; do rm -rf -- ".jobs/$old"; done
 rm -f -- .job-*.done
 tmux has-session -t main 2>/dev/null || tmux new-session -d -s main -c /workspace
+if [ "$cred" = 1 ]; then
+    rm -rf -- "$c"
+    (umask 077 && mkdir "$c" && printf '%s' "$secret" > "$c/credential")
+fi
+unset secret
 tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$cred" "$@""#;
 
 /// The job's window (bash): `claude` reads the prompt on stdin; its log is capped at 16 MiB (a
-/// job that passes it is stopped); the terminal shows a digest. The job's credential file goes as
+/// job that passes it is stopped); the terminal shows a digest. With a credential, its log is
+/// redacted line by line before it is stored or shown, so the raw secret never reaches the
+/// workspace's `stream.jsonl` or `result.txt` (whole stream-json lines, so no split matches; its
+/// characters need no JSON escaping and only `.` and `/` need escaping for `sed`). The job's credential file goes as
 /// soon as `claude` exits, before the job reports that it ended (and on any exit of the window). `exit_code` is written last, then
 /// the marker `.job-<id>.done` in the workspace root, which the gateway sees without an exec.
 const RUN: &str = r#"id=$1 cred=$2 secs=$3
@@ -144,11 +151,16 @@ shift 3
 d=/workspace/.jobs/$id
 c=/dev/shm/ac-job-$id
 trap 'rm -rf -- "$c"' EXIT
-if [ "$cred" = 1 ]; then export AC_JOB_CREDENTIAL_FILE=$c/credential; fi
+redact() { cat; }
+if [ "$cred" = 1 ]; then
+    export AC_JOB_CREDENTIAL_FILE=$c/credential
+    pat=$(sed 's/[./]/\\&/g' "$c/credential")
+    redact() { sed -u "s/$pat/[credential redacted]/g"; }
+fi
 show='fromjson? | if .type == "assistant" then (.message.content[]? | if .type == "text" then .text + "\n" elif .type == "tool_use" then "> " + .name + " " + (.input | tostring | .[0:160]) + "\n" else empty end) elif .type == "result" then "--- " + (.subtype // "result") + "\n" else empty end'
 printf 'job %s started %s\n' "$id" "$(date -u +%FT%TZ)"
 timeout -k 10 "$secs" claude -p --output-format stream-json --verbose "$@" < "$d/prompt.txt" \
-    | head -c 16777216 | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
+    | redact | head -c 16777216 | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
 rc=${PIPESTATUS[0]}
 rm -rf -- "$c"
 jq -Rrj 'fromjson? | select(.type == "result") | .result // empty' "$d/stream.jsonl" \
@@ -1243,19 +1255,37 @@ impl Jobs {
             }
             return;
         }
-        let started = self.credential(j).and_then(|credential| {
-            let prompt = std::fs::read(self.job_dir(j).join("prompt.txt"))
-                .map_err(|e| format!("prompt: {e}"))?;
-            self.runner.start(
-                &j.agent,
-                &j.id,
-                &prompt,
-                credential.as_ref(),
-                j.timeout_secs,
-                &self.claude,
-            )
-        });
+        let credential = match self.credential(j) {
+            Ok(credential) => credential,
+            Err(e) => {
+                let why = format!("start failed: {e}");
+                let _ = self.transition(&j.agent, &j.id, JobEvent::Fail, Some(&why));
+                return;
+            }
+        };
+        let started = std::fs::read(self.job_dir(j).join("prompt.txt"))
+            .map_err(|e| format!("prompt: {e}"))
+            .and_then(|prompt| {
+                self.runner.start(
+                    &j.agent,
+                    &j.id,
+                    &prompt,
+                    credential.as_ref(),
+                    j.timeout_secs,
+                    &self.claude,
+                )
+            });
         if let Err(e) = started {
+            // A start cut short (a failed step, the exec timeout) may have left the credential
+            // file in the guest's tmpfs with no window whose exit would remove it.
+            if credential.is_some() {
+                if let Err(k) = self.runner.kill(&j.agent, &j.id) {
+                    eprintln!(
+                        "ac-gateway: jobs: {}/{}: cleanup after a failed start: {k}",
+                        j.agent, j.id
+                    );
+                }
+            }
             let why = format!("start failed: {e}");
             let _ = self.transition(&j.agent, &j.id, JobEvent::Fail, Some(&why));
         }

@@ -1431,6 +1431,26 @@ fn ending_a_job_any_way_removes_its_credential_file() {
     assert_eq!(r.state("a1", &gone), "failed");
 }
 
+/// Review of PR #41: a start that fails (a step under `set -e`, or the exec timeout) may leave the
+/// credential file in the guest with no window to remove it, so the gateway runs the kill.
+#[test]
+fn a_failed_start_with_a_credential_runs_the_kill_that_removes_it() {
+    let r = rig();
+    r.fake.w().start_fails = true;
+    let plain = r.ok("a1", "plain");
+    r.jobs.tick();
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#);
+    let secret = field(&r.submit("a2", &body).1, "job_id");
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &plain), "failed");
+    assert_eq!(r.state("a2", &secret), "failed");
+    assert_eq!(
+        r.fake.w().kills,
+        [secret],
+        "only the job that had a credential"
+    );
+}
+
 #[test]
 fn restart_reattaches_without_starting_again() {
     let r = rig();

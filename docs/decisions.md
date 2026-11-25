@@ -1291,8 +1291,9 @@ it until then.
 its lens and claim, minted by LEL. agent_cloud must pass it through without storing, logging or showing it, and
 remove it when the job ends, however it ends.
 **Decision.**
-- *API:* `POST /api/v1/agents/{id}/jobs` (and MCP `submit_job`) accepts `credential`: 1 to 4096 bytes of `!`..`~`
-  (one line, safe on a pipe). agent_cloud does not read it and sets no TTL of its own: its life is the job's
+- *API:* `POST /api/v1/agents/{id}/jobs` (and MCP `submit_job`) accepts `credential`: 1 to 4096 bytes of
+  `A-Za-z0-9-._~+/=` (base64, base64url and JWT tokens). Those characters are never escaped in JSON, so the
+  stream-json log holds the secret exactly as written, and only `.` and `/` need escaping for `sed`. agent_cloud does not read it and sets no TTL of its own: its life is the job's
   (bounded by `timeout_secs`); LEL mints it with its own expiry.
 - *In the gateway:* an in-memory map from job id to credential, from submit until the job's terminal transition.
   The job's host directory gets an empty `needs-credential` marker. At start, a job with the marker but no
@@ -1300,18 +1301,26 @@ remove it when the job ends, however it ends.
   submit it again". `Credential`'s `Debug` prints `Credential(..)`.
 - *Into the VM:* the start exec gets a `1` flag in its argv and the credential as one line on stdin (stdin never
   reaches EOF, ADR-006, so the script reads a line, not to the end). The script writes it to
-  `/dev/shm/ac-job-<id>/credential` (umask 077) on the guest's tmpfs; the runner exports
+  `/dev/shm/ac-job-<id>/credential` (umask 077) on the guest's tmpfs as its last step before opening the
+  window, and removes it if the start fails after that; a start that fails in the gateway (an error or the exec
+  timeout) is followed by the kill script, which removes it too; the runner exports
   `AC_JOB_CREDENTIAL_FILE`. `CtrRuntime::exec_once_with_input` writes the line; it is never traced.
 - *Removal:* the runner removes the directory once `claude` exits, before writing `exit_code` and the done
   marker, and in an `EXIT` trap; the kill script removes it first and again once the processes are gone, so a
   timeout, a cancel, an interrupt with `force` and a vanished runner (now also killed for cleanup) all remove it.
   A stopped VM loses its tmpfs. A gateway restart while the job runs leaves it in place until the job ends, as
   the job still needs it.
-- *Redaction:* the collected result and stream log, and the live stream, have every exact copy replaced with
-  `[credential redacted]` while the gateway holds the credential.
+- *Redaction:* in the guest, the runner passes `claude`'s stream-json through `sed` before it is capped,
+  stored in `.jobs/<id>/stream.jsonl` or shown as the window's digest, so the workspace's log and result never
+  hold the raw secret. Each line is a whole JSON object, so no match is split. The gateway also redacts the
+  collected result and stream log, and the live stream, while it holds the credential.
+- *Idempotency:* a repeat with the same key returns the existing job and ignores the repeat's credential; after
+  a job failed with "credential lost", submit with a new key.
 **Consequences:** the credential is readable by every process of the agent user in that VM while the job runs
-(as intended), and an agent can leak it in a form redaction does not catch; LEL should mint it narrow and short.
-Output collected after a restart is not redacted. No registry schema change.
+(as intended), and an agent can leak it in a form redaction does not catch (encoded, split across tool calls, or cut by a
+tool's own truncation so only part of it shows); LEL should mint it narrow and short. The tmux scrollback a
+viewer can see shows only the redacted digest, but anything the job prints to its own terminal by other means
+is not redacted. No registry schema change.
 **Tests:** a credential reaches its job only; nothing under the host's data, jobs or workspace directories, no
 note, reply or list holds it; output and the live stream are redacted; bad credentials are 400; a restart
 before the start fails the job instead of starting it bare; timeout, cancel and a vanished runner all run the

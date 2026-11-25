@@ -1342,6 +1342,24 @@ before the start fails the job instead of starting it bare; timeout, cancel and 
 kill that removes the file; the `ctr` start puts it on stdin, never in argv, never under the workspace root.
 Still to check live (with #1067): the file exists during the job and is gone after each kind of end.
 
+**Addendum (2026-11-25, #1066): model access through the credential.** An agent whose only egress profile is
+`gateway` (ADR-016 `!exclusive`) cannot reach `api.anthropic.com`, so a Claude Code job there could not call the
+model. Decided (Nano, with LEL): *LEL's gateway fronts the model.* `AC_JOB_MODEL_URL` (gateway setting, an
+`https://` URL; `ModelUrl` refuses anything else, and a bad value stops the gateway) names it. For a job that
+carries a credential, the start exec passes the URL as one more argv word (`-` when there is no credential or no
+setting), and the runner exports `ANTHROPIC_BASE_URL=<url>` and `ANTHROPIC_AUTH_TOKEN=<the credential>` for
+`claude`. So no model login lives in the VM; the one reachable host is also the model's; the job's model access
+ends when LEL's token does. Jobs without a credential are unchanged (the agent's own login).
+*Operator rule:* the URL's host and port must be the `gateway` profile's `endpoint`, or the proxy refuses the
+model calls (the witness then shows `egress_deny` for it).
+*Consequences:* the credential is now also in `claude`'s environment, readable by the job's processes as the file
+already was, and the redaction is unchanged. LEL's gateway must proxy the Anthropic Messages API and accept the
+job credential as a bearer token.
+*Alternative rejected:* adding `api.anthropic.com` to the profile needs a long-lived Claude login in the
+workspace and lets the agent reach the model API directly.
+*Tests:* the URL reaches the runner with every start; the `ctr` start passes it only with a credential, never
+the credential itself in argv; the runner exports both variables only then.
+
 ## ADR-029: A job's witness record, from outside the VM
 **Status:** proposed (2026-11-25). Mill Board card #1065 (LEL D101).
 **Context:** LEL's BBP claim needs evidence about a job that the agent cannot forge. The gateway already holds

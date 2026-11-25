@@ -214,6 +214,9 @@ holds no long-lived secret:
   by the gateway in the collected result, stream log and live stream. Limits: an agent can still leak it
   encoded or split, or a tool's truncation can show part of it. Treat the credential as readable by the job, which is the point: mint it
   short-lived and scoped to the one task.
+- *Model access* (ADR-028 addendum): with `AC_JOB_MODEL_URL` set, a job with a credential runs `claude` with
+  `ANTHROPIC_BASE_URL` at that URL and the credential as `ANTHROPIC_AUTH_TOKEN`, so an agent limited to the
+  `gateway` profile needs no Claude login of its own. Keep the URL's host:port equal to the profile's endpoint.
 
 ## Known gaps
 

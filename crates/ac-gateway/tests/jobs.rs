@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ac_ctr::{CtrConfig, CtrRuntime};
 use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
-use ac_domain::job::Credential;
+use ac_domain::job::{Credential, ModelUrl};
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
@@ -48,6 +48,8 @@ struct World {
     starts: Vec<(String, Vec<u8>, u32, Vec<String>)>,
     /// The credential each start was handed (job, secret).
     credentials: Vec<(String, Option<String>)>,
+    /// The model URL each start was handed (job, url).
+    models: Vec<(String, Option<String>)>,
     /// What every `read` appends, as an agent echoing its credential would.
     echo: String,
     /// What `status` reports per job; `Running` if absent.
@@ -124,6 +126,7 @@ impl JobRunner for Fake {
         job: &JobId,
         prompt: &[u8],
         credential: Option<&Credential>,
+        model: Option<&ModelUrl>,
         timeout: u32,
         claude: &[String],
     ) -> Result<(), String> {
@@ -133,6 +136,8 @@ impl JobRunner for Fake {
         }
         w.credentials
             .push((job.to_string(), credential.map(|c| c.expose().to_owned())));
+        w.models
+            .push((job.to_string(), model.map(|m| m.as_str().to_owned())));
         w.starts
             .push((job.to_string(), prompt.to_vec(), timeout, claude.to_vec()));
         Ok(())
@@ -346,6 +351,17 @@ const HOT: Pressure = Pressure {
 };
 
 fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limits, Load)>) -> Rig {
+    build_with(store, fake, root, gate, |j| j)
+}
+
+/// [`build`], with `extra` applied to the jobs before the clock and notes.
+fn build_with(
+    store: Arc<EngineStore>,
+    fake: Fake,
+    root: PathBuf,
+    gate: Option<(Limits, Load)>,
+    extra: impl FnOnce(Jobs) -> Jobs,
+) -> Rig {
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let notes = Arc::new(Mutex::new(Vec::new()));
     let (c, n) = (Arc::clone(&clock), Arc::clone(&notes));
@@ -356,7 +372,7 @@ fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limit
     if let Some((limits, load)) = gate {
         jobs = jobs.with_gate(limits, load);
     }
-    let jobs = jobs
+    let jobs = extra(jobs)
         .with_clock(move || c.load(Ordering::SeqCst))
         .with_notes(move |id, text| {
             let _ = n.lock().map(|mut v| v.push(format!("{id}: {text}")));
@@ -1748,6 +1764,145 @@ fn routes_over_http() {
     }
 }
 
+/// The launch contract (docs/launch-contract.md, #1066) end to end over HTTP, with one launcher
+/// token as an operator would issue it: create an agent with only the `gateway` profile, submit a
+/// job with a credential, wait for it, read its result and witness, then destroy and purge.
+#[test]
+fn the_launch_contract_end_to_end_over_http() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let r = rig();
+    let dir = r.root.join("egress");
+    let _ = std::fs::create_dir_all(dir.join("profiles"));
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    for (name, text) in [
+        (
+            "profiles/gateway.txt",
+            "!exclusive\nendpoint mcp.tail.test:8443\n",
+        ),
+        ("allow.txt", "api.anthropic.com\n"),
+    ] {
+        let _ = std::fs::write(dir.join(name), text);
+        let _ = std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o600));
+    }
+    let egress = Arc::new(ac_gateway::egress::EgressStore::new(
+        dir.join("agents"),
+        dir.join("profiles"),
+        dir.join("allow.txt"),
+        "10.89.0.1:3128",
+        me,
+    ));
+    let file = TokenFile::new(r.root.join("tokens"), me);
+    let scopes = Scopes::parse("agents:read,agents:write,egress:write,jobs:read,jobs:write")
+        .unwrap_or_else(|e| panic!("{e}"));
+    let pool = Agents::parse("lel1,lel2").unwrap_or_else(|e| panic!("{e}"));
+    let launcher = file
+        .create("lel-launcher", scopes, pool, 1, None)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let keys = Keys::new(Tokens::default());
+    reload(&file, &keys);
+    let fleet = Fleet::new(Rt, Arc::clone(&r.store)).with_egress(egress.clone());
+    let api = Api::new(fleet)
+        .with_jobs(r.jobs.clone())
+        .with_egress(egress.clone());
+    let app = App::new(api, Hub::new(NoTerm, r.root.join("history")), keys)
+        .with_jobs(Arc::clone(&r.jobs));
+    let server = Server::bind_shared("127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")), app)
+        .unwrap_or_else(|e| panic!("bind: {e}"));
+    let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
+    std::thread::spawn(move || server.run());
+    let call = |method: &str, path: &str, body: &str| {
+        let (status, _, body) = request_as(addr, &launcher, method, path, body);
+        (status, body)
+    };
+
+    // 1. Create the agent with only the gateway profile: it never has the base list.
+    let (status, body) = call(
+        "POST",
+        "/api/v1/agents/lel1",
+        r#"{"egress_profiles":["gateway"]}"#,
+    );
+    assert_eq!(status, 201, "{body}");
+    let (_, body) = call("GET", "/api/v1/agents/lel1/egress", "");
+    assert!(
+        body.contains(r#""profiles":["gateway"]"#) && body.contains(r#""effective_hosts":1"#),
+        "{body}"
+    );
+    assert_eq!(
+        call("POST", "/api/v1/agents/a1", "").0,
+        404,
+        "outside the pool: not found to this token"
+    );
+    // 2. Submit the job with its credential and an idempotency key.
+    let job = r#"{"prompt":"fix the test","timeout_secs":600,"idempotency_key":"claim-7","credential":"lel.claim-7.tok"}"#;
+    let (status, body) = call("POST", "/api/v1/agents/lel1/jobs", job);
+    assert_eq!(status, 202, "{body}");
+    assert!(!body.contains("lel.claim-7.tok"), "{body}");
+    let id = field(&body, "job_id");
+    assert_eq!(
+        field(&call("POST", "/api/v1/agents/lel1/jobs", job).1, "job_id"),
+        id,
+        "a retry is the same job"
+    );
+    // 3. It runs and ends; the launcher long-polls.
+    r.jobs.tick();
+    assert_eq!(
+        r.fake.w().credentials.last().cloned(),
+        Some((id.clone(), Some("lel.claim-7.tok".to_owned())))
+    );
+    let witness_path = format!("/api/v1/agents/lel1/jobs/{id}/witness");
+    assert_eq!(call("GET", &witness_path, "").0, 409, "not before it ends");
+    r.egress.set(Ok("ac-egress: allow 10.89.0.30 agent=lel1 mcp.tail.test:8443\n\
+                     ac-egress: deny 10.89.0.30 agent=lel1 api.anthropic.com:443: not on allowlist\n"));
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    let (status, body) = call("GET", &format!("/api/v1/agents/lel1/jobs/{id}?wait=30"), "");
+    assert_eq!(
+        (status, field(&body, "state").as_str()),
+        (200, "succeeded"),
+        "{body}"
+    );
+    // 4. The result is agent-written text.
+    let (status, body) = call("GET", &format!("/api/v1/agents/lel1/jobs/{id}/output"), "");
+    assert_eq!(status, 200);
+    assert!(body.starts_with("result of"), "{body}");
+    // 5. The witness, with a digest anyone can recompute from the record.
+    let (status, body) = call("GET", &witness_path, "");
+    assert_eq!(status, 200, "{body}");
+    let parsed = rusty_json::Value::parse(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    let text = |k: &str| {
+        parsed
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let record = text("record");
+    assert_eq!(text("sha256"), sha256_hex(record.as_bytes()));
+    assert!(
+        record.starts_with(&format!(
+            "agent_cloud.witness v1\nagent lel1\njob {id}\nstate succeeded\n"
+        )),
+        "{record}"
+    );
+    assert!(record.ends_with("egress journal 2\negress_allow mcp.tail.test:8443 1\negress_deny api.anthropic.com:443 1\n"), "{record}");
+    // 6. Destroy and purge: the agent, its workspace and its jobs go.
+    let (status, body) = call("DELETE", "/api/v1/agents/lel1?purge=true", "");
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = call("GET", "/api/v1/agents/lel1", "");
+    assert_eq!(status, 200);
+    assert!(body.contains(r#""state":"destroyed""#), "{body}");
+    assert_eq!(
+        call("GET", "/api/v1/agents/lel1/jobs", "").1,
+        r#"{"jobs":[]}"#
+    );
+    let agents = std::fs::read_to_string(dir.join("agents")).unwrap_or_default();
+    assert!(
+        !agents.contains("lel1"),
+        "credential and attachment forgotten: {agents}"
+    );
+}
+
 /// Tokens made as `ac-gateway token create` makes them, plus an admin one.
 struct Scoped {
     file: TokenFile,
@@ -2120,9 +2275,19 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let root = tmp();
     let (rt, log) = ctr(&root, "");
     let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
+    let model = model_url();
     for (n, prompt) in hostile_prompts().iter().enumerate() {
         let job = JobId::from_random([n as u8, 1, 2, 3, 4, 5, 6, 7]);
-        let r = rt.start(&agent("a1"), &job, prompt.as_bytes(), None, 60, &flags);
+        // Without a credential the model URL is not passed on.
+        let r = rt.start(
+            &agent("a1"),
+            &job,
+            prompt.as_bytes(),
+            None,
+            Some(&model),
+            60,
+            &flags,
+        );
         assert!(r.is_ok(), "{r:?}");
         let file = root.join(format!("workspaces/a1/.job-{job}.prompt"));
         assert_eq!(
@@ -2131,17 +2296,22 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
         );
         let argv = argvs(&log).pop().unwrap_or_default();
         // timeout -s TERM -k 3 30 ctr -n agents task exec --exec-id <x> a1 sh -c <START>
-        // ac-job-start <RUN> <job> <0|1> <secs> <flags...>: constants, the job id, whether a
-        // credential follows on stdin, and the operator's flags only.
+        // ac-job-start <RUN> <job> <0|1> <model|-> <secs> <flags...>: constants, the job id,
+        // whether a credential follows on stdin, the operator's model URL, and their flags only.
         assert_eq!(argv[..6], ["timeout", "-s", "TERM", "-k", "3", "30"]);
         assert_eq!(argv[6..11], ["ctr", "-n", "agents", "task", "exec"]);
         assert_eq!(argv[13..16], ["a1", "sh", "-c"]);
         assert_eq!(argv[17], "ac-job-start");
         assert_eq!(
-            argv[19..22],
-            [job.to_string(), "0".to_owned(), "360".to_owned()]
+            argv[19..23],
+            [
+                job.to_string(),
+                "0".to_owned(),
+                "-".to_owned(),
+                "360".to_owned()
+            ]
         );
-        assert_eq!(argv[22..], flags[..]);
+        assert_eq!(argv[23..], flags[..]);
         let held = log.lock().map(|l| {
             l.iter()
                 .all(|r| matches!(r.stdin, platform_mock::process::StdioKind::Pipe))
@@ -2162,7 +2332,7 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let link = root.join(format!("workspaces/a1/.job-{job}.prompt"));
     let _ = std::os::unix::fs::symlink(&victim, &link);
     assert!(rt
-        .start(&agent("a1"), &job, b"evil", None, 60, &flags)
+        .start(&agent("a1"), &job, b"evil", None, None, 60, &flags)
         .is_err());
     assert_eq!(
         std::fs::read_to_string(&victim).ok().as_deref(),
@@ -2178,12 +2348,17 @@ fn ctr_start_hands_a_credential_on_stdin_never_in_argv_or_the_workspace() {
     let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
     let job = JobId::from_random([7; 8]);
     let cred = Credential::parse("LEL-SECRET-token.42").unwrap_or_else(|e| panic!("{e}"));
-    let r = rt.start(&agent("a1"), &job, b"go", Some(&cred), 60, &flags);
+    let r = rt.start(&agent("a1"), &job, b"go", Some(&cred), None, 60, &flags);
     assert!(r.is_ok(), "{r:?}");
     let argv = argvs(&log).pop().unwrap_or_default();
     assert_eq!(
-        argv[19..22],
-        [job.to_string(), "1".to_owned(), "360".to_owned()]
+        argv[19..23],
+        [
+            job.to_string(),
+            "1".to_owned(),
+            "-".to_owned(),
+            "360".to_owned()
+        ]
     );
     assert!(
         argv.iter().all(|a| !a.contains("LEL-SECRET")),
@@ -2196,7 +2371,46 @@ fn ctr_start_hands_a_credential_on_stdin_never_in_argv_or_the_workspace() {
         .into_iter()
         .any(|p| std::fs::read(&p).is_ok_and(|b| b.windows(10).any(|w| w == b"LEL-SECRET")));
     assert!(!leaked, "credential written under the workspace root");
+    // With a model URL, it goes to the runner, which exports it with the credential as token.
+    let job = JobId::from_random([8; 8]);
+    let r = rt.start(
+        &agent("a1"),
+        &job,
+        b"go",
+        Some(&cred),
+        Some(&model_url()),
+        60,
+        &flags,
+    );
+    assert!(r.is_ok(), "{r:?}");
+    let argv = argvs(&log).pop().unwrap_or_default();
+    assert_eq!(argv[21], "https://gw.tail.test:8443/v1");
+    assert!(argv[18].contains("ANTHROPIC_BASE_URL=\"$model\""));
+    assert!(argv[18].contains("ANTHROPIC_AUTH_TOKEN=$(cat \"$c/credential\")"));
+    assert!(argv.iter().all(|a| !a.contains("LEL-SECRET")));
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn model_url() -> ModelUrl {
+    ModelUrl::parse("https://gw.tail.test:8443/v1").unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn the_model_url_goes_to_the_runner_with_every_start() {
+    let (store, root) = registry();
+    let r = build_with(store, Fake::default(), root, None, |j| {
+        j.with_model_url(model_url())
+    });
+    let id = field(
+        &r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#))
+            .1,
+        "job_id",
+    );
+    r.jobs.tick();
+    assert_eq!(
+        r.fake.w().models.last().cloned(),
+        Some((id, Some("https://gw.tail.test:8443/v1".to_owned())))
+    );
 }
 
 /// Every file under `dir`.

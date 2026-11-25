@@ -14,7 +14,9 @@
 //! `AC_PROBE_FAILURES` (consecutive failures before acting, 3), `AC_PROBE_WINDOW` (seconds they must
 //! span, 90), `AC_BUSY_LOAD_PER_CORE` (1.0), `AC_BUSY_IO_SOME` (20), `AC_BUSY_CPU_SOME` (50). Jobs (ADR-010):
 //! `AC_JOB_PERMISSION_MODE` (default `acceptEdits`), `AC_JOB_ALLOWED_TOOLS` (comma-separated,
-//! default [`jobs::DEFAULT_TOOLS`]), `AC_JOB_UNSAFE=1` (`--dangerously-skip-permissions` instead).
+//! default [`jobs::DEFAULT_TOOLS`]), `AC_JOB_UNSAFE=1` (`--dangerously-skip-permissions` instead),
+//! `AC_JOB_MODEL_URL` (an `https://` URL: jobs that carry a credential reach the model there, with
+//! the credential as their token; ADR-028 addendum. Unset, every job uses the agent's own login).
 //! Job start gate (ADR-013; defaults in [`Limits::for_cores`]): `AC_MAX_RUNNING_JOBS` (host-wide,
 //! default the core count), `AC_JOB_CPU_PSI_MAX` (start only while cpu PSI some avg10 is below
 //! this, 40), `AC_JOB_START_SPACING` (least seconds between starts, 15).
@@ -78,6 +80,7 @@ use ac_ctr::facts::{collect, LinuxHost, Paths, Scope};
 use ac_ctr::host::{Monotonic, ProcPressure};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_domain::health::Thresholds;
+use ac_domain::job::ModelUrl;
 use ac_domain::schedule::Limits;
 use ac_domain::tune::rules::drift;
 use ac_domain::tune::{recommend, Fact, Profile};
@@ -131,6 +134,17 @@ fn thresholds() -> Result<Thresholds, String> {
 }
 
 /// The job start gate: [`Limits::for_cores`] for this host, each overridable from the environment.
+/// `AC_JOB_MODEL_URL`, if set; a bad value stops the gateway rather than run jobs without it.
+fn model_url() -> Result<Option<ModelUrl>, String> {
+    match std::env::var("AC_JOB_MODEL_URL") {
+        Ok(v) if !v.is_empty() => ModelUrl::parse(&v)
+            .map(Some)
+            .map_err(|e| format!("AC_JOB_MODEL_URL: {e}")),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("AC_JOB_MODEL_URL: {e}")),
+    }
+}
+
 fn limits() -> Result<Limits, String> {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let d = Limits::for_cores(u32::try_from(cores).unwrap_or(u32::MAX));
@@ -416,6 +430,7 @@ fn run() -> Result<(), String> {
         std::env::var("AC_JOB_ALLOWED_TOOLS").ok().as_deref(),
         env("AC_JOB_UNSAFE", "") == "1",
     )?;
+    let model = model_url()?;
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let gate = limits()?;
     settings_check();
@@ -487,19 +502,25 @@ fn run() -> Result<(), String> {
         data.join("history"),
     );
     let notes = hub.clone();
-    let jobs = Arc::new(
-        Jobs::new(
-            store.clone(),
-            store,
-            CtrRuntime::new(LinuxSpawner, cfg.clone()),
-            data.join("jobs"),
-            claude,
-        )
-        .with_gate(gate, ProcPressure)
-        .with_changes(CtrRuntime::new(LinuxSpawner, cfg.clone()))
-        .with_egress_log(CtrRuntime::new(LinuxSpawner, cfg.clone()))
-        .with_notes(move |id, text| notes.note(id, text)),
-    );
+    let mut jobs = Jobs::new(
+        store.clone(),
+        store,
+        CtrRuntime::new(LinuxSpawner, cfg.clone()),
+        data.join("jobs"),
+        claude,
+    )
+    .with_gate(gate, ProcPressure)
+    .with_changes(CtrRuntime::new(LinuxSpawner, cfg.clone()))
+    .with_egress_log(CtrRuntime::new(LinuxSpawner, cfg.clone()))
+    .with_notes(move |id, text| notes.note(id, text));
+    if let Some(url) = model {
+        eprintln!(
+            "ac-gateway: jobs with a credential reach the model at {}",
+            url.as_str()
+        );
+        jobs = jobs.with_model_url(url);
+    }
+    let jobs = Arc::new(jobs);
     jobs.startup();
     let unhealthy = Unhealthy::default();
     let mut api = Api::new(fleet)

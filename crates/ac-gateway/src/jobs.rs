@@ -41,7 +41,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ac_ctr::CtrRuntime;
 use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
-use ac_domain::job::{self, Credential};
+use ac_domain::job::{self, Credential, ModelUrl};
 use ac_domain::schedule::{self, Limits, Wait};
 use ac_domain::witness::{self, EgressSource};
 use ac_domain::{AgentId, Job, JobEvent, JobId, JobState, State};
@@ -119,8 +119,8 @@ const MODES: [&str; 5] = ["acceptEdits", "auto", "dontAsk", "manual", "plan"];
 /// change note. A start that fails after that removes it again (and the gateway's kill does too,
 /// for a start the exec timeout cut short).
 const START: &str = r#"set -eu
-run=$1 id=$2 cred=$3
-shift 3
+run=$1 id=$2 cred=$3 model=$4
+shift 4
 c=/dev/shm/ac-job-$id
 secret=
 if [ "$cred" = 1 ]; then IFS= read -r secret; fi
@@ -137,7 +137,7 @@ if [ "$cred" = 1 ]; then
     (umask 077 && mkdir "$c" && printf '%s' "$secret" > "$c/credential")
 fi
 unset secret
-tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$cred" "$@""#;
+tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$cred" "$model" "$@""#;
 
 /// The job's window (bash): `claude` reads the prompt on stdin; its log is capped at 16 MiB (a
 /// job that passes it is stopped); the terminal shows a digest. With a credential, its log is
@@ -146,8 +146,8 @@ tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$i
 /// characters need no JSON escaping and only `.` and `/` need escaping for `sed`). The job's credential file goes as
 /// soon as `claude` exits, before the job reports that it ended (and on any exit of the window). `exit_code` is written last, then
 /// the marker `.job-<id>.done` in the workspace root, which the gateway sees without an exec.
-const RUN: &str = r#"id=$1 cred=$2 secs=$3
-shift 3
+const RUN: &str = r#"id=$1 cred=$2 model=$3 secs=$4
+shift 4
 d=/workspace/.jobs/$id
 c=/dev/shm/ac-job-$id
 trap 'rm -rf -- "$c"' EXIT
@@ -156,6 +156,11 @@ if [ "$cred" = 1 ]; then
     export AC_JOB_CREDENTIAL_FILE=$c/credential
     pat=$(sed 's/[./]/\\&/g' "$c/credential")
     redact() { sed -u "s/$pat/[credential redacted]/g"; }
+    if [ "$model" != - ]; then
+        export ANTHROPIC_BASE_URL="$model"
+        ANTHROPIC_AUTH_TOKEN=$(cat "$c/credential")
+        export ANTHROPIC_AUTH_TOKEN
+    fi
 fi
 show='fromjson? | if .type == "assistant" then (.message.content[]? | if .type == "text" then .text + "\n" elif .type == "tool_use" then "> " + .name + " " + (.input | tostring | .[0:160]) + "\n" else empty end) elif .type == "result" then "--- " + (.subtype // "result") + "\n" else empty end'
 printf 'job %s started %s\n' "$id" "$(date -u +%FT%TZ)"
@@ -258,13 +263,16 @@ impl Part {
 /// use a fake.
 pub trait JobRunner: Send + Sync + 'static {
     /// Put `prompt` in the agent's workspace, `credential` (if any) on the guest's tmpfs, and
-    /// open the job's window; returns once it is open.
+    /// open the job's window; returns once it is open. With both a credential and `model`, the
+    /// job reaches the model there with the credential as its token.
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &self,
         agent: &AgentId,
         job: &JobId,
         prompt: &[u8],
         credential: Option<&Credential>,
+        model: Option<&ModelUrl>,
         timeout_secs: u32,
         claude: &[String],
     ) -> Result<(), String>;
@@ -389,6 +397,7 @@ impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
         job: &JobId,
         prompt: &[u8],
         credential: Option<&Credential>,
+        model: Option<&ModelUrl>,
         timeout_secs: u32,
         claude: &[String],
     ) -> Result<(), String> {
@@ -420,6 +429,10 @@ impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
             Some(c) => ("1", format!("{}\n", c.expose())),
             None => ("0", String::new()),
         };
+        let model = match (credential, model) {
+            (Some(_), Some(m)) => m.as_str(),
+            _ => "-",
+        };
         let mut args = vec![
             "sh",
             "-c",
@@ -428,6 +441,7 @@ impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
             RUN,
             job.as_str(),
             flag,
+            model,
             &secs,
         ];
         args.extend(claude.iter().map(String::as_str));
@@ -682,6 +696,7 @@ pub struct Jobs {
     runner: Box<dyn JobRunner>,
     changes: Option<Box<dyn Changes>>,
     egress: Option<Box<dyn EgressLog>>,
+    model: Option<ModelUrl>,
     dir: PathBuf,
     claude: Vec<String>,
     notes: Notes,
@@ -784,6 +799,7 @@ impl Jobs {
             runner: Box::new(runner),
             changes: None,
             egress: None,
+            model: None,
             dir,
             claude,
             notes: Box::new(|_, _| {}),
@@ -801,6 +817,13 @@ impl Jobs {
             queued: Condvar::new(),
             secrets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Jobs that carry a credential reach the model at `url`, with the credential as their token
+    /// (ADR-028 addendum); jobs without one use the agent's own login, as before.
+    pub fn with_model_url(mut self, url: ModelUrl) -> Self {
+        self.model = Some(url);
+        self
     }
 
     /// Read each witness record's egress decisions from `log` (ADR-029). Without this, records
@@ -1274,6 +1297,7 @@ impl Jobs {
                     &j.id,
                     &prompt,
                     credential.as_ref(),
+                    self.model.as_ref(),
                     j.timeout_secs,
                     &self.claude,
                 )

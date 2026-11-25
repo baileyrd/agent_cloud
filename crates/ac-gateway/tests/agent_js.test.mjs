@@ -126,3 +126,50 @@ test('fork sends the new id, and a checkpoint only when one is picked', async ()
   const forks = sent.filter((r) => r.method === 'POST').map((r) => r.body);
   assert.deepEqual(forks, [{ id: 'b2' }, { id: 'b3', checkpoint: 'c2' }]);
 });
+
+const EGRESS = {
+  [`GET ${A}/egress`]: [[200, { id: 'a1', profiles: ['rust'], effective_hosts: 5, missing: ['gone'] }]],
+  'GET /api/v1/egress/profiles': [[200, { profiles: [
+    { name: 'node', error: 'mode 644' },
+    { name: 'rust', hosts: 2 },
+    { name: 'wall', hosts: 1, exclusive: true },
+  ] }]],
+};
+const boxes = (els) => els.profiles.children.map((label) => label.children[0]);
+
+test('egress shows the attached profiles and hosts; only egress:write may change them', async () => {
+  const reader = await load({ scopes: ['agents:read'], answers: { ...EGRESS } });
+  assert.equal(reader.els['egress-state'].textContent, 'Reaches 5 hosts · missing: gone');
+  assert.deepEqual(boxes(reader.els).map((b) => [b.value, b.checked, b.disabled]),
+    [['node', false, true], ['rust', true, true], ['wall', false, true]]);
+  assert.equal(reader.els.profiles.children[0].children[1].textContent, ' node (error: mode 644)');
+  assert.equal(reader.els.profiles.children[2].children[1].textContent, ' wall (1 host, exclusive)');
+  assert.equal(reader.els['save-egress'].hidden, true);
+  const writer = await load({ scopes: ['agents:read', 'egress:write'], answers: { ...EGRESS } });
+  assert.deepEqual(boxes(writer.els).map((b) => b.disabled), [true, false, false], 'a broken profile stays disabled');
+  assert.equal(writer.els['save-egress'].hidden, false);
+});
+
+test('saving egress sends the ticked profiles; [] detaches all', async () => {
+  const { els, sent } = await load({
+    scopes: ['egress:write'],
+    answers: { ...EGRESS, [`PUT ${A}/egress`]: [[200, { id: 'a1', profiles: ['wall'], effective_hosts: 1 }]] },
+  });
+  sent.length = 0;
+  const [, rust, wall] = boxes(els);
+  rust.checked = false;
+  wall.checked = true;
+  await els.egress.handlers.submit({ preventDefault() {} });
+  assert.deepEqual([sent[0].method, sent[0].url, sent[0].body], ['PUT', `${A}/egress`, { profiles: ['wall'] }]);
+  assert.equal(els.note.textContent, 'Egress: done.');
+  for (const b of boxes(els)) b.checked = false;
+  sent.length = 0;
+  await els.egress.handlers.submit({ preventDefault() {} });
+  assert.deepEqual(sent[0].body, { profiles: [] });
+});
+
+test('without the egress routes the section says why and offers no form', async () => {
+  const { els } = await load({ scopes: ['agents:read'] });
+  assert.equal(els['egress-state'].textContent, 'Egress: not found');
+  assert.equal(els.egress.hidden, true);
+});

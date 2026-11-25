@@ -125,7 +125,7 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [ ] Each ended job's witness record (state, times, exit, changed paths, egress decisions) and its SHA-256,
   from outside the VM, through REST and MCP (ADR-029, #1065). To verify on BaileyServ: a job's egress counts
   match the proxy's journal
-- [ ] Web UI for agents and jobs: static in-repo pages over the existing API, six slices (ADR-030 accepted 2026-11-25, #516). Slices 1-4: the agents page at `/ui/` with the host's capacity, and each agent's page (checkpoints, restore, fork) and jobs page.
+- [ ] Web UI for agents and jobs: static in-repo pages over the existing API, six slices (ADR-030 accepted 2026-11-25, #516). Slices 1-5: the agents page at `/ui/` with the host's capacity, and each agent's page (checkpoints, restore, fork, egress) and jobs page.
 - [ ] Launch contract for untrusted agents ([launch-contract.md](launch-contract.md), #1066): the gateway calls,
   token, failures; tested end to end over HTTP with fakes; `scripts/untrusted-run.sh` for the host (#1067).
   Model access: `AC_JOB_MODEL_URL` sends credentialed jobs to LEL's gateway (ADR-028 addendum). Open: LEL's

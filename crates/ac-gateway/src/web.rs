@@ -42,6 +42,14 @@ const SCRIPT: &str = include_str!("../assets/viewer.js");
 const STYLE: &str = include_str!("../assets/viewer.css");
 const DESK_PAGE: &str = include_str!("../assets/desk.html");
 const DESK_SCRIPT: &str = include_str!("../assets/desk.js");
+/// The management pages (ADR-030): shared script and style, then one page per slice.
+const UI_SCRIPT: &str = include_str!("../assets/ui.js");
+const UI_STYLE: &str = include_str!("../assets/ui.css");
+const AGENTS_PAGE: &str = include_str!("../assets/agents.html");
+const AGENTS_SCRIPT: &str = include_str!("../assets/agents.js");
+/// The management pages' scripts, whose API calls must all be in the catalog.
+#[cfg(test)]
+const UI_SCRIPTS: [(&str, &str); 2] = [("ui.js", UI_SCRIPT), ("agents.js", AGENTS_SCRIPT)];
 
 /// For agent-written text: never sniffed, never rendered as a page.
 const UNTRUSTED: [(&str, &str); 4] = [
@@ -253,7 +261,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             ),
             Some(Answer::Text(text)) => untrusted(text.into_bytes()),
             None => match jobs::route(method, path) {
-                Some(route) => self.job(route, target, body),
+                Some(route) => self.job(route, target, body, token),
                 None => {
                     let may_attach = token.scopes.allows(Scope::EgressWrite);
                     if let Some(id) = crate::create_target(method, target) {
@@ -332,7 +340,13 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
 
     /// A job route. A submit takes the lifecycle lock around the agent's state check and the
     /// queueing, so a pause cannot slip between them; the others never take it.
-    fn job(&self, route: Result<Route, Reply>, target: &str, body: &[u8]) -> Response {
+    fn job(
+        &self,
+        route: Result<Route, Reply>,
+        target: &str,
+        body: &[u8],
+        token: &Token,
+    ) -> Response {
         let Some(jobs) = &self.jobs else {
             return json(error(404, "not found"));
         };
@@ -348,6 +362,16 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             });
         }
         let query = target.split_once('?').map_or("", |(_, q)| q);
+        if let Route::Events(id, job) = &route {
+            return match Jobs::events(jobs, id, job, query) {
+                Ok(stream) => events(Revocable {
+                    stream,
+                    keys: self.keys.clone(),
+                    token: token.clone(),
+                }),
+                Err(reply) => json(reply),
+            };
+        }
         match jobs.handle(route, query) {
             jobs::Answer::Json(reply) => json(reply),
             jobs::Answer::Output(bytes) => untrusted(bytes),
@@ -355,15 +379,16 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
     }
 }
 
-/// A viewer stream that ends once its token is revoked, changed or expired (checked at every
-/// message and keep-alive, so within a few seconds of the reload or the expiry). Ending it gives up the viewer's seat.
-struct Revocable {
-    stream: crate::viewer::Stream,
+/// A viewer or job-event stream that ends once its token is revoked, changed or expired (checked
+/// at every message and keep-alive, so within a few seconds of the reload or the expiry). Ending
+/// it gives up the stream's seat.
+struct Revocable<I> {
+    stream: I,
     keys: Keys,
     token: Token,
 }
 
-impl Iterator for Revocable {
+impl<I: Iterator<Item = Vec<u8>>> Iterator for Revocable<I> {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Vec<u8>> {
@@ -426,6 +451,18 @@ fn shown(path: &str) -> String {
     escape(&path.chars().take(200).collect::<String>())
 }
 
+/// A job's AG-UI events (#471). The text in them is agent-written: never sniffed or cached.
+fn events(stream: Revocable<jobs::EventStream>) -> Response {
+    let headers = [
+        ("X-Content-Type-Options", "nosniff"),
+        ("Cache-Control", "no-store"),
+    ];
+    with(
+        Response::stream(rusty_agui::sse::CONTENT_TYPE, stream),
+        &headers,
+    )
+}
+
 /// Agent-written bytes as plain text (see [`UNTRUSTED`]).
 fn untrusted(body: Vec<u8>) -> Response {
     with(Response::json(StatusCode::OK, body), &UNTRUSTED)
@@ -462,10 +499,16 @@ fn asset(method: &str, path: &str) -> Option<Response> {
     if method != "GET" {
         return Some(json(error(405, "method not allowed")));
     }
+    const JS: &str = "text/javascript; charset=utf-8";
+    const CSS: &str = "text/css; charset=utf-8";
     let (body, kind) = match name {
-        "viewer.js" => (SCRIPT, "text/javascript; charset=utf-8"),
-        "viewer.css" => (STYLE, "text/css; charset=utf-8"),
-        "desk.js" => (DESK_SCRIPT, "text/javascript; charset=utf-8"),
+        "" => (AGENTS_PAGE, "text/html; charset=utf-8"),
+        "viewer.js" => (SCRIPT, JS),
+        "viewer.css" => (STYLE, CSS),
+        "ui.js" => (UI_SCRIPT, JS),
+        "ui.css" => (UI_STYLE, CSS),
+        "agents.js" => (AGENTS_SCRIPT, JS),
+        "desk.js" => (DESK_SCRIPT, JS),
         id if ac_domain::AgentId::parse(id).is_ok() => (PAGE, "text/html; charset=utf-8"),
         desk if desk
             .strip_prefix("desk/")
@@ -583,11 +626,77 @@ mod tests {
         assert!(asset("GET", "/ui/..%2Fetc").is_some_and(|r| r.status == StatusCode::from_u16(404)));
         assert!(asset("POST", "/ui/a1").is_some_and(|r| r.status == StatusCode::from_u16(405)));
         assert!(asset("GET", "/api/v1/agents").is_none());
+        let index = asset("GET", "/ui/");
+        assert!(index.is_some_and(|r| r.status == StatusCode::OK
+            && r.headers.get("content-security-policy") == Some(CSP)
+            && r.headers.get("content-type") == Some("text/html; charset=utf-8")));
+        for js in ["/ui/ui.js", "/ui/agents.js"] {
+            assert!(asset("GET", js).is_some_and(
+                |r| r.headers.get("content-type") == Some("text/javascript; charset=utf-8")
+            ));
+        }
+    }
+
+    /// Each `'METHOD', '/api/v1/...'` call in the management pages' scripts, and any API path not
+    /// written that way (which fails the test: every call must be checkable).
+    fn ui_calls(script: &str) -> Vec<(String, String)> {
+        let mut calls = Vec::new();
+        for (at, _) in script.match_indices("'/api/v1/") {
+            let path: String = script[at + 1..]
+                .chars()
+                .take_while(|c| *c != '\'')
+                .collect();
+            let method = script[..at]
+                .strip_suffix("', ")
+                .and_then(|head| head.rsplit_once('\''))
+                .map(|(_, m)| m.to_owned())
+                .unwrap_or_default();
+            calls.push((method, path));
+        }
+        calls
+    }
+
+    #[test]
+    fn the_management_pages_call_only_catalog_routes() {
+        let mut seen = 0;
+        for (name, script) in UI_SCRIPTS {
+            for (method, path) in ui_calls(script) {
+                assert!(
+                    crate::access::ROUTES
+                        .iter()
+                        .any(|r| r.method == method && r.path == path),
+                    "{name}: {method:?} {path} is not in access::ROUTES"
+                );
+                seen += 1;
+            }
+            assert!(
+                !script.contains("`/api/"),
+                "{name}: build API paths with UI.url"
+            );
+            assert!(
+                !script.contains("\"/api/"),
+                "{name}: write API paths in single quotes"
+            );
+        }
+        assert!(seen >= 6, "the scan found the calls ({seen})");
+        assert_eq!(
+            ui_calls("x('GET', '/api/v1/bad')"),
+            [("GET".into(), "/api/v1/bad".into())]
+        );
+        assert_eq!(ui_calls("x('/api/v1/bad')")[0].0, "");
     }
 
     #[test]
     fn page_makes_no_external_requests_and_keeps_the_token_in_memory() {
-        for (name, text) in [("html", PAGE), ("js", SCRIPT), ("css", STYLE)] {
+        for (name, text) in [
+            ("html", PAGE),
+            ("js", SCRIPT),
+            ("css", STYLE),
+            ("ui.js", UI_SCRIPT),
+            ("ui.css", UI_STYLE),
+            ("agents.html", AGENTS_PAGE),
+            ("agents.js", AGENTS_SCRIPT),
+        ] {
             for banned in [
                 "http://",
                 "https://",
@@ -602,9 +711,11 @@ mod tests {
                 assert!(!text.contains(banned), "{name} contains {banned}");
             }
         }
-        assert!(
-            !PAGE.contains("<script>") && !PAGE.contains("style="),
-            "no inline script or style"
-        );
+        for page in [PAGE, AGENTS_PAGE] {
+            assert!(
+                !page.contains("<script>") && !page.contains("style="),
+                "no inline script or style"
+            );
+        }
     }
 }

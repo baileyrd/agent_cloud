@@ -300,10 +300,50 @@ never the registry's state or times. Output is read through execs, so a wedged a
 The image's PID 1 is `tini` (running `sleep infinity`), which reaps orphans, so a killed job leaves no
 zombies (verified 2026-10-22: none after a cancel through the API, a `pkill` of `claude` and killed
 orphans; before, with `sleep infinity` as PID 1, they stayed until the agent was paused).
-**Not now:** `rusty_agui` (AG-UI events over SSE) fits a later per-job event stream that turns the
-stream-json log into `RUN_STARTED`/`TEXT_MESSAGE_*`/`TOOL_CALL_*`/`RUN_FINISHED`; it does not fit the
-control plane (AG-UI has no queue, job id or re-attach; a run is one request). Long-polling the status
-is enough for now.
+**Not the control plane:** AG-UI has no queue, job id or re-attach (a run is one request), so jobs stay
+on this API and long-polling. A read-only AG-UI view of each job came later (addendum below).
+
+**Addendum (2026-11-25, #471): each job as an AG-UI run.** `GET .../jobs/{job}/events[?after=N]` (`jobs:read`
+for the agent; not an MCP tool, since a tool call answers once) streams the job as Server-Sent Events in
+AG-UI's format, built with `rusty_agui` from the same rusty_mill pin (ADR-008). It is for watching:
+CopilotKit or any AG-UI client renders the run live. It is not evidence: the witness record (ADR-029) is.
+- *Mapping* (`ac-gateway/src/agui.rs`): `RUN_STARTED` (thread = agent id, run = job id), then
+  `STATE_SNAPSHOT` with the job as `GET .../jobs/{job}` renders it, again at each state change. Each log
+  line's `assistant` text block becomes `TEXT_MESSAGE_START`/`CONTENT`/`END`, each `tool_use` block becomes
+  `TOOL_CALL_START`/`ARGS`/`END` (the input as JSON), and each `user` `tool_result` becomes
+  `TOOL_CALL_RESULT`. Other lines (system, result, thinking, unparsable) make nothing. `succeeded` ends with
+  `RUN_FINISHED` (result = the job); the other ends with `RUN_ERROR`, code = the state.
+- *Trust:* this is the first place the gateway parses the agent's log. It parses with `rusty_json` (no
+  serde), line by line. A line over 1 MiB is skipped and any text over 64 KiB is cut. Every event passes
+  `rusty_agui`'s ordering verifier, and a violation ends the run with `RUN_ERROR` `sequence`. The outcome
+  comes from the registry, never from the log, so an agent can write anything into the messages but
+  cannot make a failed job look finished. Lines are redacted with the job's credential (ADR-028), which
+  the stream captures when it opens, because the registry forgets the credential when the job ends,
+  before the last read. Served `nosniff` and `no-store`.
+- *Reading:* while the job runs, the stream polls every 2 s. It reads the registry, then up to 4 x 256 KiB
+  of the log from where it stopped, through one `dd` exec. Once the job ends it drains the rest, 4 chunks per
+  step with no wait between steps, so frames still go out and the token is still checked between them. If
+  the drain fails or spends its budget (16 MiB) before the log's end, a `CUSTOM` event named
+  `log_incomplete` (value `read_failed` or `read_limit`) goes out before the run's last event, which
+  still gives the job's own outcome. A budget spent exactly at the end is checked with one more read.
+  A job that had already ended is replayed from the host's copy, which is its last 1 MiB. A started job
+  with no copy (cancelled, timed out, or the copy failed) gets `log_incomplete` with `no_copy`. At most 8
+  streams are open at once and 2 on one agent (429 beyond), because each one execs: one agent's token
+  cannot take every seat, and one agent sees at most 2 log execs per poll. The gateway does not stat the
+  log on the host to skip unchanged reads, because it never reads below a workspace root (the agent
+  controls it). Keep-alive comments go out between polls. The stream ends within one poll of its token
+  being revoked or expiring (ADR-022), like a viewer stream, and a client that goes away frees its seat
+  at the next write.
+- *Resuming:* each line's events carry the line number as their SSE `id`, on the last of them. A client
+  that reconnects passes the last id it saw as `?after=N` and gets `RUN_STARTED`, the state, then the
+  lines after N. Browsers cannot set `Authorization` on an `EventSource`, so clients use `fetch` and
+  resume explicitly. `Last-Event-ID` is not read. Ids always count from the log's start. When the job ended
+  the gateway marks a host copy that holds the whole log (`stream.whole`). A copy without the mark may
+  be only the log's last 1 MiB: it is replayed without ids and followed by `log_incomplete` with
+  `capped`, and `?after=N` against it ends at once with `RUN_ERROR` code `replay_unavailable`, rather
+  than resuming from the wrong line.
+- *Not done:* partial messages (`--include-partial-messages`) and reasoning events. The log has whole
+  messages only, so text arrives one message at a time.
 
 ## ADR-011: Scoped API tokens
 **Status:** accepted (2026-10-21).
@@ -347,7 +387,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST /api/v1/agents/{id}` (create) | `agents:write` |
   | `POST /api/v1/agents/{id}/pause`, `.../resume` | `agents:write` |
   | `DELETE /api/v1/agents/{id}` (destroy; `?purge=true`, `?force=true`) | `agents:write` |
-  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output`, `.../jobs/{job}/witness` | `jobs:read` |
+  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output`, `.../jobs/{job}/witness`, `.../jobs/{job}/events` | `jobs:read` |
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
   | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
@@ -1464,7 +1504,7 @@ the digest. Resource peaks are not in v1: no per-job figure exists without new s
 - *Sign the record.* Needs a key held off the guest and a rotation story; worth it once LEL verifies offline.
 
 ## ADR-030: A web UI from static in-repo pages over the existing API
-**Status:** proposed (2026-11-25). Mill Board card #516 (R5).
+**Status:** accepted (2026-11-25, Nano). Mill Board card #516 (R5). Slice 1: the agents page at `/ui/`.
 **Context:** ADR-025 keeps an agent_cloud web UI for managing agents and jobs. It must add no backend surface:
 it calls only routes already in the operation catalog (ADR-020), authenticates with a bearer token (ADR-011)
 and is served behind `tailscale serve` (ADR-024). The terminal and desktop viewers already set the pattern:
@@ -1506,3 +1546,9 @@ no npm package and no third-party code.
 which are already reviewed. Reloading asks for the token again, which is intended. Sharing code between pages
 means a shared `ui.js` (token prompt, `fetch` wrapper, `whoami`); it is added by the first slice and kept
 under about 150 lines. Backups and tokens stay on the host's command line.
+
+**Addendum (2026-11-25, slice 1):** the pages share `ui.js` (token prompt, `api`, `whoami`, an element helper)
+and `ui.css`. The agents page is the UI's index, `/ui/`, so it cannot clash with an agent id under `/ui/<id>`.
+Every call is written as a single-quoted method and catalog pattern side by side (for example `'POST'` then
+the pause route with its `{id}` segment); `web::tests::the_management_pages_call_only_catalog_routes` reads
+the scripts and fails on any pair that is not in `access::ROUTES`, or any API path written another way.

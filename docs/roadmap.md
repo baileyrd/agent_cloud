@@ -43,7 +43,8 @@ items below in scope (R5). This file records what shipped and how it was verifie
   valid tokens still work), each failure logged with the tailnet user behind Serve (ADR-024, PR #35; verified on
   BaileyServ 2026-11-24). Per-address limits are not possible behind Serve, where every peer is loopback
 - [x] Drop the deprecated `AC_TOKEN_FILE` (#640; BaileyServ confirmed off it 2026-11-24)
-- [ ] Per-job event stream (AG-UI via `rusty_agui`)
+- [ ] Per-job event stream (AG-UI via `rusty_agui`): `GET .../jobs/{job}/events` (ADR-010 addendum, #471); a live
+  check with an AG-UI client on BaileyServ is still to do
 - [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
 - [x] Fleet lifecycle and `ctr`/Kata adapter (`ac-fleet`, `ac-ctr`), tested against fakes and on the host
 
@@ -126,7 +127,7 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [ ] Each ended job's witness record (state, times, exit, changed paths, egress decisions) and its SHA-256,
   from outside the VM, through REST and MCP (ADR-029, #1065). To verify on BaileyServ: a job's egress counts
   match the proxy's journal
-- [ ] Web UI for agents and jobs: static in-repo pages over the existing API, six slices (ADR-030 proposed, #516)
+- [ ] Web UI for agents and jobs: static in-repo pages over the existing API, six slices (ADR-030 accepted 2026-11-25, #516). Slice 1: the agents page at `/ui/`.
 - [ ] Launch contract for untrusted agents ([launch-contract.md](launch-contract.md), #1066): the gateway calls,
   token, failures; tested end to end over HTTP with fakes; `scripts/untrusted-run.sh` for the host (#1067).
   Model access: `AC_JOB_MODEL_URL` sends credentialed jobs to LEL's gateway (ADR-028 addendum). Open: LEL's

@@ -439,6 +439,12 @@ How to use it:
    keyboard (the same lock as the terminal: one of the two pages holds it at a time); typing goes in as key
    presses, so paste by typing. Needs the image's `ffmpeg` and `xdotool` (ADR-006, desktop addendum).
 
+**Agents page** (ADR-030, #516): `http://localhost:8780/ui/` (or the tailnet HTTPS URL with `/ui/`). It asks for a
+token once, keeps it in memory only, and lists the agents that token is for, with their state and health. With
+`agents:write` it can create, pause, resume, destroy and purge them. Destroy and purge are confirmed first, and a
+pause or destroy refused because the agent has a job offers to retry with `force=true`, which interrupts the job.
+Without `agents:write` the page is read-only (and the gateway refuses the calls anyway).
+
 The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off).
 A probe answering within 10 s is healthy. Failures while the host is busy are logged "slow, host busy, not acting".
 Only 3 failures over 90 s on an idle host make it act. It first kills the gateway's own `ctr` clients for that
@@ -509,6 +515,7 @@ H | curl -sS -H @- $J/6b941feec45a4c25/output        # pong (the final message, 
 H | curl -sS -H @- "$J/6b941feec45a4c25/output?part=stream"   # the stream-json log
 H | curl -sS -H @- -X POST $J/6b941feec45a4c25/cancel
 H | curl -sS -H @- $J/6b941feec45a4c25/witness        # an ended job: record and sha256 (ADR-029)
+H | curl -sSN -H @- $J/6b941feec45a4c25/events        # the job as an AG-UI run (SSE), live; ?after=N resumes
 H | curl -sS -H @- $J                                # the agent's jobs, newest first
 ```
 

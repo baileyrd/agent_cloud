@@ -370,6 +370,13 @@ pub const ROUTES: &[Rule] = &[
         send: Send::Query,
         args: &[AGENT, JOB],
     }),
+    // A stream, so not an MCP tool (a tool call answers once).
+    rule(
+        "GET",
+        "/api/v1/agents/{id}/jobs/{job}/events",
+        S(JobsRead),
+        None,
+    ),
     rule("GET", "/api/v1/agents/{id}/term", S(ViewerRead), None),
     offer(rule("GET", "/api/v1/agents/{id}/history", S(ViewerRead), None), Tool {
         name: "get_history",
@@ -613,6 +620,7 @@ mod tests {
             ("GET", &format!("{job}/output"), S(JobsRead)),
             ("POST", &format!("{job}/cancel"), S(JobsWrite)),
             ("GET", &format!("{job}/witness"), S(JobsRead)),
+            ("GET", &format!("{job}/events"), S(JobsRead)),
             ("GET", "/api/v1/agents/a1/term", S(ViewerRead)),
             ("GET", "/api/v1/agents/a1/history", S(ViewerRead)),
             ("POST", &format!("{term}/window"), S(ViewerRead)),
@@ -633,7 +641,7 @@ mod tests {
         }
         assert_eq!(
             ROUTES.len(),
-            38,
+            39,
             "a new route needs a row above and in ADR-011"
         );
     }

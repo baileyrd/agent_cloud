@@ -36,3 +36,5 @@ rusty_libc = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42
 rusty_time = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }
 # JSON request bodies (job API). No serde: its own Value and parser.
 rusty_json = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555", default-features = false, features = ["std"] }
+# AG-UI events and SSE framing for the per-job event stream (#471). Same pin; no new third-party code.
+rusty_agui = { git = "https://github.com/Rusty-Mill/rusty_mill", rev = "84eeeb42faa1f41d4d7ae39ca7de47197f049555" }

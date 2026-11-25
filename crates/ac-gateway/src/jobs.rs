@@ -1245,6 +1245,9 @@ impl Jobs {
                 "ac-gateway: jobs: {}/{}: start snapshot: {e}",
                 j.agent, j.id
             );
+            // No compare will run, so the witness must not wait for one: a job that fills the
+            // disk cannot make its changes look merely pending.
+            self.keep_changes(&j.agent, &j.id, &witness::Changes::Failed);
         }
         if self
             .transition(&j.agent, &j.id, JobEvent::Start, None)
@@ -1534,8 +1537,13 @@ impl Jobs {
         if !dir.is_dir() {
             return;
         }
+        let path = dir.join(CHANGES_FILE);
+        // A compare that found no start snapshot says nothing new about a start that failed.
+        if *changes == witness::Changes::None && path.exists() {
+            return;
+        }
         let text = witness::render_changes(changes);
-        if let Err(e) = write_private(&dir.join(CHANGES_FILE), text.as_bytes()) {
+        if let Err(e) = write_private(&path, text.as_bytes()) {
             eprintln!("ac-gateway: jobs: {agent}/{id}: keeping changes: {e}");
         }
     }

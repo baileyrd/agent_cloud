@@ -1372,12 +1372,15 @@ job is queued or running; 404 for an unknown agent or job.
   whitespace or a control byte. A different layout takes `v2`.
 - *Changes:* what the job's compare found is kept in `<data>/jobs/<agent>/<job>/changes` (mode 0600) when it
   runs, beside the job's prompt and output, and pruned with them. `pending` until then: re-fetch for the final
-  record. `none` for a job that never started or a gateway without change tracking. `too_many` and `failed` say
+  record. `failed` at once if the start snapshot failed (a full disk), since no compare will run. `none` for a
+  job that never started or a gateway without change tracking. `too_many` and `failed` say
   so, as the history note does, so a job cannot hide what it did by breaking the listing.
 - *Egress:* the gateway reads `journalctl --unit=ac-egress.service` for the job's window, widened to whole
   seconds, and counts `allow` and `deny` lines tagged `agent=<id>` (ADR-016's per-agent credential). Other
   agents', unattributed (`agent=-`) and `error` lines are left out. A failed read, or more than 16 MiB of journal
-  for the window, gives `egress unavailable` rather than a partial count. A job's neighbour in the same second of
+  for the window, gives `egress unavailable` rather than a partial count. `ac-egress.service` sets
+  `LogRateLimitIntervalSec=0`, so journald's per-unit rate limit cannot drop decision lines when a job floods the
+  proxy; without it a count could fall short without saying so. A job's neighbour in the same second of
   the same agent can add to its counts; jobs of one agent never overlap otherwise.
 - *Left out on purpose:* the prompt, the result, the stream log and the job's `reason`. Each is agent-written or
   may quote agent-written text, and the record must hold only what the host observed.

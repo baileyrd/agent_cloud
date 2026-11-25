@@ -70,6 +70,8 @@ struct World {
     too_many: bool,
     /// Every compare fails (a `btrfs send` that timed out).
     diff_fails: bool,
+    /// Every start snapshot fails (a full disk).
+    begin_fails: bool,
     /// How many `leftovers` calls fail before one succeeds.
     leftovers_fail: usize,
     /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
@@ -170,6 +172,9 @@ impl JobRunner for Fake {
 
 impl Changes for Fake {
     fn begin(&self, _: &AgentId, job: &JobId) -> Result<(), String> {
+        if self.w().begin_fails {
+            return Err("btrfs subvolume snapshot: No space left on device".into());
+        }
         let paths = [
             ".jobs/j/prompt.txt",
             ".job-j.done",
@@ -695,6 +700,15 @@ fn a_witness_says_what_the_compare_could_not_list() {
             .0,
         404
     );
+    // Review of PR #41: a failed start snapshot means no compare will run; not `pending` forever.
+    r.fake.w().too_many = false;
+    r.fake.w().begin_fails = true;
+    let blind = r.ok("a1", "d");
+    r.jobs.tick();
+    r.fake.set(&blind, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    assert!(witness(&r, &blind).1.contains("\nchanges failed\n"));
 }
 
 /// Issue #26 review: a job whose listing is over the cap (a few hundred thousand files) still gets

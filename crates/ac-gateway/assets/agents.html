@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Agents</title>
+<link rel="stylesheet" href="/ui/ui.css">
+</head>
+<body>
+<header>
+  <strong>Agents</strong>
+  <span id="who"></span>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<main>
+  <form id="create" hidden>
+    <label for="new-id">New agent</label>
+    <input id="new-id" autocomplete="off" spellcheck="false" placeholder="id">
+    <button type="submit">Create</button>
+  </form>
+  <p id="note" role="status"></p>
+  <table>
+    <thead><tr><th>Agent</th><th>State</th><th>Health</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p id="empty" hidden>No agents for this token.</p>
+</main>
+<script src="/ui/ui.js"></script>
+<script src="/ui/agents.js"></script>
+</body>
+</html>

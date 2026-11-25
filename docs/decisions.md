@@ -1035,9 +1035,11 @@ copies those too.
   session store is wrapped (`ac_store::mirror::Mirrored`) so that every state change, and every start, rewrites
   `<data>/state/agents` whole and atomically (temp file, fsync, rename, 0600): one `<agent-id> <state>` line per
   agent. A reader always sees one consistent list. A failed copy is logged, not returned, since the state did
-  change; the next change rewrites it. Jobs are not copied: they are history, not what a host needs to come back.
+  change; the next change rewrites it. `ac-ctl`'s own lifecycle commands (run with the gateway stopped) go
+  through the same wrapper and rewrite it at start, so the copy never lags a change made there. Jobs are not copied: they are history, not what a host needs to come back.
 - *The two files* (`AC_TOKENS`, `AC_EGRESS_AGENTS`) are already replaced atomically by their writers, so a
-  plain read is consistent. Tokens hold digests only (ADR-011); the egress file holds per-boot proxy
+  plain read is consistent. `ac-backup.service` reads the gateway's env file, so it finds them where the
+  gateway does; a run that finds no tokens file warns. Tokens hold digests only (ADR-011); the egress file holds per-boot proxy
   credentials, which a new boot replaces anyway.
 - *Layout:* `<dest>/_state/<id>/` with `agents`, `tokens` and `egress-agents` (the ones the host has; the agent
   list is required) and a `MANIFEST` of `<sha256> <bytes> <file>` lines, all 0600. `_state` is not a valid
@@ -1045,13 +1047,19 @@ copies those too.
   leftover `.part` is removed by the next run. `--keep` applies: the newest `keep` stay. A failed state copy makes
   the run exit 1, like a workspace that was not backed up. `ac-ctl backups <dest>` lists them as `state <id>`.
 - *Restore:* `ac-ctl restore-state <dest> [<id>]` (default the newest). Refused while another process holds the
-  data directory (stop `ac-gateway`), when the registry already has an agent, when a tokens or egress file is
+  data directory (stop `ac-gateway`), when the registry has an agent the backup does not hold in the same state
+  (an empty registry, or one a restore cut short filled partly, is fine, so a failed restore can be run again),
+  when a tokens or egress file is
   there with other content (move it aside), and when any file fails its manifest. Every check runs before the
   first write. It writes the two files (0600), records each agent with its saved state, and rewrites the mirror.
   At its next start the gateway's reconcile marks agents recorded running but with no VM paused; restore
   their workspaces with `restore-backup`, then resume them.
 - *Rules* are pure (`ac_domain::state`: names, the agent list and manifest formats, verification); the file I/O
   is `ac-ctl`'s `state` module.
+- *What the manifest proves:* that the files were not corrupted, not that nobody changed them. Anyone who can
+  write the share can plant a tokens file with a matching manifest, so restore only from a share as trusted as
+  the host. On a CIFS share the files' modes come from the mount options (`file_mode=0600,dir_mode=0700`), not
+  from the 0600 that `ac-ctl` asks for.
 - *Not covered:* job records and history, the gateway env file, egress profiles and the base allowlist (operator
   config, kept in this repo's `deploy/` or by the operator).
 

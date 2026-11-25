@@ -86,8 +86,15 @@ fn save_state(b: &Backup, keep: usize) -> u8 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    match state::save(&state::Paths::from_env(&b.data), &b.dest, keep, now) {
+    let paths = state::Paths::from_env(&b.data);
+    match state::save(&paths, &b.dest, keep, now) {
         Ok(s) => {
+            if !s.files.contains(&ac_domain::state::TOKENS) {
+                eprintln!(
+                    "warning: no tokens file at {} (set AC_TOKENS if the gateway uses another path)",
+                    paths.source(ac_domain::state::TOKENS).display()
+                );
+            }
             let pruned = match s.pruned {
                 0 => String::new(),
                 n => format!("; {n} older deleted"),

@@ -38,7 +38,7 @@ impl Paths {
     }
 
     /// The host file a state backup's `name` comes from and goes back to.
-    fn source(&self, name: &str) -> PathBuf {
+    pub fn source(&self, name: &str) -> PathBuf {
         match name {
             AGENTS => ac_store::mirror::path(&self.data),
             TOKENS => self.tokens.clone(),
@@ -197,8 +197,9 @@ fn read_backup(dir: &Path) -> Result<Vec<(Entry, Vec<u8>)>, String> {
 }
 
 /// Put state backup `wanted` (default the newest) back. Refused while another process (the
-/// gateway) holds the data directory, when the registry has any agent, and when a tokens or
-/// egress file is already there with other content; every check runs before the first write.
+/// gateway) holds the data directory, when the registry has an agent the backup does not hold in
+/// the same state (so a restore cut short can be run again), and when a tokens or egress file is
+/// already there with other content; every check runs before the first write.
 pub fn restore(paths: &Paths, dest: &Path, wanted: Option<&BackupId>) -> Result<String, String> {
     let ids = list(dest)?;
     let id = match wanted {
@@ -211,21 +212,22 @@ pub fn restore(paths: &Paths, dest: &Path, wanted: Option<&BackupId>) -> Result<
         ac_store::IN_USE => format!("{}: stop ac-gateway first", e.cause),
         _ => e.to_string(),
     })?;
+    let agents = match files.iter().find(|(e, _)| e.name == AGENTS) {
+        Some((_, bytes)) => {
+            state::parse_agents(&String::from_utf8_lossy(bytes)).map_err(|e| e.to_string())?
+        }
+        None => Vec::new(),
+    };
     let present = store.list().map_err(|e| e.to_string())?;
-    if !present.is_empty() {
+    if let Some((agent, _)) = present.iter().find(|p| !agents.contains(p)) {
         return Err(format!(
-            "the registry in {} already has {} agent(s); restore-state only fills an empty one",
+            "the registry in {} already has {} agent(s), {agent} not as in this backup; \
+             restore-state only fills an empty registry or finishes its own restore",
             paths.data.display(),
             present.len()
         ));
     }
-    let mut agents = Vec::new();
-    for (entry, bytes) in &files {
-        if entry.name == AGENTS {
-            let text = String::from_utf8_lossy(bytes);
-            agents = state::parse_agents(&text).map_err(|e| e.to_string())?;
-            continue;
-        }
+    for (entry, bytes) in files.iter().filter(|(e, _)| e.name != AGENTS) {
         let to = paths.source(entry.name);
         if read_if_there(&to)?.is_some_and(|there| there != *bytes) {
             return Err(format!(
@@ -349,6 +351,28 @@ mod tests {
         }
     }
 
+    /// Review of PR #41: a restore cut short after recording some agents can be run again.
+    #[test]
+    fn a_restore_cut_short_can_be_run_again() {
+        let (src, dst, dest) = (tmp("src"), tmp("dst"), tmp("dest"));
+        save(&host(&src, true), &dest, 7, 1_795_000_000).unwrap_or_else(|e| panic!("{e}"));
+        let to = clean(&dst);
+        {
+            let store = EngineStore::open(&to.data).unwrap_or_else(|e| panic!("{e}"));
+            let _ = store.set_state(&a("a1"), State::Running);
+        }
+        let said = restore(&to, &dest, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(said.contains("2 agent(s)"), "{said}");
+        assert!(restore(&to, &dest, None).is_ok(), "and again");
+        assert_eq!(
+            agents(&to.data),
+            [(a("a1"), State::Running), (a("a2"), State::Paused)]
+        );
+        for d in [src, dst, dest] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     #[test]
     fn missing_egress_file_is_left_out_and_retention_keeps_the_newest() {
         let (src, dest) = (tmp("src"), tmp("dest"));
@@ -385,9 +409,16 @@ mod tests {
         let id = save(&from, &dest, 7, 1_795_000_000)
             .map(|s| s.id)
             .unwrap_or_else(|e| panic!("{e}"));
-        // A registry with agents.
+        // A registry with an agent the backup does not hold.
+        {
+            let store = EngineStore::open(&from.data).unwrap_or_else(|e| panic!("{e}"));
+            let _ = store.set_state(&a("a3"), State::Running);
+        }
         let e = restore(&from, &dest, None).err().unwrap_or_default();
-        assert!(e.contains("already has 2 agent(s)"), "{e}");
+        assert!(
+            e.contains("already has 3 agent(s), a3 not as in this backup"),
+            "{e}"
+        );
         // A gateway holding the data directory.
         let to = clean(&dst);
         let held = EngineStore::open(&to.data);

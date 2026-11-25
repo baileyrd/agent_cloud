@@ -31,6 +31,7 @@ use ac_domain::tune::{recommend, HostFacts};
 use ac_domain::AgentLimits;
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::PortError;
+use ac_store::mirror::Mirrored;
 use ac_store::EngineStore;
 use args::{Action, Cli, Command, Doctor, Job, Snap, Tune, USAGE};
 use platform_linux::LinuxSpawner;
@@ -109,12 +110,18 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let max = checkpoint_max()?;
     let snapshots = std::sync::Arc::new(CtrRuntime::new(LinuxSpawner, cfg.clone()));
-    let fleet = Fleet::new(
-        CtrRuntime::new(LinuxSpawner, cfg),
+    // Mirrored like the gateway's, so a change made here with the gateway stopped reaches the
+    // agent list that state backups copy.
+    let store = Mirrored::new(
         EngineStore::open(&cli.data)?,
-    )
-    .with_admission(Box::new(capacity), margin)
-    .with_snapshots(snapshots, max);
+        ac_store::mirror::path(&cli.data),
+    );
+    if let Err(e) = store.sync() {
+        eprintln!("ac-ctl: {e}");
+    }
+    let fleet = Fleet::new(CtrRuntime::new(LinuxSpawner, cfg), store)
+        .with_admission(Box::new(capacity), margin)
+        .with_snapshots(snapshots, max);
     let (action, id) = match &cli.job {
         Job::Agent(action, id) => (*action, id),
         Job::Snap(op) => return Ok(snap(&fleet, op)?),

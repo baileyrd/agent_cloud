@@ -436,7 +436,8 @@ How to use it:
    (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
 
 **Agents page** (ADR-030, #516): `http://localhost:8780/ui/` (or the tailnet HTTPS URL with `/ui/`). It asks for a
-token once, keeps it in memory only, and lists the agents that token is for, with their state and health. With
+token once, keeps it in memory only, and lists the agents that token is for, with their state and health, under a line of the host's capacity
+(`GET /api/v1/capacity`: room for more agents, `/dev/shm`, guest size and job slots). With
 `agents:write` it can create, pause, resume, destroy and purge them. Destroy and purge are confirmed first, and a
 pause or destroy refused because the agent has a job offers to retry with `force=true`, which interrupts the job.
 Without `agents:write` the page is read-only (and the gateway refuses the calls anyway). Each agent's id links

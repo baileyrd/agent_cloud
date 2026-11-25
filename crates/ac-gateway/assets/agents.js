@@ -1,5 +1,5 @@
 // The agents page (ADR-030 slice 1, #516): every agent the token is for, with its state and health,
-// and create, pause, resume, destroy and purge. Controls the token's scopes cannot use are hidden.
+// and create, pause, resume, destroy and purge; with slice 4, the host's capacity above the list. Controls the token's scopes cannot use are hidden.
 (() => {
   'use strict';
 
@@ -71,6 +71,20 @@
     return tr;
   }
 
+  // The host's admission figures (ADR-012) and job slots, as one line.
+  function capacity(c) {
+    const parts = [
+      `room for ${c.max_more_agents} more agent${c.max_more_agents === 1 ? '' : 's'}`,
+      `${c.running_agents} running`,
+      `/dev/shm ${c.shm_free_mib} of ${c.shm_total_mib} MiB free`,
+      `${c.guest_mib} MiB per guest`,
+    ];
+    if (c.max_running_jobs !== undefined) {
+      parts.push(`jobs: ${c.running_jobs} of ${c.max_running_jobs} running, ${c.queued_jobs} queued`);
+    }
+    return parts.join(' · ');
+  }
+
   async function refresh() {
     const r = await api('GET', '/api/v1/agents');
     if (!r.ok) {
@@ -79,6 +93,9 @@
     }
     $('rows').replaceChildren(...r.data.agents.map(row));
     $('empty').hidden = r.data.agents.length > 0;
+    const c = await api('GET', '/api/v1/capacity');
+    $('capacity').hidden = !c.ok;
+    $('capacity').textContent = c.ok ? capacity(c.data) : '';
   }
 
   async function create(event) {

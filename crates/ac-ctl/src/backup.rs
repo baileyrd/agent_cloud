@@ -1,6 +1,7 @@
-//! `ac-ctl backup`, `backups` and `restore-backup` (ADR-021). None of them opens the registry, so
-//! they run beside `ac-gateway`; a backup and a restore hold `<data>/backup.lock` against each
-//! other.
+//! `ac-ctl backup`, `backups`, `restore-backup` and `restore-state` (ADR-021). The first three
+//! never open the registry, so they run beside `ac-gateway`; a backup of every agent also copies
+//! the control-plane state ([`crate::state`]), and `restore-state` needs the gateway stopped. A
+//! backup and a restore hold `<data>/backup.lock` against each other.
 
 use std::path::Path;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use platform_linux::LinuxSpawner;
 use rusty_multimodal_db_engine::dir_lock::{DirLock, DirLockError};
 
 use crate::args::{Backup, BackupOp};
+use crate::state;
 
 type Rt = CtrRuntime<LinuxSpawner>;
 
@@ -59,12 +61,50 @@ pub fn run(b: &Backup, max_checkpoints: usize) -> Result<u8, String> {
             full_every,
         } => {
             let _held = lock(&b.data)?;
-            send(&rt, &b.dest, agents, *keep, *full_every)
+            let sent = send(&rt, &b.dest, agents, *keep, *full_every)?;
+            match agents.is_empty() {
+                true => Ok(sent.max(save_state(b, *keep))),
+                false => Ok(sent),
+            }
         }
         BackupOp::List(agent) => list(&rt, &b.dest, agent.as_ref()),
+        BackupOp::RestoreState(wanted) => {
+            let _held = lock(&b.data)?;
+            let paths = state::Paths::from_env(&b.data);
+            println!("{}", state::restore(&paths, &b.dest, wanted.as_ref())?);
+            Ok(0)
+        }
         BackupOp::Restore(id, wanted) => {
             let _held = lock(&b.data)?;
             restore(&rt, &b.dest, id, wanted.as_ref(), max_checkpoints)
+        }
+    }
+}
+
+/// Copy the control-plane state; 0, or 1 if it failed (reported here).
+fn save_state(b: &Backup, keep: usize) -> u8 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let paths = state::Paths::from_env(&b.data);
+    match state::save(&paths, &b.dest, keep, now) {
+        Ok(s) => {
+            if !s.files.contains(&ac_domain::state::TOKENS) {
+                eprintln!(
+                    "warning: no tokens file at {} (set AC_TOKENS if the gateway uses another path)",
+                    paths.source(ac_domain::state::TOKENS).display()
+                );
+            }
+            let pruned = match s.pruned {
+                0 => String::new(),
+                n => format!("; {n} older deleted"),
+            };
+            println!("state backed up {} ({}{pruned})", s.id, s.files.join(", "));
+            0
+        }
+        Err(e) => {
+            eprintln!("state not backed up: {e}");
+            1
         }
     }
 }
@@ -145,7 +185,12 @@ fn agents_at(dest: &Path) -> Result<Vec<AgentId>, String> {
 fn list(rt: &Rt, dest: &Path, agent: Option<&AgentId>) -> Result<u8, String> {
     let ids = match agent {
         Some(id) => vec![id.clone()],
-        None => agents_at(dest)?,
+        None => {
+            for id in state::list(dest)? {
+                println!("state {id}");
+            }
+            agents_at(dest)?
+        }
     };
     for id in ids {
         let streams = rt.streams(dest, &id).map_err(|e| e.to_string())?;

@@ -287,6 +287,28 @@ The log's `agent=` field is the agent the credential named. It is `-` without a 
 and gets the base list: pause and resume it through the gateway. `ac-ctl doctor` checks the agents file's mode
 and that every attached profile is installed.
 
+*Gateway-only agents* (ADR-016 addendum, for untrusted Let Em Loose agents): a profile can name one MCP gateway
+and drop the base list. Write it with your gateway's own name and port (another machine, not this host):
+
+```bash
+printf '!exclusive\nendpoint <gateway-host>:<port>\n' | sudo tee /etc/agent-cloud/egress/profiles/gateway.txt >/dev/null
+sudo chmod 0600 /etc/agent-cloud/egress/profiles/gateway.txt
+curl -sS -H "Authorization: Bearer $TOKEN" -X PUT --data-binary '{"profiles":["gateway"]}' \
+    http://127.0.0.1:8780/api/v1/agents/a1/egress
+# {"id":"a1","profiles":["gateway"],"effective_hosts":1}   add "rust" etc. for package mirrors
+```
+
+The proxy's unit denies private destinations as a second line of defence, so allow the gateway's address too
+(its tailnet address, from `tailscale ip -4 <gateway-host>`), then restart it:
+
+```bash
+sudo systemctl edit ac-egress        # add:  [Service]  IPAddressAllow=<gateway address>/32
+sudo systemctl restart ac-egress
+```
+
+The agent then reaches that host on that port only (also on the tailnet or LAN), and nothing else: not the model
+API, not GitHub, not the gateway host on any other port.
+
 *Upgrading (install order):* install the proxy first, then the profiles, then the gateway. Either order is safe.
 A new proxy with an old gateway finds no agents file and gives everyone the base list. A new gateway with an old
 proxy hands out credentials the old proxy ignores, so attachments do nothing until the proxy is upgraded.
@@ -507,6 +529,7 @@ H | curl -sS -H @- "$J/6b941feec45a4c25?wait=30"     # returns when the state ch
 H | curl -sS -H @- $J/6b941feec45a4c25/output        # pong (the final message, plain text)
 H | curl -sS -H @- "$J/6b941feec45a4c25/output?part=stream"   # the stream-json log
 H | curl -sS -H @- -X POST $J/6b941feec45a4c25/cancel
+H | curl -sS -H @- $J/6b941feec45a4c25/witness        # an ended job: record and sha256 (ADR-029)
 H | curl -sS -H @- $J                                # the agent's jobs, newest first
 ```
 
@@ -594,7 +617,21 @@ sudo ac-ctl restore-backup /mnt/agent-backups a1                   # the newest;
 # a1 restored backup 20261028-130512; the workspace it replaced is checkpoint 20261029-091502
 ```
 
-then resume it. On a new host, or after a purge, the restore makes the workspace and `create` boots it. To check
+then resume it. On a new host, or after a purge, the restore makes the workspace and `create` boots it.
+
+A run with no agent named also copies the control-plane state to `<dest>/_state/<id>/`: the agent list the
+gateway keeps in `<data>/state/agents`, the tokens file and the egress agents file, with a manifest of checksums
+(ADR-021 addendum). To rebuild a lost host, install it, then before the first gateway start:
+
+```bash
+sudo ac-ctl restore-state /mnt/agent-backups                       # the newest; or name one
+# restored state 20261125-033000: 2 agent(s); agents, tokens, egress-agents. Start ac-gateway: ...
+sudo systemctl start ac-gateway                                    # agents that were running come back paused
+sudo ac-ctl restore-backup /mnt/agent-backups a1                   # then each workspace, and resume it
+```
+
+It refuses while the gateway runs, if the registry already has agents, or if a tokens or egress file is there
+with other content. To check
 the btrfs side on a new host: `sudo scripts/btrfs-backup-test.sh` (loopback filesystems, removed after).
 
 **Post-reboot check:** `sudo scripts/post-reboot-check.sh` prints PASS or FAIL per line and exits non-zero on

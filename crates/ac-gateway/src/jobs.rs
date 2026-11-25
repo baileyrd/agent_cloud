@@ -2,14 +2,17 @@
 //! result, without exec-ing into the VM by hand.
 //!
 //! Routes (bearer token required), under `/api/v1/agents/{id}/`:
-//! - `POST jobs` `{"prompt", "timeout_secs"?, "idempotency_key"?}`: 202 and the job (200 and the
-//!   existing job for a known key);
+//! - `POST jobs` `{"prompt", "timeout_secs"?, "idempotency_key"?, "credential"?}`: 202 and the job
+//!   (200 and the existing job for a known key). A `credential` (ADR-028) is an opaque string the
+//!   job's process finds in the file `$AC_JOB_CREDENTIAL_FILE`, on the guest's tmpfs, for as long
+//!   as the job runs; it is never stored, logged or shown, and is redacted from collected output;
 //! - `GET jobs`: the agent's jobs, newest first;
 //! - `GET jobs/{job}[?wait=N]`: the job; with `wait` (at most 30 s), once its state changes. A
 //!   queued job says why it waits in `queued_reason` (ADR-013; `null` until the supervisor's next
 //!   tick, within a second);
 //! - `GET jobs/{job}/output[?part=stream]`: the final message, or the stream-json log, as text;
-//! - `POST jobs/{job}/cancel`.
+//! - `POST jobs/{job}/cancel`;
+//! - `GET jobs/{job}/witness`: an ended job's witness record and its SHA-256 (ADR-029).
 //!
 //! A queued job starts when its agent is free and the host-wide gate is open ([`schedule`]): fewer
 //! than `max_running` jobs run, the CPU is not saturated, and the last start was long enough ago.
@@ -38,12 +41,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ac_ctr::CtrRuntime;
 use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
-use ac_domain::job;
+use ac_domain::job::{self, Credential};
 use ac_domain::schedule::{self, Limits, Wait};
+use ac_domain::witness::{self, EgressSource};
 use ac_domain::{AgentId, Job, JobEvent, JobId, JobState, State};
 use ac_ports::{HostLoad, JobStore, SessionStore};
 use platform::process::Spawner;
 use rusty_json::Value;
+use rusty_sha2::{Hash, Sha256};
 
 use crate::{error, escape, Busy, JobCounts, Reply};
 
@@ -51,6 +56,8 @@ use crate::{error, escape, Busy, JobCounts, Reply};
 pub const MAX_QUEUE: usize = 8;
 /// Finished jobs kept per agent (registry records and host copies).
 pub const KEEP: usize = 20;
+/// Where a job's compare result is kept in its host directory, for its witness record.
+pub const CHANGES_FILE: &str = "changes";
 /// Longest `?wait=`.
 pub const MAX_WAIT_SECS: u64 = 30;
 /// Long-polls at once; more are refused, so they cannot take the lifecycle API's connections.
@@ -71,6 +78,29 @@ const MARKER_RETRY: Duration = Duration::from_secs(3);
 const STATUS_LIMIT: Duration = Duration::from_secs(10);
 /// Added to the job's timeout for the runner's own `timeout`, a backstop for a stopped gateway.
 const BACKSTOP_SECS: u32 = 300;
+/// In a job's host directory: the job was submitted with a credential (empty; never the secret).
+const NEEDS_CREDENTIAL: &str = "needs-credential";
+/// What stands in for a credential in collected output.
+pub const REDACTED: &[u8] = b"[credential redacted]";
+
+/// `bytes` with every occurrence of `secret` replaced by [`REDACTED`].
+pub fn redact(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
+    if secret.is_empty() {
+        return bytes.to_vec();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(secret) {
+            out.extend_from_slice(REDACTED);
+            i += secret.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
 
 /// Default `AC_JOB_ALLOWED_TOOLS`: read, search and edit files; `git` without push; `ls`, `cat`;
 /// `python3` and `cargo` (both run arbitrary code as the agent user, inside the VM); `sleep`.
@@ -80,12 +110,21 @@ pub const DEFAULT_TOOLS: &str = "Read,Glob,Grep,Edit,Write,Bash(git status:*),Ba
 /// Permission modes a job may use without `AC_JOB_UNSAFE=1`.
 const MODES: [&str; 5] = ["acceptEdits", "auto", "dontAsk", "manual", "plan"];
 
-/// Start a job, as the agent user (argv: this, the runner script, the job id, the backstop
-/// timeout, then `claude`'s permission flags). Refuses a job whose directory exists, so a job
-/// never starts twice. Keeps the newest 5 job directories.
+/// Start a job, as the agent user (argv: this, the runner script, the job id, `1` if a credential
+/// follows on stdin else `0`, the backstop timeout, then `claude`'s permission flags). Refuses a
+/// job whose directory exists, so a job never starts twice. Keeps the newest 5 job directories.
+/// A credential is read as one line from stdin (which never reaches EOF, see `exec_once`) and
+/// written, last before the window opens, to `/dev/shm/ac-job-<id>/credential`, 0600 in a 0700
+/// directory, on the guest's tmpfs: never in the workspace, so never in a snapshot, backup or
+/// change note. A start that fails after that removes it again (and the gateway's kill does too,
+/// for a start the exec timeout cut short).
 const START: &str = r#"set -eu
-run=$1 id=$2
-shift 2
+run=$1 id=$2 cred=$3
+shift 3
+c=/dev/shm/ac-job-$id
+secret=
+if [ "$cred" = 1 ]; then IFS= read -r secret; fi
+trap 'rc=$?; [ "$rc" = 0 ] || rm -rf -- "$c"' EXIT
 cd /workspace
 mkdir -p -m 700 .jobs
 mkdir -m 700 ".jobs/$id"
@@ -93,19 +132,37 @@ mv ".job-$id.prompt" ".jobs/$id/prompt.txt"
 ls -1t .jobs | grep -E '^[a-z0-9-]+$' | tail -n +6 | while read -r old; do rm -rf -- ".jobs/$old"; done
 rm -f -- .job-*.done
 tmux has-session -t main 2>/dev/null || tmux new-session -d -s main -c /workspace
-tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$@""#;
+if [ "$cred" = 1 ]; then
+    rm -rf -- "$c"
+    (umask 077 && mkdir "$c" && printf '%s' "$secret" > "$c/credential")
+fi
+unset secret
+tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$cred" "$@""#;
 
 /// The job's window (bash): `claude` reads the prompt on stdin; its log is capped at 16 MiB (a
-/// job that passes it is stopped); the terminal shows a digest. `exit_code` is written last, then
+/// job that passes it is stopped); the terminal shows a digest. With a credential, its log is
+/// redacted line by line before it is stored or shown, so the raw secret never reaches the
+/// workspace's `stream.jsonl` or `result.txt` (whole stream-json lines, so no split matches; its
+/// characters need no JSON escaping and only `.` and `/` need escaping for `sed`). The job's credential file goes as
+/// soon as `claude` exits, before the job reports that it ended (and on any exit of the window). `exit_code` is written last, then
 /// the marker `.job-<id>.done` in the workspace root, which the gateway sees without an exec.
-const RUN: &str = r#"id=$1 secs=$2
-shift 2
+const RUN: &str = r#"id=$1 cred=$2 secs=$3
+shift 3
 d=/workspace/.jobs/$id
+c=/dev/shm/ac-job-$id
+trap 'rm -rf -- "$c"' EXIT
+redact() { cat; }
+if [ "$cred" = 1 ]; then
+    export AC_JOB_CREDENTIAL_FILE=$c/credential
+    pat=$(sed 's/[./]/\\&/g' "$c/credential")
+    redact() { sed -u "s/$pat/[credential redacted]/g"; }
+fi
 show='fromjson? | if .type == "assistant" then (.message.content[]? | if .type == "text" then .text + "\n" elif .type == "tool_use" then "> " + .name + " " + (.input | tostring | .[0:160]) + "\n" else empty end) elif .type == "result" then "--- " + (.subtype // "result") + "\n" else empty end'
 printf 'job %s started %s\n' "$id" "$(date -u +%FT%TZ)"
 timeout -k 10 "$secs" claude -p --output-format stream-json --verbose "$@" < "$d/prompt.txt" \
-    | head -c 16777216 | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
+    | redact | head -c 16777216 | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
 rc=${PIPESTATUS[0]}
+rm -rf -- "$c"
 jq -Rrj 'fromjson? | select(.type == "result") | .result // empty' "$d/stream.jsonl" \
     | head -c 262144 > "$d/result.txt"
 printf '%s\n' "$rc" > "$d/exit_code.tmp"
@@ -124,11 +181,12 @@ f=/workspace/.jobs/$id/exit_code
 if [ -f "$f" ]; then printf 'exit %s\n' "$(head -c 12 "$f" | tr -dc 0-9-)"; exit 0; fi
 echo gone"#;
 
-/// Kill a job's window (found by name, then addressed by its id, as in [`STATUS`]): its process
-/// tree (by parent pid) and the pane's session, stopped first so nothing forks meanwhile, then
+/// Kill a job's window (found by name, then addressed by its id, as in [`STATUS`]) and remove its
+/// credential file (first, and again once the processes are gone): its process tree (by parent pid) and the pane's session, stopped first so nothing forks meanwhile, then
 /// killed; the window closed. Prints `killed` once every one of them
 /// is gone (zombies count as gone), `gone` if there was no window, else fails.
-const KILL: &str = r#"w=$(tmux list-windows -t main -F '#{window_name} #{window_id} #{pane_pid}' 2>/dev/null | sed -n "s/^job-$1 //p" | head -n 1)
+const KILL: &str = r#"rm -rf -- "/dev/shm/ac-job-$1"
+w=$(tmux list-windows -t main -F '#{window_name} #{window_id} #{pane_pid}' 2>/dev/null | sed -n "s/^job-$1 //p" | head -n 1)
 [ -n "$w" ] || { echo gone; exit 0; }
 t=${w% *} pid=${w#* }
 all=$pid new=$pid
@@ -147,7 +205,7 @@ while [ "$i" -lt 30 ]; do
         s=$(ps -o stat= -p "$p" 2>/dev/null) || continue
         case $s in Z*) ;; *) left="$left $p" ;; esac
     done
-    [ -z "$left" ] && { echo killed; exit 0; }
+    [ -z "$left" ] && { rm -rf -- "/dev/shm/ac-job-$1"; echo killed; exit 0; }
     i=$((i + 1))
     sleep 0.1
 done
@@ -199,12 +257,14 @@ impl Part {
 /// How the gateway reaches a job in its agent. Implemented over `ctr` for [`CtrRuntime`]; tests
 /// use a fake.
 pub trait JobRunner: Send + Sync + 'static {
-    /// Put `prompt` in the agent's workspace and open the job's window; returns once it is open.
+    /// Put `prompt` in the agent's workspace, `credential` (if any) on the guest's tmpfs, and
+    /// open the job's window; returns once it is open.
     fn start(
         &self,
         agent: &AgentId,
         job: &JobId,
         prompt: &[u8],
+        credential: Option<&Credential>,
         timeout_secs: u32,
         claude: &[String],
     ) -> Result<(), String>;
@@ -213,7 +273,8 @@ pub trait JobRunner: Send + Sync + 'static {
     fn finished(&self, agent: &AgentId, job: &JobId) -> bool;
     /// Whether the job still runs (an exec).
     fn status(&self, agent: &AgentId, job: &JobId) -> Result<Probe, String>;
-    /// Kill the job's processes and close its window; fails unless they are gone.
+    /// Kill the job's processes, close its window and remove its credential file; fails unless
+    /// they are gone.
     fn kill(&self, agent: &AgentId, job: &JobId) -> Result<(), String>;
     /// Up to [`RESULT_CAP`] bytes of the result, or the last [`STREAM_CAP`] of the log.
     fn read(&self, agent: &AgentId, job: &JobId, part: Part) -> Result<Vec<u8>, String>;
@@ -257,6 +318,20 @@ impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
 
     fn leftovers(&self) -> Result<Vec<(AgentId, JobId)>, String> {
         self.job_leftovers().map_err(|e| e.to_string())
+    }
+}
+
+/// The egress proxy's log for a time window (ADR-029), for witness records. Implemented over
+/// the journal for [`CtrRuntime`]; tests use a fake.
+pub trait EgressLog: Send + Sync + 'static {
+    /// The proxy's log lines from `since_ms` to `until_ms`, possibly a little wider.
+    fn between(&self, since_ms: u64, until_ms: u64) -> Result<String, String>;
+}
+
+impl<S: Spawner + Send + Sync + 'static> EgressLog for CtrRuntime<S> {
+    fn between(&self, since_ms: u64, until_ms: u64) -> Result<String, String> {
+        self.egress_journal(since_ms, until_ms)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -313,6 +388,7 @@ impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
         agent: &AgentId,
         job: &JobId,
         prompt: &[u8],
+        credential: Option<&Credential>,
         timeout_secs: u32,
         claude: &[String],
     ) -> Result<(), String> {
@@ -340,14 +416,33 @@ impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
             return Err(format!("{}: {e}", path.display()));
         }
         let secs = (timeout_secs + BACKSTOP_SECS).to_string();
-        let mut args = vec!["sh", "-c", START, "ac-job-start", RUN, job.as_str(), &secs];
+        let (flag, input) = match credential {
+            Some(c) => ("1", format!("{}\n", c.expose())),
+            None => ("0", String::new()),
+        };
+        let mut args = vec![
+            "sh",
+            "-c",
+            START,
+            "ac-job-start",
+            RUN,
+            job.as_str(),
+            flag,
+            &secs,
+        ];
         args.extend(claude.iter().map(String::as_str));
-        self.exec_once("job start", agent, &args, Duration::from_secs(30))
-            .map(drop)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&path);
-                e.to_string()
-            })
+        self.exec_once_with_input(
+            "job start",
+            agent,
+            &args,
+            input.as_bytes(),
+            Duration::from_secs(30),
+        )
+        .map(drop)
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&path);
+            e.to_string()
+        })
     }
 
     fn finished(&self, agent: &AgentId, job: &JobId) -> bool {
@@ -452,6 +547,8 @@ pub enum Route {
     Output(AgentId, JobId),
     /// `POST .../jobs/{job}/cancel`.
     Cancel(AgentId, JobId),
+    /// `GET .../jobs/{job}/witness`.
+    Witness(AgentId, JobId),
 }
 
 /// Parse a job route: `None` if `path` is not one.
@@ -478,7 +575,8 @@ pub fn route(method: &str, path: &str) -> Option<Result<Route, Reply>> {
         ("GET", [_], Some(j)) => Route::Get(id, j),
         ("GET", [_, "output"], Some(j)) => Route::Output(id, j),
         ("POST", [_, "cancel"], Some(j)) => Route::Cancel(id, j),
-        (_, [] | [_] | [_, "output" | "cancel"], _) => {
+        ("GET", [_, "witness"], Some(j)) => Route::Witness(id, j),
+        (_, [] | [_] | [_, "output" | "cancel" | "witness"], _) => {
             return Some(Err(error(405, "method not allowed")))
         }
         _ => return Some(Err(error(404, "not found"))),
@@ -495,9 +593,12 @@ pub struct Request {
     pub timeout_secs: u32,
     /// The caller's idempotency key.
     pub key: Option<String>,
+    /// The job's credential (ADR-028).
+    pub credential: Option<Credential>,
 }
 
-/// Parse `{"prompt", "timeout_secs"?, "idempotency_key"?}`; unknown members are refused.
+/// Parse `{"prompt", "timeout_secs"?, "idempotency_key"?, "credential"?}`; unknown members are
+/// refused.
 pub fn parse_request(body: &[u8]) -> Result<Request, Reply> {
     let bad = |m: &str| error(400, m);
     let text = std::str::from_utf8(body).map_err(|_| bad("body is not UTF-8"))?;
@@ -505,10 +606,12 @@ pub fn parse_request(body: &[u8]) -> Result<Request, Reply> {
     let Some(obj) = value.as_object() else {
         return Err(bad("body must be a JSON object"));
     };
-    if let Some(k) = obj
-        .keys()
-        .find(|k| !matches!(k.as_str(), "prompt" | "timeout_secs" | "idempotency_key"))
-    {
+    if let Some(k) = obj.keys().find(|k| {
+        !matches!(
+            k.as_str(),
+            "prompt" | "timeout_secs" | "idempotency_key" | "credential"
+        )
+    }) {
         return Err(bad(&format!("unknown member {k:?}")));
     }
     let prompt = match value.get("prompt") {
@@ -535,10 +638,16 @@ pub fn parse_request(body: &[u8]) -> Result<Request, Reply> {
         }
         Some(_) => return Err(bad("idempotency_key must be a string")),
     };
+    let credential = match value.get("credential") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) => Some(Credential::parse(c).map_err(|e| bad(&e.to_string()))?),
+        Some(_) => return Err(bad("credential must be a string")),
+    };
     Ok(Request {
         prompt,
         timeout_secs,
         key,
+        credential,
     })
 }
 
@@ -572,6 +681,7 @@ pub struct Jobs {
     agents: Arc<dyn SessionStore + Send + Sync>,
     runner: Box<dyn JobRunner>,
     changes: Option<Box<dyn Changes>>,
+    egress: Option<Box<dyn EgressLog>>,
     dir: PathBuf,
     claude: Vec<String>,
     notes: Notes,
@@ -594,6 +704,8 @@ pub struct Jobs {
     /// Ended jobs whose changes are still to be compared ([`Jobs::diff_next`]).
     diffs: Mutex<Diffs>,
     queued: Condvar,
+    /// Credentials of jobs not yet ended (by job id), in memory only (ADR-028).
+    secrets: Mutex<HashMap<String, Credential>>,
 }
 
 /// Telling an earlier run's leftover snapshots from this run's jobs, by what this run did rather
@@ -671,6 +783,7 @@ impl Jobs {
             agents,
             runner: Box::new(runner),
             changes: None,
+            egress: None,
             dir,
             claude,
             notes: Box::new(|_, _| {}),
@@ -686,7 +799,15 @@ impl Jobs {
             waiters: AtomicUsize::new(0),
             diffs: Mutex::new(Diffs::default()),
             queued: Condvar::new(),
+            secrets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Read each witness record's egress decisions from `log` (ADR-029). Without this, records
+    /// say `egress unavailable`.
+    pub fn with_egress_log(mut self, log: impl EgressLog) -> Self {
+        self.egress = Some(Box::new(log));
+        self
     }
 
     /// Record state changes with `notes` (the agent's history log).
@@ -757,10 +878,13 @@ impl Jobs {
             req.key,
         );
         let saved = self
-            .save_prompt(&j, req.prompt.as_bytes())
+            .save_prompt(&j, req.prompt.as_bytes(), req.credential.is_some())
             .and_then(|()| self.store.put_job(&j).map_err(|e| e.to_string()));
         if let Err(e) = saved {
             return error(500, &e);
+        }
+        if let Some(c) = req.credential {
+            self.secrets().insert(j.id.to_string(), c);
         }
         (self.notes)(agent, &format!("job {} queued", j.id));
         self.changed.notify_all();
@@ -783,6 +907,7 @@ impl Jobs {
                 Some(_) => error(400, "part must be result or stream"),
             },
             Route::Cancel(id, job) => self.cancel(&id, &job),
+            Route::Witness(id, job) => self.witness(&id, &job),
         };
         Answer::Json(reply)
     }
@@ -847,7 +972,7 @@ impl Jobs {
                 Answer::Json(error(409, "job is running; its result comes when it ends"))
             }
             (JobState::Running, Part::Stream) => match self.runner.read(agent, id, part) {
-                Ok(bytes) => Answer::Output(bytes),
+                Ok(bytes) => Answer::Output(self.redact(&j, bytes)),
                 Err(_) => Answer::Output(Vec::new()),
             },
             _ => Answer::Output(
@@ -872,6 +997,71 @@ impl Jobs {
         match self.transition(agent, id, JobEvent::Cancel, Some("cancelled by a caller")) {
             Ok(j) => ok(200, self.render(&j)),
             Err(reply) => reply,
+        }
+    }
+
+    /// An ended job's witness record (ADR-029) and its SHA-256, from the registry, the changes
+    /// kept when its compare ran and the proxy's log for its agent while it ran. Nothing the
+    /// agent wrote is read. 409 until the job ends; `changes pending` until its compare has run.
+    fn witness(&self, agent: &AgentId, id: &JobId) -> Reply {
+        let j = match self.find(agent, id) {
+            Ok(j) => j,
+            Err(reply) => return reply,
+        };
+        if !j.state.is_terminal() {
+            return error(
+                409,
+                &format!(
+                    "job {id} is {}; its witness comes when it ends",
+                    j.state.name()
+                ),
+            );
+        }
+        let changes = match self.kept_changes(&j) {
+            Ok(changes) => changes,
+            Err(e) => return error(500, &format!("job {id} changes: {e}")),
+        };
+        let record = witness::render(&j, &changes, &self.egress_of(&j));
+        let digest: String = Sha256::digest(record.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        ok(
+            200,
+            format!(
+                r#"{{"record":{},"sha256":"{digest}"}}"#,
+                Value::from(record).to_json_string()
+            ),
+        )
+    }
+
+    /// What the job's compare found, as kept in its host directory by [`Jobs::diff_next`].
+    fn kept_changes(&self, j: &Job) -> Result<witness::Changes, String> {
+        if j.started_ms.is_none() || self.changes.is_none() {
+            return Ok(witness::Changes::None);
+        }
+        match std::fs::read_to_string(self.job_dir(j).join(CHANGES_FILE)) {
+            Ok(text) => witness::parse_changes(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(witness::Changes::Pending),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The proxy's decisions for the job's agent while it ran; none for a job that never started.
+    fn egress_of(&self, j: &Job) -> EgressSource {
+        let Some(log) = &self.egress else {
+            return EgressSource::Unavailable;
+        };
+        let Some(started) = j.started_ms else {
+            return EgressSource::Journal(Vec::new());
+        };
+        let finished = j.finished_ms.unwrap_or(started).max(started);
+        match log.between(started, finished) {
+            Ok(text) => EgressSource::Journal(witness::decisions(&text, &j.agent)),
+            Err(e) => {
+                eprintln!("ac-gateway: jobs: {}/{}: egress log: {e}", j.agent, j.id);
+                EgressSource::Unavailable
+            }
         }
     }
 
@@ -1036,7 +1226,13 @@ impl Jobs {
             }
             Ok(Probe::Exited(Some(code))) => (JobEvent::Exit(code), None),
             Ok(Probe::Exited(None)) => (JobEvent::Fail, Some("unreadable exit code")),
-            Ok(Probe::Gone) => (JobEvent::Fail, Some("runner ended without an exit code")),
+            Ok(Probe::Gone) => {
+                // The window went without the runner's own cleanup: remove the credential file.
+                if let Err(e) = self.runner.kill(&j.agent, &j.id) {
+                    eprintln!("ac-gateway: jobs: {}/{}: cleanup: {e}", j.agent, j.id);
+                }
+                (JobEvent::Fail, Some("runner ended without an exit code"))
+            }
         };
         self.collect(j);
         let _ = self.transition(&j.agent, &j.id, event, why);
@@ -1049,6 +1245,9 @@ impl Jobs {
                 "ac-gateway: jobs: {}/{}: start snapshot: {e}",
                 j.agent, j.id
             );
+            // No compare will run, so the witness must not wait for one: a job that fills the
+            // disk cannot make its changes look merely pending.
+            self.keep_changes(&j.agent, &j.id, &witness::Changes::Failed);
         }
         if self
             .transition(&j.agent, &j.id, JobEvent::Start, None)
@@ -1059,13 +1258,37 @@ impl Jobs {
             }
             return;
         }
+        let credential = match self.credential(j) {
+            Ok(credential) => credential,
+            Err(e) => {
+                let why = format!("start failed: {e}");
+                let _ = self.transition(&j.agent, &j.id, JobEvent::Fail, Some(&why));
+                return;
+            }
+        };
         let started = std::fs::read(self.job_dir(j).join("prompt.txt"))
             .map_err(|e| format!("prompt: {e}"))
             .and_then(|prompt| {
-                self.runner
-                    .start(&j.agent, &j.id, &prompt, j.timeout_secs, &self.claude)
+                self.runner.start(
+                    &j.agent,
+                    &j.id,
+                    &prompt,
+                    credential.as_ref(),
+                    j.timeout_secs,
+                    &self.claude,
+                )
             });
         if let Err(e) = started {
+            // A start cut short (a failed step, the exec timeout) may have left the credential
+            // file in the guest's tmpfs with no window whose exit would remove it.
+            if credential.is_some() {
+                if let Err(k) = self.runner.kill(&j.agent, &j.id) {
+                    eprintln!(
+                        "ac-gateway: jobs: {}/{}: cleanup after a failed start: {k}",
+                        j.agent, j.id
+                    );
+                }
+            }
             let why = format!("start failed: {e}");
             let _ = self.transition(&j.agent, &j.id, JobEvent::Fail, Some(&why));
         }
@@ -1074,10 +1297,9 @@ impl Jobs {
     /// Copy the capped result and log to the host, so they outlive the VM.
     fn collect(&self, j: &Job) {
         for part in [Part::Result, Part::Stream] {
-            let copied = self
-                .runner
-                .read(&j.agent, &j.id, part)
-                .and_then(|bytes| write_private(&self.job_dir(j).join(part.file()), &bytes));
+            let copied = self.runner.read(&j.agent, &j.id, part).and_then(|bytes| {
+                write_private(&self.job_dir(j).join(part.file()), &self.redact(j, bytes))
+            });
             if let Err(e) = copied {
                 eprintln!(
                     "ac-gateway: jobs: {}/{}: {}: {e}",
@@ -1143,6 +1365,7 @@ impl Jobs {
         (self.notes)(agent, &note);
         if j.state.is_terminal() {
             book.remove(id.as_str());
+            self.secrets().remove(id.as_str());
             self.prune(agent);
         }
         drop(book);
@@ -1250,17 +1473,25 @@ impl Jobs {
         let (Some((agent, id)), Some(changes)) = (next, &self.changes) else {
             return false;
         };
-        match changes.diff(&agent, &id) {
-            Ok(Some(Changed::Paths(paths))) => (self.notes)(&agent, &change_note(&id, &paths)),
-            Ok(Some(Changed::TooMany)) => (self.notes)(&agent, &too_many_note(&id)),
-            Ok(None) => {}
+        let kept = match changes.diff(&agent, &id) {
+            Ok(Some(Changed::Paths(paths))) => {
+                (self.notes)(&agent, &change_note(&id, &paths));
+                witness::Changes::Listed(paths)
+            }
+            Ok(Some(Changed::TooMany)) => {
+                (self.notes)(&agent, &too_many_note(&id));
+                witness::Changes::TooMany
+            }
+            Ok(None) => witness::Changes::None,
             // Noted too, so a job cannot hide what it did by making its listing fail (a send
             // timed out on millions of files); the cause, host paths and all, only in the log.
             Err(e) => {
                 eprintln!("ac-gateway: jobs: {agent}/{id}: changes: {e}");
                 (self.notes)(&agent, &format!("job {id} changes could not be listed"));
+                witness::Changes::Failed
             }
-        }
+        };
+        self.keep_changes(&agent, &id, &kept);
         self.queue().listing = None;
         true
     }
@@ -1299,18 +1530,67 @@ impl Jobs {
         }
     }
 
+    /// Keep what a job's compare found for its witness record, beside its prompt and output.
+    /// A job already pruned has no directory, and nothing is kept.
+    fn keep_changes(&self, agent: &AgentId, id: &JobId, changes: &witness::Changes) {
+        let dir = self.dir.join(agent.as_str()).join(id.as_str());
+        if !dir.is_dir() {
+            return;
+        }
+        let path = dir.join(CHANGES_FILE);
+        // A compare that found no start snapshot says nothing new about a start that failed.
+        if *changes == witness::Changes::None && path.exists() {
+            return;
+        }
+        let text = witness::render_changes(changes);
+        if let Err(e) = write_private(&path, text.as_bytes()) {
+            eprintln!("ac-gateway: jobs: {agent}/{id}: keeping changes: {e}");
+        }
+    }
+
     fn job_dir(&self, j: &Job) -> PathBuf {
         self.dir.join(j.agent.as_str()).join(j.id.as_str())
     }
 
-    fn save_prompt(&self, j: &Job, prompt: &[u8]) -> Result<(), String> {
+    /// The prompt, and with `credential` an empty [`NEEDS_CREDENTIAL`] marker (never the
+    /// credential itself), so a job whose credential a restart lost is failed, not started bare.
+    fn save_prompt(&self, j: &Job, prompt: &[u8], credential: bool) -> Result<(), String> {
         let dir = self.job_dir(j);
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
+        if credential {
+            write_private(&dir.join(NEEDS_CREDENTIAL), b"")?;
+        }
         write_private(&dir.join("prompt.txt"), prompt)
+    }
+
+    fn secrets(&self) -> MutexGuard<'_, HashMap<String, Credential>> {
+        self.secrets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The job's credential, `Ok(None)` if it has none, or why it cannot start: it had one, and
+    /// the gateway restarted since it was submitted.
+    fn credential(&self, j: &Job) -> Result<Option<Credential>, String> {
+        if let Some(c) = self.secrets().get(j.id.as_str()) {
+            return Ok(Some(c.clone()));
+        }
+        match self.job_dir(j).join(NEEDS_CREDENTIAL).exists() {
+            true => {
+                Err("its credential was lost when the gateway restarted; submit it again".into())
+            }
+            false => Ok(None),
+        }
+    }
+
+    /// `bytes` with every copy of the job's credential replaced, when it is still known.
+    fn redact(&self, j: &Job, bytes: Vec<u8>) -> Vec<u8> {
+        match self.secrets().get(j.id.as_str()) {
+            Some(c) => redact(&bytes, c.expose().as_bytes()),
+            None => bytes,
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, u64>> {

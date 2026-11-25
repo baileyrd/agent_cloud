@@ -49,7 +49,8 @@
 //! within a second.
 //!
 //! At startup it reconciles the registry with containerd once (see `Fleet::reconcile`): after a
-//! host reboot, agents recorded running have no VM and become paused. A failed reconcile is
+//! host reboot, agents recorded running have no VM and become paused, and an agent recorded
+//! creating whose VM is up (the gateway stopped mid-create) becomes running. A failed reconcile is
 //! logged and the gateway serves anyway. It then SIGKILLs `ctr` clients an earlier gateway left
 //! and detaches their tmux control clients in every running agent. The job supervisor then starts
 //! on its own thread and ticks at once and every second after: it re-attaches running jobs of
@@ -90,6 +91,7 @@ use ac_gateway::viewer::Hub;
 use ac_gateway::watchdog::Watchdog;
 use ac_gateway::web::App;
 use ac_gateway::{bind, Api, Unhealthy};
+use ac_store::mirror::Mirrored;
 use ac_store::EngineStore;
 use platform::events::{SignalEvent, SignalSource};
 use platform_linux::{LinuxSignalSource, LinuxSpawner};
@@ -97,7 +99,7 @@ use rusty_serve::{Server, ShutdownHandle};
 
 const TOKENS: &str = "/etc/agent-cloud/tokens";
 
-type Gateway = App<CtrRuntime<LinuxSpawner>, Arc<EngineStore>>;
+type Gateway = App<CtrRuntime<LinuxSpawner>, Mirrored<Arc<EngineStore>>>;
 
 /// A number >= 0 from the environment, `default` when unset.
 fn num(key: &str, default: f64) -> Result<f64, String> {
@@ -429,7 +431,12 @@ fn run() -> Result<(), String> {
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
     let snapshots = CtrRuntime::new(LinuxSpawner, cfg.clone());
     log_volumes(&snapshots);
-    let mut fleet = Fleet::new(runtime, Arc::clone(&store))
+    // A plain-text copy of the agent list for `ac-ctl backup` (ADR-021 addendum).
+    let registry = Mirrored::new(Arc::clone(&store), ac_store::mirror::path(&data));
+    if let Err(e) = registry.sync() {
+        eprintln!("ac-gateway: {e}; backups will not have the agent list until it is written");
+    }
+    let mut fleet = Fleet::new(runtime, registry)
         .with_admission(Box::new(capacity), margin)
         .with_snapshots(Arc::new(snapshots), checkpoint_max()?);
     let egress = match networked {
@@ -441,8 +448,12 @@ fn run() -> Result<(), String> {
     }
     let reconciled = match fleet.reconcile() {
         Ok(changed) => {
-            for id in changed {
-                eprintln!("ac-gateway: reconcile: {id} had no VM; marked paused");
+            for (id, state) in changed {
+                let why = match state {
+                    State::Creating => "was half booted at a restart; VM stopped, still creating (create or destroy it)",
+                    _ => "had no VM; marked paused",
+                };
+                eprintln!("ac-gateway: reconcile: {id} {why}");
             }
             "reconcile done"
         }
@@ -486,6 +497,7 @@ fn run() -> Result<(), String> {
         )
         .with_gate(gate, ProcPressure)
         .with_changes(CtrRuntime::new(LinuxSpawner, cfg.clone()))
+        .with_egress_log(CtrRuntime::new(LinuxSpawner, cfg.clone()))
         .with_notes(move |id, text| notes.note(id, text)),
     );
     jobs.startup();

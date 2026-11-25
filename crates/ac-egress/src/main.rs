@@ -11,6 +11,9 @@
 //! decision and forced on SIGHUP; a bad version is logged once and the previous one stays. A
 //! request without `Proxy-Authorization` gets the base list; a bad credential gets 407.
 //!
+//! `AC_EGRESS_AGENT_NET` (default 10.89.0.0/16, the agent bridge): an `endpoint` (ADR-016) that
+//! resolves into it is refused, so a rebound name cannot reach another agent or the host's bridge.
+//!
 //! The bridge address exists only once the first agent's CNI ADD creates `acbr0`, so binding is
 //! retried every two seconds until it does.
 
@@ -21,7 +24,7 @@ use std::time::Duration;
 
 use ac_egress::allowfile::AllowFile;
 use ac_egress::egressfile::EgressFiles;
-use ac_egress::{is_public, Limits, Proxy, System};
+use ac_egress::{is_public, AgentNet, Limits, Proxy, System};
 use platform::events::{SignalEvent, SignalSource};
 use platform_linux::LinuxSignalSource;
 
@@ -72,7 +75,13 @@ fn run() -> Result<(), String> {
         env("AC_EGRESS_PROFILES", "/etc/agent-cloud/egress/profiles"),
         owner,
     );
-    let proxy = Arc::new(Proxy::new(list, System, Limits::default()).with_files(files));
+    let agents = AgentNet::parse(&env("AC_EGRESS_AGENT_NET", "10.89.0.0/16"))
+        .map_err(|e| format!("AC_EGRESS_AGENT_NET: {e}"))?;
+    let proxy = Arc::new(
+        Proxy::new(list, System, Limits::default())
+            .with_agent_net(agents)
+            .with_files(files),
+    );
     proxy.refresh(true);
 
     let signals = LinuxSignalSource;

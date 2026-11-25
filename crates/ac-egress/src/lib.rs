@@ -20,6 +20,6 @@ pub mod policy;
 pub mod proxy;
 
 pub use policy::{
-    decide, is_public, judge, vet, Caller, Decision, Policy, Reason, Refused, Verdict,
+    decide, is_public, judge, vet, AgentNet, Caller, Decision, Policy, Reason, Refused, Verdict,
 };
 pub use proxy::{Limits, Proxy, System, Upstream};

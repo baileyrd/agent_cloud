@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 use ac_ctr::{CtrConfig, CtrRuntime};
 use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
+use ac_domain::job::Credential;
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
-use ac_gateway::jobs::{self, Answer, Changes, JobRunner, Jobs, Part, Probe, Route};
+use ac_gateway::jobs::{self, Answer, Changes, EgressLog, JobRunner, Jobs, Part, Probe, Route};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::web::App;
@@ -45,6 +46,10 @@ fn agent(s: &str) -> AgentId {
 struct World {
     /// (job, prompt, timeout, flags) per start.
     starts: Vec<(String, Vec<u8>, u32, Vec<String>)>,
+    /// The credential each start was handed (job, secret).
+    credentials: Vec<(String, Option<String>)>,
+    /// What every `read` appends, as an agent echoing its credential would.
+    echo: String,
     /// What `status` reports per job; `Running` if absent.
     status: HashMap<String, Probe>,
     statuses: usize,
@@ -65,6 +70,8 @@ struct World {
     too_many: bool,
     /// Every compare fails (a `btrfs send` that timed out).
     diff_fails: bool,
+    /// Every start snapshot fails (a full disk).
+    begin_fails: bool,
     /// How many `leftovers` calls fail before one succeeds.
     leftovers_fail: usize,
     /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
@@ -116,6 +123,7 @@ impl JobRunner for Fake {
         _: &AgentId,
         job: &JobId,
         prompt: &[u8],
+        credential: Option<&Credential>,
         timeout: u32,
         claude: &[String],
     ) -> Result<(), String> {
@@ -123,6 +131,8 @@ impl JobRunner for Fake {
         if w.start_fails {
             return Err("no VM".into());
         }
+        w.credentials
+            .push((job.to_string(), credential.map(|c| c.expose().to_owned())));
         w.starts
             .push((job.to_string(), prompt.to_vec(), timeout, claude.to_vec()));
         Ok(())
@@ -152,15 +162,19 @@ impl JobRunner for Fake {
         Ok(())
     }
     fn read(&self, _: &AgentId, job: &JobId, part: Part) -> Result<Vec<u8>, String> {
+        let echo = self.w().echo.clone();
         Ok(match part {
-            Part::Result => format!("result of {job} <script>").into_bytes(),
-            Part::Stream => b"{\"type\":\"result\"}\n".to_vec(),
+            Part::Result => format!("result of {job} <script>{echo}").into_bytes(),
+            Part::Stream => format!("{{\"type\":\"result\"}}\n{echo}").into_bytes(),
         })
     }
 }
 
 impl Changes for Fake {
     fn begin(&self, _: &AgentId, job: &JobId) -> Result<(), String> {
+        if self.w().begin_fails {
+            return Err("btrfs subvolume snapshot: No space left on device".into());
+        }
         let paths = [
             ".jobs/j/prompt.txt",
             ".job-j.done",
@@ -209,6 +223,37 @@ impl Changes for Fake {
     }
 }
 
+/// The proxy's log as a test sets it; `Err` reads as an unreadable journal. Records each window.
+#[derive(Clone)]
+struct Log(Arc<Mutex<Logged>>);
+
+/// What `read` returns, and the windows asked for.
+type Logged = (Result<String, String>, Vec<(u64, u64)>);
+
+impl Default for Log {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new((Ok(String::new()), Vec::new()))))
+    }
+}
+
+impl Log {
+    fn set(&self, log: Result<&str, &str>) {
+        let mut l = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        l.0 = log.map(str::to_owned).map_err(str::to_owned);
+    }
+    fn windows(&self) -> Vec<(u64, u64)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
+    }
+}
+
+impl EgressLog for Log {
+    fn between(&self, since_ms: u64, until_ms: u64) -> Result<String, String> {
+        let mut l = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        l.1.push((since_ms, until_ms));
+        l.0.clone()
+    }
+}
+
 // ---- a rig: real registry, fake runner, fake clock ---------------------------------------------
 
 struct Rig {
@@ -217,6 +262,7 @@ struct Rig {
     fake: Fake,
     clock: Arc<AtomicU64>,
     notes: Arc<Mutex<Vec<String>>>,
+    egress: Log,
     root: PathBuf,
 }
 
@@ -303,7 +349,10 @@ fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limit
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let notes = Arc::new(Mutex::new(Vec::new()));
     let (c, n) = (Arc::clone(&clock), Arc::clone(&notes));
-    let mut jobs = jobs_over(&store, fake.clone(), &root).with_changes(fake.clone());
+    let egress = Log::default();
+    let mut jobs = jobs_over(&store, fake.clone(), &root)
+        .with_changes(fake.clone())
+        .with_egress_log(egress.clone());
     if let Some((limits, load)) = gate {
         jobs = jobs.with_gate(limits, load);
     }
@@ -318,6 +367,7 @@ fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limit
         fake,
         clock,
         notes,
+        egress,
         root,
     }
 }
@@ -533,6 +583,132 @@ fn started_jobs_note_what_they_changed_and_drop_their_snapshot() {
     assert_eq!(w.sealed, [done.clone(), unstarted.clone()]);
     assert_eq!(w.ended, [done, unstarted], "a never-started job has none");
     assert!(w.snapshots.is_empty(), "every snapshot dropped");
+}
+
+/// The witness record and digest of a job's reply (ADR-029).
+fn witness(r: &Rig, job: &str) -> (u16, String, String) {
+    let (status, body) = r.json(Route::Witness(agent("a1"), job_id(job)), "");
+    if status != 200 {
+        return (status, body, String::new());
+    }
+    let parsed = rusty_json::Value::parse(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    let text = |k: &str| {
+        parsed
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("no {k} in {body}"))
+            .to_owned()
+    };
+    (status, text("record"), text("sha256"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use rusty_sha2::{Hash, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn a_witness_comes_when_the_job_ends_and_its_digest_covers_the_record() {
+    let r = rig();
+    let id = r.ok("a1", "SECRET-PROMPT");
+    assert_eq!(witness(&r, &id).0, 409, "queued");
+    r.jobs.tick();
+    assert_eq!(witness(&r, &id).0, 409, "running");
+    r.egress.set(Ok(
+        "ac-egress: allow 10.89.0.21 agent=a1 api.anthropic.com:443\n\
+                     ac-egress: deny 10.89.0.21 agent=a1 evil.example:443: not on allowlist\n\
+                     ac-egress: allow 10.89.0.22 agent=a2 crates.io:443\n",
+    ));
+    r.advance(7_000);
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (status, pending, _) = witness(&r, &id);
+    assert_eq!(status, 200);
+    assert!(pending.contains("\nchanges pending\n"), "{pending}");
+    r.diff_all();
+    let (_, record, digest) = witness(&r, &id);
+    assert_eq!(digest, sha256_hex(record.as_bytes()));
+    assert!(record.starts_with(&format!(
+        "agent_cloud.witness v1\nagent a1\njob {id}\nstate succeeded\nexit_code 0\n"
+    )));
+    assert!(
+        record.contains("\nchanges listed 4\nchanged .job-j.done\nchanged .jobs/j/prompt.txt\nchanged src/.jobs\nchanged src/main.rs\n"),
+        "{record}"
+    );
+    assert!(
+        record.ends_with("egress journal 2\negress_allow api.anthropic.com:443 1\negress_deny evil.example:443 1\n"),
+        "{record}"
+    );
+    for agent_text in ["SECRET-PROMPT", "result of", "<script>", "crates.io"] {
+        assert!(!record.contains(agent_text), "{agent_text} in {record}");
+    }
+    let windows = r.egress.windows();
+    let job = r.get("a1", &id);
+    let window = (
+        field(&job, "started_ms").parse().unwrap_or(0),
+        field(&job, "finished_ms").parse().unwrap_or(0),
+    );
+    assert!(
+        windows.iter().all(|w| *w == window),
+        "{windows:?} vs {window:?}"
+    );
+    assert_eq!(
+        witness(&r, &id).2,
+        digest,
+        "the same facts, the same digest"
+    );
+    r.egress.set(Err("journalctl: no such unit"));
+    let (_, blind, other) = witness(&r, &id);
+    assert!(blind.ends_with("\negress unavailable\n"), "{blind}");
+    assert_ne!(other, digest);
+}
+
+#[test]
+fn a_witness_says_what_the_compare_could_not_list() {
+    let r = rig();
+    r.fake.w().diff_fails = true;
+    let failed = r.ok("a1", "a");
+    r.jobs.tick();
+    r.fake.set(&failed, Probe::Exited(Some(1)));
+    r.tick();
+    r.diff_all();
+    assert!(witness(&r, &failed).1.contains("\nchanges failed\n"));
+    r.fake.w().diff_fails = false;
+    r.fake.w().too_many = true;
+    let many = r.ok("a1", "b");
+    r.jobs.tick();
+    r.fake.set(&many, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    assert!(witness(&r, &many).1.contains("\nchanges too_many\n"));
+    let never = r.ok("a1", "c");
+    assert_eq!(
+        r.json(Route::Cancel(agent("a1"), job_id(&never)), "").0,
+        200
+    );
+    let (_, record, _) = witness(&r, &never);
+    assert!(
+        record.contains("\nstarted_ms -\n")
+            && record.ends_with("\nchanges none\negress journal 0\n"),
+        "{record}"
+    );
+    assert_eq!(
+        r.json(Route::Witness(agent("a1"), job_id("00000000000000ff")), "")
+            .0,
+        404
+    );
+    // Review of PR #41: a failed start snapshot means no compare will run; not `pending` forever.
+    r.fake.w().too_many = false;
+    r.fake.w().begin_fails = true;
+    let blind = r.ok("a1", "d");
+    r.jobs.tick();
+    r.fake.set(&blind, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    assert!(witness(&r, &blind).1.contains("\nchanges failed\n"));
 }
 
 /// Issue #26 review: a job whose listing is over the cap (a few hundred thousand files) still gets
@@ -1147,6 +1323,145 @@ fn stopped_agent_interrupts_running_and_cancels_queued() {
         r.fake.w().kills.len(),
         1,
         "no kill for an agent without a VM"
+    );
+}
+
+const CRED: &str = "LEL-SECRET-token.42";
+
+#[test]
+fn a_credential_reaches_its_job_only_and_is_kept_nowhere() {
+    let r = rig();
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#);
+    let (status, reply) = r.submit("a1", &body);
+    assert_eq!(status, 202, "{reply}");
+    assert!(!reply.contains(CRED), "{reply}");
+    let id = field(&reply, "job_id");
+    let plain = r.ok("a2", "no secret");
+    r.fake.w().echo = format!(" leaked {CRED} twice {CRED}");
+    r.jobs.tick();
+    let handed = r.fake.w().credentials.clone();
+    assert!(
+        handed.contains(&(id.clone(), Some(CRED.to_owned()))),
+        "{handed:?}"
+    );
+    assert!(handed.contains(&(plain.clone(), None)), "{handed:?}");
+    // The live stream is redacted.
+    let live = r
+        .json(Route::Output(agent("a1"), job_id(&id)), "part=stream")
+        .1;
+    assert!(
+        !live.contains(CRED) && live.contains("[credential redacted]"),
+        "{live}"
+    );
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    assert_eq!(r.state("a1", &id), "succeeded");
+    // Nothing on the host holds it: registry, job copies, notes, replies.
+    for p in walk(&r.root) {
+        let b = std::fs::read(&p).unwrap_or_default();
+        assert!(
+            !b.windows(CRED.len()).any(|w| w == CRED.as_bytes()),
+            "{}",
+            p.display()
+        );
+    }
+    let result = r.json(Route::Output(agent("a1"), job_id(&id)), "").1;
+    assert!(
+        result.contains("leaked [credential redacted] twice [credential redacted]"),
+        "{result}"
+    );
+    let notes = r.notes.lock().map(|v| v.join("\n")).unwrap_or_default();
+    assert!(!notes.contains(CRED), "{notes}");
+    assert!(!r.json(Route::List(agent("a1")), "").1.contains(CRED));
+}
+
+#[test]
+fn bad_credentials_are_refused() {
+    let r = rig();
+    for body in [
+        r#"{"prompt":"go","credential":""}"#,
+        r#"{"prompt":"go","credential":"has space"}"#,
+        r#"{"prompt":"go","credential":42}"#,
+    ] {
+        let (status, reply) = r.submit("a1", body);
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+    let long = "x".repeat(4097);
+    assert_eq!(
+        r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{long}"}}"#))
+            .0,
+        400
+    );
+}
+
+#[test]
+fn a_restart_before_the_start_fails_the_job_instead_of_starting_it_bare() {
+    let r = rig();
+    let busy = r.ok("a1", "first");
+    let (_, reply) = r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#));
+    let queued = field(&reply, "job_id");
+    r.jobs.tick();
+    let mut r = r;
+    let root = std::mem::take(&mut r.root);
+    let fake = r.fake.clone();
+    drop(r);
+    let store = Arc::new(EngineStore::open(&root.join("data")).unwrap_or_else(|e| panic!("{e}")));
+    let r = with_store(store, fake, root);
+    r.fake.set(&busy, Probe::Exited(Some(0)));
+    r.tick();
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &queued), "failed");
+    assert!(r.get("a1", &queued).contains("credential was lost"));
+    assert!(!r.started().contains(&queued), "never started without it");
+}
+
+#[test]
+fn ending_a_job_any_way_removes_its_credential_file() {
+    // Timeout and cancel go through kill (which removes the file); a vanished runner too.
+    let r = rig();
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}","timeout_secs":10}}"#);
+    let timed = field(&r.submit("a1", &body).1, "job_id");
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#);
+    let cancelled = field(&r.submit("a2", &body).1, "job_id");
+    r.jobs.tick();
+    let _ = r.json(Route::Cancel(agent("a2"), job_id(&cancelled)), "");
+    r.advance(11_000);
+    r.jobs.tick();
+    let gone = field(
+        &r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#))
+            .1,
+        "job_id",
+    );
+    r.jobs.tick();
+    r.fake.set(&gone, Probe::Gone);
+    r.fake.w().status.insert(gone.clone(), Probe::Gone);
+    r.tick();
+    let kills = r.fake.w().kills.clone();
+    for job in [&timed, &cancelled, &gone] {
+        assert!(kills.contains(job), "{job} not cleaned: {kills:?}");
+    }
+    assert_eq!(r.state("a1", &timed), "timed_out");
+    assert_eq!(r.state("a2", &cancelled), "cancelled");
+    assert_eq!(r.state("a1", &gone), "failed");
+}
+
+/// Review of PR #41: a start that fails (a step under `set -e`, or the exec timeout) may leave the
+/// credential file in the guest with no window to remove it, so the gateway runs the kill.
+#[test]
+fn a_failed_start_with_a_credential_runs_the_kill_that_removes_it() {
+    let r = rig();
+    r.fake.w().start_fails = true;
+    let plain = r.ok("a1", "plain");
+    r.jobs.tick();
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#);
+    let secret = field(&r.submit("a2", &body).1, "job_id");
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &plain), "failed");
+    assert_eq!(r.state("a2", &secret), "failed");
+    assert_eq!(
+        r.fake.w().kills,
+        [secret],
+        "only the job that had a credential"
     );
 }
 
@@ -1807,7 +2122,7 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
     for (n, prompt) in hostile_prompts().iter().enumerate() {
         let job = JobId::from_random([n as u8, 1, 2, 3, 4, 5, 6, 7]);
-        let r = rt.start(&agent("a1"), &job, prompt.as_bytes(), 60, &flags);
+        let r = rt.start(&agent("a1"), &job, prompt.as_bytes(), None, 60, &flags);
         assert!(r.is_ok(), "{r:?}");
         let file = root.join(format!("workspaces/a1/.job-{job}.prompt"));
         assert_eq!(
@@ -1816,14 +2131,17 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
         );
         let argv = argvs(&log).pop().unwrap_or_default();
         // timeout -s TERM -k 3 30 ctr -n agents task exec --exec-id <x> a1 sh -c <START>
-        // ac-job-start <RUN> <job> <secs> <flags...>: constants, the job id and the operator's
-        // flags only.
+        // ac-job-start <RUN> <job> <0|1> <secs> <flags...>: constants, the job id, whether a
+        // credential follows on stdin, and the operator's flags only.
         assert_eq!(argv[..6], ["timeout", "-s", "TERM", "-k", "3", "30"]);
         assert_eq!(argv[6..11], ["ctr", "-n", "agents", "task", "exec"]);
         assert_eq!(argv[13..16], ["a1", "sh", "-c"]);
         assert_eq!(argv[17], "ac-job-start");
-        assert_eq!(argv[19..21], [job.to_string(), "360".to_owned()]);
-        assert_eq!(argv[21..], flags[..]);
+        assert_eq!(
+            argv[19..22],
+            [job.to_string(), "0".to_owned(), "360".to_owned()]
+        );
+        assert_eq!(argv[22..], flags[..]);
         let held = log.lock().map(|l| {
             l.iter()
                 .all(|r| matches!(r.stdin, platform_mock::process::StdioKind::Pipe))
@@ -1843,12 +2161,58 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let _ = std::fs::write(&victim, "keep");
     let link = root.join(format!("workspaces/a1/.job-{job}.prompt"));
     let _ = std::os::unix::fs::symlink(&victim, &link);
-    assert!(rt.start(&agent("a1"), &job, b"evil", 60, &flags).is_err());
+    assert!(rt
+        .start(&agent("a1"), &job, b"evil", None, 60, &flags)
+        .is_err());
     assert_eq!(
         std::fs::read_to_string(&victim).ok().as_deref(),
         Some("keep")
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn ctr_start_hands_a_credential_on_stdin_never_in_argv_or_the_workspace() {
+    let root = tmp();
+    let (rt, log) = ctr(&root, "");
+    let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
+    let job = JobId::from_random([7; 8]);
+    let cred = Credential::parse("LEL-SECRET-token.42").unwrap_or_else(|e| panic!("{e}"));
+    let r = rt.start(&agent("a1"), &job, b"go", Some(&cred), 60, &flags);
+    assert!(r.is_ok(), "{r:?}");
+    let argv = argvs(&log).pop().unwrap_or_default();
+    assert_eq!(
+        argv[19..22],
+        [job.to_string(), "1".to_owned(), "360".to_owned()]
+    );
+    assert!(
+        argv.iter().all(|a| !a.contains("LEL-SECRET")),
+        "credential in argv"
+    );
+    // The start script reads one line into the guest's tmpfs and the runner removes it.
+    assert!(argv[16].contains("IFS= read -r secret") && argv[16].contains("/dev/shm/ac-job-"));
+    assert!(argv[18].contains("rm -rf -- \"$c\""), "runner cleanup");
+    let leaked = walk(&root.join("workspaces"))
+        .into_iter()
+        .any(|p| std::fs::read(&p).is_ok_and(|b| b.windows(10).any(|w| w == b"LEL-SECRET")));
+    assert!(!leaked, "credential written under the workspace root");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Every file under `dir`.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        match p.is_dir() {
+            true => out.extend(walk(&p)),
+            false => out.push(p),
+        }
+    }
+    out
 }
 
 #[test]

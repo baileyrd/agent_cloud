@@ -302,7 +302,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST /api/v1/agents/{id}` (create) | `agents:write` |
   | `POST /api/v1/agents/{id}/pause`, `.../resume` | `agents:write` |
   | `DELETE /api/v1/agents/{id}` (destroy; `?purge=true`, `?force=true`) | `agents:write` |
-  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output` | `jobs:read` |
+  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output`, `.../jobs/{job}/witness` | `jobs:read` |
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
   | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
@@ -708,6 +708,42 @@ not reach. Adding it to the base list would open a code-delivery channel to ever
 **Not now:** per-profile ports (443 and 80 as the base list); per-agent base lists; binding a credential to a VM's
 MAC or IP; profiles editable through the API.
 
+**Addendum (2026-11-25, proposed; Mill Board card #1063): gateway-only agents.** LEL D101 jails an untrusted
+agent deny-by-default except its MCP gateway, and ADR-025 makes agent_cloud that wall. Profiles only ever *added*
+hosts to the base list, on ports 443 and 80, to public addresses; LEL's gateway is on the tailnet on its own port.
+- *Two directives in a profile file:* `endpoint <host>:<port>` allows exactly that host on exactly that port; the
+  host is a name (no IP literal), from the operator's file, never hardcoded or set through the API. `!exclusive`
+  means an agent with this profile attached loses the base list: it reaches only what its profiles allow. Other
+  attached profiles still add their hosts, so package mirrors compose (`["gateway","rust"]`).
+- *Profiles only:* the base allowlist refuses both directives (the proxy keeps its previous list, and the
+  gateway reports the file as bad), since a base `endpoint` would reach every agent and anonymous callers.
+- *Shipped as config, not code:* `/etc/agent-cloud/egress/profiles/gateway.txt` is two lines the operator writes
+  (docs/install.md); nothing in this repo names the gateway. The name `gateway` is a convention, not reserved.
+- *No generic CONNECT target:* an endpoint matches host and port together. The same host on any other port goes
+  through the ordinary rules (and is refused unless some list has it on 443/80).
+- *Private addresses:* an endpoint's addresses are vetted by `vet_endpoint`, which accepts private ranges (the
+  tailnet's 100.64.0.0/10, RFC 1918, ULA) but refuses loopback, unspecified, link-local, multicast, broadcast and
+  IPv4-mapped forms, and the agent bridge (`AC_EGRESS_AGENT_NET`, default 10.89.0.0/16), which the proxy's unit
+  may reach: a name that resolves there (a rebind of a name the operator does not control) would reach another
+  agent or the host's bridge address. Every other host keeps `vet`, which refuses all non-public addresses. An endpoint pointed at
+  this host's own LAN or tailnet address would reach its services: name another machine. The proxy's unit
+  (`IPAddressDeny=` of private ranges) still blocks the address until the operator allows exactly it with a
+  drop-in (`IPAddressAllow=<address>/32`, docs/install.md), so a profile alone cannot open a private range.
+- *Nothing else leaks:* `agentfw.nft` already rejects every packet from `acbr0` but TCP to the proxy port, so an
+  agent has no DNS and no direct IP egress; names are resolved by the proxy only. Anonymous callers and other
+  agents never get another agent's endpoint.
+- *API:* unchanged. `GET /api/v1/egress/profiles` adds `"exclusive":true`; `effective_hosts` leaves the base list
+  out for an agent with an exclusive profile, and counts an endpoint as one entry.
+- *Tests:* policy unit tests (only the endpoint answers; other ports, the base list and other agents refused; a
+  mirror composes; `vet_endpoint` ranges) and a loopback proxy test with a tailnet-addressed fake upstream. The live
+  check is part of #1067.
+- *Fails closed:* an attached profile with no usable version (deleted, or never parsed since the proxy started)
+  now also drops the base list, since it may have been the exclusive one; before, it only added nothing. The proxy
+  warns about it, and `effective_hosts` shows the smaller count. A profile that turns bad keeps its last good
+  version, as before.
+- *Rollback:* an older proxy or gateway refuses a profile with these directives as malformed (the proxy keeps that
+  profile's last good version, so the agent gets base list + nothing); remove `gateway.txt` before downgrading.
+
 ## ADR-017: An MCP interface on the gateway, split by token scope
 **Status:** accepted (2026-10-28; verified on BaileyServ the same day with Claude Code 2.1.312 added by
 `claude mcp add`: 21 of 22 tools listed for a token without `egress:write`, checkpoint tools and a 409 passed through).
@@ -722,7 +758,7 @@ Origin check.
 - *One tool per REST route* (declared on the route in `access::ROUTES` since ADR-020): `whoami`; `list_agents`, `get_agent`, `get_capacity`,
   `list_egress_profiles`, `get_agent_egress` (`agents:read`); `create_agent`, `pause_agent`, `resume_agent`,
   `destroy_agent` (`agents:write`); `set_agent_egress` (`egress:write`); `list_jobs`, `get_job`,
-  `get_job_output` (`jobs:read`); `submit_job`, `cancel_job` (`jobs:write`); `get_history` (`viewer:read`);
+  `get_job_output`, `get_job_witness` (`jobs:read`, ADR-029); `submit_job`, `cancel_job` (`jobs:write`); `get_history` (`viewer:read`);
   `list_checkpoints` (`agents:read`); `create_checkpoint`, `delete_checkpoint`, `restore_checkpoint`,
   `fork_agent` (`agents:write`, ADR-018). A tool takes its method, path and scope from the route that offers it.
 - *Same path as REST:* a call becomes that route's method, target and body, then goes through `access::check`
@@ -986,11 +1022,46 @@ of the snapshot, including a send that fails half way and a broken chain.
   `<data>/backups/<id>/*` with `btrfs subvolume delete`. Streams at `<dest>` need only `btrfs receive -f` on any
   btrfs, none of this code.
 
-**Not now:** the registry, tokens and the egress agents file (the data directory outside workspaces; copying the
-registry needs the gateway's cooperation, and agents and tokens can be recreated); checkpoints in backups; a
+**Not now:** ~~the registry, tokens and the egress agents file~~ (added below, 2026-11-25); checkpoints in backups; a
 gateway route or MCP tool; uploads to object storage without a mount; compression (`btrfs send --compressed-data`
 needs a newer kernel and protocol 2) and encryption (use an encrypted share or filesystem); a checksum beside each
 stream (btrfs checks every command in a stream on receive).
+
+**Addendum (2026-11-25, proposed; Mill Board card #467): control-plane state.** A lost host also loses which
+agents exist and in what state, the API tokens and the egress attachments. `ac-ctl backup` with no agent named now
+copies those too.
+- *The agent list without the registry:* the registry is a set of mmap files the gateway holds open, so a copy
+  of them taken while it writes is not safe, and `ac-ctl` cannot open it beside the gateway. The gateway's
+  session store is wrapped (`ac_store::mirror::Mirrored`) so that every state change, and every start, rewrites
+  `<data>/state/agents` whole and atomically (temp file, fsync, rename, 0600): one `<agent-id> <state>` line per
+  agent. A reader always sees one consistent list. A failed copy is logged, not returned, since the state did
+  change; the next change rewrites it. `ac-ctl`'s own lifecycle commands (run with the gateway stopped) go
+  through the same wrapper and rewrite it at start, so the copy never lags a change made there. Jobs are not copied: they are history, not what a host needs to come back.
+- *The two files* (`AC_TOKENS`, `AC_EGRESS_AGENTS`) are already replaced atomically by their writers, so a
+  plain read is consistent. `ac-backup.service` reads the gateway's env file, so it finds them where the
+  gateway does; a run that finds no tokens file warns. Tokens hold digests only (ADR-011); the egress file holds per-boot proxy
+  credentials, which a new boot replaces anyway.
+- *Layout:* `<dest>/_state/<id>/` with `agents`, `tokens` and `egress-agents` (the ones the host has; the agent
+  list is required) and a `MANIFEST` of `<sha256> <bytes> <file>` lines, all 0600. `_state` is not a valid
+  agent id, so it never meets an agent's stream directory. Written as `<id>.part`, flushed, then renamed; a
+  leftover `.part` is removed by the next run. `--keep` applies: the newest `keep` stay. A failed state copy makes
+  the run exit 1, like a workspace that was not backed up. `ac-ctl backups <dest>` lists them as `state <id>`.
+- *Restore:* `ac-ctl restore-state <dest> [<id>]` (default the newest). Refused while another process holds the
+  data directory (stop `ac-gateway`), when the registry has an agent the backup does not hold in the same state
+  (an empty registry, or one a restore cut short filled partly, is fine, so a failed restore can be run again),
+  when a tokens or egress file is
+  there with other content (move it aside), and when any file fails its manifest. Every check runs before the
+  first write. It writes the two files (0600), records each agent with its saved state, and rewrites the mirror.
+  At its next start the gateway's reconcile marks agents recorded running but with no VM paused; restore
+  their workspaces with `restore-backup`, then resume them.
+- *Rules* are pure (`ac_domain::state`: names, the agent list and manifest formats, verification); the file I/O
+  is `ac-ctl`'s `state` module.
+- *What the manifest proves:* that the files were not corrupted, not that nobody changed them. Anyone who can
+  write the share can plant a tokens file with a matching manifest, so restore only from a share as trusted as
+  the host. On a CIFS share the files' modes come from the mount options (`file_mode=0600,dir_mode=0700`), not
+  from the 0600 that `ac-ctl` asks for.
+- *Not covered:* job records and history, the gateway env file, egress profiles and the base allowlist (operator
+  config, kept in this repo's `deploy/` or by the operator).
 
 ## ADR-022: Token expiry, opt-in per token
 **Status:** proposed (2026-10-28; unit and HTTP tests, not yet on BaileyServ).
@@ -1200,3 +1271,129 @@ ADR-021 backups, then re-run `post-reboot-check.sh` and `ac-ctl doctor`.
   and inference already use, and it shares a kernel with the evidence store.
 - *MS-01 after its Fedora migration:* the most cores. It waits on the migration, and it shares memory and the
   kernel with the router.
+
+## ADR-027: A create boots its VM outside the lifecycle lock
+**Status:** proposed (2026-11-25). Mill Board card #479.
+**Context:** The gateway serves every lifecycle call under one lock (`App`'s `Mutex<Api>`), and a create held
+it for the whole VM boot, so a 4-agent create storm took 4 + 4 + 4 + 4 s (roadmap M4). The lock is what keeps
+admission (ADR-012) correct: the check and the start of two creates cannot interleave.
+**Decision:** A create runs in three steps. *Reserve* under the lock: validate the body, admit the guest,
+issue the proxy credential (ADR-016) and record the agent `Creating`. *Boot* without the lock: the runtime's
+create alone. *Commit* under the lock: `Running`, or on a failed boot the credential is revoked and the agent
+stays `Creating`, as a failed create always has. Pause, resume, destroy, checkpoints and forks still hold the
+lock throughout.
+- *Admission stays correct* because a reservation is `Creating`, which admission already counts at the
+  configured guest size. No new state was added to the lifecycle.
+- *An agent that is booting* is in a set the gateway keeps. Every change to it is refused with 409 (`agent
+  {id} is being created`): a second create, pause, destroy, egress, checkpoints, restore, a fork to or from it.
+  Reads are served and show `creating`. The entry goes when the commit is done. A boot that panics is caught
+  and committed as a failed boot, so its credential is revoked too.
+- *After a gateway stop during a boot* the startup reconcile stops a `Creating` agent's VM if it is up, revokes
+  its credential and leaves it `Creating`. A live VM does not mean the boot finished: the CPU, memory and pids
+  limits (ADR-023) are applied after `ctr run`, so promoting it to `Running` could leave an agent without them.
+  Retry the create, or destroy it. One whose VM is not up stays `Creating`; its credential is swept.
+**Consequences:** Creates of different agents boot at the same time, so a storm is bounded by the host
+(containerd, CNI with host-local IPAM, disk), not by the gateway. The runtime must be `Sync`; `CtrRuntime` is.
+Forks still boot under the lock: they are rarer and also copy a workspace. To measure: a 4-create storm on the
+host, recorded in sizing.md.
+**Alternative:** release the reservation on a failed boot (forget the record). Rejected for now: a failed
+create has always stayed visible as `Creating` so its leftovers can be destroyed, and admission keeps counting
+it until then.
+
+## ADR-028: A job may carry an opaque, short-lived credential
+**Status:** proposed (2026-11-25). Mill Board card #1064.
+**Context:** LEL D101: no long-lived secret inside the jail; each untrusted job gets a short-lived token scoped to
+its lens and claim, minted by LEL. agent_cloud must pass it through without storing, logging or showing it, and
+remove it when the job ends, however it ends.
+**Decision.**
+- *API:* `POST /api/v1/agents/{id}/jobs` (and MCP `submit_job`) accepts `credential`: 1 to 4096 bytes of
+  `A-Za-z0-9-._~+/=` (base64, base64url and JWT tokens). Those characters are never escaped in JSON, so the
+  stream-json log holds the secret exactly as written, and only `.` and `/` need escaping for `sed`. agent_cloud does not read it and sets no TTL of its own: its life is the job's
+  (bounded by `timeout_secs`); LEL mints it with its own expiry.
+- *In the gateway:* an in-memory map from job id to credential, from submit until the job's terminal transition.
+  The job's host directory gets an empty `needs-credential` marker. At start, a job with the marker but no
+  credential in memory (a restart came between) fails: "its credential was lost when the gateway restarted;
+  submit it again". `Credential`'s `Debug` prints `Credential(..)`.
+- *Into the VM:* the start exec gets a `1` flag in its argv and the credential as one line on stdin (stdin never
+  reaches EOF, ADR-006, so the script reads a line, not to the end). The script writes it to
+  `/dev/shm/ac-job-<id>/credential` (umask 077) on the guest's tmpfs as its last step before opening the
+  window, and removes it if the start fails after that; a start that fails in the gateway (an error or the exec
+  timeout) is followed by the kill script, which removes it too; the runner exports
+  `AC_JOB_CREDENTIAL_FILE`. `CtrRuntime::exec_once_with_input` writes the line; it is never traced.
+- *Removal:* the runner removes the directory once `claude` exits, before writing `exit_code` and the done
+  marker, and in an `EXIT` trap; the kill script removes it first and again once the processes are gone, so a
+  timeout, a cancel, an interrupt with `force` and a vanished runner (now also killed for cleanup) all remove it.
+  A stopped VM loses its tmpfs. A gateway restart while the job runs leaves it in place until the job ends, as
+  the job still needs it.
+- *Redaction:* in the guest, the runner passes `claude`'s stream-json through `sed` before it is capped,
+  stored in `.jobs/<id>/stream.jsonl` or shown as the window's digest, so the workspace's log and result never
+  hold the raw secret. Each line is a whole JSON object, so no match is split. The gateway also redacts the
+  collected result and stream log, and the live stream, while it holds the credential.
+- *Idempotency:* a repeat with the same key returns the existing job and ignores the repeat's credential; after
+  a job failed with "credential lost", submit with a new key.
+**Consequences:** the credential is readable by every process of the agent user in that VM while the job runs
+(as intended), and an agent can leak it in a form redaction does not catch (encoded, split across tool calls, or cut by a
+tool's own truncation so only part of it shows); LEL should mint it narrow and short. The tmux scrollback a
+viewer can see shows only the redacted digest, but anything the job prints to its own terminal by other means
+is not redacted. No registry schema change.
+**Tests:** a credential reaches its job only; nothing under the host's data, jobs or workspace directories, no
+note, reply or list holds it; output and the live stream are redacted; bad credentials are 400; a restart
+before the start fails the job instead of starting it bare; timeout, cancel and a vanished runner all run the
+kill that removes the file; the `ctr` start puts it on stdin, never in argv, never under the workspace root.
+Still to check live (with #1067): the file exists during the job and is gone after each kind of end.
+
+## ADR-029: A job's witness record, from outside the VM
+**Status:** proposed (2026-11-25). Mill Board card #1065 (LEL D101).
+**Context:** LEL's BBP claim needs evidence about a job that the agent cannot forge. The gateway already holds
+facts the guest cannot write: the job's registry record (ADR-010), the paths it changed from btrfs snapshots
+(ADR-019), and the egress proxy's decision for every request its agent made (ADR-007, ADR-016). Nothing gathered
+them per job, and the change list lived only as a history note.
+
+**Decision:** `GET /api/v1/agents/{id}/jobs/{job}/witness` (`jobs:read`), and the MCP tool `get_job_witness`
+from the same catalog route (ADR-020), return `{"record": "<text>", "sha256": "<hex>"}` for an ended job. The
+digest is SHA-256 over the record's UTF-8 bytes, so a verifier recomputes it from the record alone. 409 while the
+job is queued or running; 404 for an unknown agent or job.
+- *Record v1:* one `key value` line each, `\n`-terminated, in this order; a missing value is `-`:
+  ```
+  agent_cloud.witness v1
+  agent <id>
+  job <job id>
+  state <succeeded|failed|cancelled|timed_out|interrupted>
+  exit_code <n|->
+  created_ms <ms>
+  started_ms <ms|->
+  finished_ms <ms|->
+  changes <listed N|too_many|failed|pending|none>
+  changed <path>                      (N lines, sorted, unique; only after `changes listed`)
+  egress <journal N|unavailable>
+  egress_<allow|deny> <host:port> <count>   (N lines, sorted by verdict then target)
+  ```
+  Paths are workspace-relative and escaped as `btrfs receive --dump` prints them (ADR-019), so none holds
+  whitespace or a control byte. A different layout takes `v2`.
+- *Changes:* what the job's compare found is kept in `<data>/jobs/<agent>/<job>/changes` (mode 0600) when it
+  runs, beside the job's prompt and output, and pruned with them. `pending` until then: re-fetch for the final
+  record. `failed` at once if the start snapshot failed (a full disk), since no compare will run. `none` for a
+  job that never started or a gateway without change tracking. `too_many` and `failed` say
+  so, as the history note does, so a job cannot hide what it did by breaking the listing.
+- *Egress:* the gateway reads `journalctl --unit=ac-egress.service` for the job's window, widened to whole
+  seconds, and counts `allow` and `deny` lines tagged `agent=<id>` (ADR-016's per-agent credential). Other
+  agents', unattributed (`agent=-`) and `error` lines are left out. A failed read, or more than 16 MiB of journal
+  for the window, gives `egress unavailable` rather than a partial count. `ac-egress.service` sets
+  `LogRateLimitIntervalSec=0`, so journald's per-unit rate limit cannot drop decision lines when a job floods the
+  proxy; without it a count could fall short without saying so. A job's neighbour in the same second of
+  the same agent can add to its counts; jobs of one agent never overlap otherwise.
+- *Left out on purpose:* the prompt, the result, the stream log and the job's `reason`. Each is agent-written or
+  may quote agent-written text, and the record must hold only what the host observed.
+
+**Consequences:** LEL can store the digest on its claim and later fetch and recheck the record. The record is as
+trustworthy as the host: the gateway signs nothing, so a verifier trusts it through the token-authenticated
+channel. Journal retention bounds how long `egress journal` can be rebuilt: an old job's record may change to
+`journal 0` once its lines rotate out, which changes its digest. LEL should keep the record it fetched, not only
+the digest. Resource peaks are not in v1: no per-job figure exists without new sampling.
+
+**Alternatives:**
+- *Have the proxy keep per-job counters.* The proxy does not know jobs, and the journal already holds every
+  decision with the agent's name.
+- *JSON as the canonical form.* Key order, escaping and number formatting all need pinning down for a stable
+  digest; fixed lines are easier to rebuild in any language.
+- *Sign the record.* Needs a key held off the guest and a rotation story; worth it once LEL verifies offline.

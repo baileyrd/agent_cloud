@@ -15,6 +15,7 @@ dependencies = [
  "rusty_atomic_file",
  "rusty_json",
  "rusty_multimodal_db_engine",
+ "rusty_sha2",
 ]
 
 [[package]]
@@ -96,6 +97,7 @@ version = "0.1.0"
 dependencies = [
  "ac-domain",
  "ac-ports",
+ "rusty_atomic_file",
  "rusty_multimodal_db_engine",
  "serde",
  "uuid",

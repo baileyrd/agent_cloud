@@ -13,6 +13,7 @@ pub mod capacity;
 pub mod exec;
 pub mod facts;
 pub mod host;
+pub mod journal;
 mod limits;
 pub mod snap;
 
@@ -361,16 +362,31 @@ impl<S: Spawner> CtrRuntime<S> {
         args: &[&str],
         limit: Duration,
     ) -> Result<Vec<u8>, PortError> {
-        self.exec_tagged(op, ONCE_EXEC_PREFIX, id, args, limit)
+        self.exec_tagged(op, ONCE_EXEC_PREFIX, id, args, b"", limit)
     }
 
-    /// [`Self::exec_once`] with exec ids starting `tag`.
+    /// [`Self::exec_once`], writing `input` to the process's stdin first. Stdin still never
+    /// reaches EOF while the process lives, so the guest must read `input` by its own framing
+    /// (a line, say), never to the end. Keeps secrets out of argv: `input` is never traced.
+    pub fn exec_once_with_input(
+        &self,
+        op: &'static str,
+        id: &AgentId,
+        args: &[&str],
+        input: &[u8],
+        limit: Duration,
+    ) -> Result<Vec<u8>, PortError> {
+        self.exec_tagged(op, ONCE_EXEC_PREFIX, id, args, input, limit)
+    }
+
+    /// [`Self::exec_once`] with exec ids starting `tag`, and `input` written to stdin.
     fn exec_tagged(
         &self,
         op: &'static str,
         tag: &str,
         id: &AgentId,
         args: &[&str],
+        input: &[u8],
         limit: Duration,
     ) -> Result<Vec<u8>, PortError> {
         let fail = |cause: String| PortError { op, cause };
@@ -390,6 +406,10 @@ impl<S: Spawner> CtrRuntime<S> {
             .spawn(&cmd)
             .map_err(|e| fail(format!("spawn timeout: {e:?}")))?;
         let mut exec = Exec::new(child, b"", Duration::from_secs(3));
+        if !input.is_empty() {
+            exec.send(input)
+                .map_err(|e| fail(format!("write stdin: {e}")))?;
+        }
         let drain = |pipe: Option<Box<dyn platform::fs::File>>| match pipe {
             Some(mut pipe) => read_all(pipe.as_mut()).map_err(|e| fail(format!("read: {e:?}"))),
             None => Ok(Vec::new()),
@@ -409,7 +429,7 @@ impl<S: Spawner> CtrRuntime<S> {
     /// Whether agent `id` answers a trivial exec within `budget`: a wedged shim never does. The
     /// exec id starts [`PROBE_EXEC_PREFIX`].
     pub fn probe(&self, id: &AgentId, budget: Duration) -> bool {
-        self.exec_tagged("probe", PROBE_EXEC_PREFIX, id, &["true"], budget)
+        self.exec_tagged("probe", PROBE_EXEC_PREFIX, id, &["true"], b"", budget)
             .is_ok()
     }
 

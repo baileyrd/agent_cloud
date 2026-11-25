@@ -48,7 +48,8 @@ pub struct Loaded {
     pub profiles: BTreeMap<ProfileName, Allowlist>,
     /// One line per agent.
     pub agents: Vec<Attachment>,
-    /// Attachments that name a profile with no usable file: each adds nothing.
+    /// Attachments that name a profile with no usable file: the agent loses the base list until
+    /// it is fixed (the wall fails closed).
     pub warnings: Vec<String>,
     /// Files refused this time; each kept its last good version.
     pub errors: Vec<String>,
@@ -146,7 +147,7 @@ impl EgressFiles {
                 .filter(|p| !self.good.profiles.contains_key(*p))
             {
                 warnings.push(format!(
-                    "agent {}: profile {p} has no usable file in {} (adds nothing)",
+                    "agent {}: profile {p} has no usable file in {} (the agent gets no base list until it is fixed)",
                     a.agent,
                     self.profiles.display()
                 ));

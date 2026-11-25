@@ -8,6 +8,12 @@
 //! an agent with a queued or running job are refused (409) unless `?force=true`, which interrupts the job
 //! first (ADR-010).
 //!
+//! A create's VM boot runs outside the lifecycle lock (ADR-027): [`Api::begin_create`] reserves
+//! the agent as `creating` under the lock, the caller boots it unlocked ([`Creation::boot`]), and
+//! [`Api::finish_create`] commits it under the lock again. While it boots, every other change to
+//! that agent (a second create, pause, destroy, egress, checkpoints, a fork to or from it) is
+//! refused with 409; reads are served.
+//!
 //! Admission (ADR-012): a create or resume whose guest would not fit `/dev/shm` is refused with
 //! 507 and `{"error","rule","needed_mib","available_mib","more_agents"}`; `GET /api/v1/capacity`
 //! reports the figures, and with the task API also `running_jobs`, `queued_jobs` and
@@ -45,8 +51,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use ac_domain::{AgentId, CheckpointId, Label, ProfileName, Shortfall, State};
-use ac_fleet::{Fleet, FleetError};
-use ac_ports::{Runtime, SessionStore};
+use ac_fleet::{Fleet, FleetError, Reserved};
+use ac_ports::{PortError, Runtime, SessionStore};
 use egress::Profiles;
 use rusty_json::Value;
 use tokens::Agents;
@@ -119,12 +125,38 @@ impl Busy for NoJobs {
     fn forget(&self, _: &AgentId) {}
 }
 
+/// Agents whose create is booting outside the lifecycle lock.
+type Booting = Arc<Mutex<HashSet<AgentId>>>;
+
+/// A create reserved by [`Api::begin_create`]: boot it with [`Self::boot`] without the lifecycle
+/// lock, then pass the outcome to [`Api::finish_create`]. Until it is dropped, the agent counts as
+/// booting, so other changes to it are refused; dropping it (also by a panic) releases that.
+pub struct Creation<R> {
+    reserved: Reserved<R>,
+    booting: Booting,
+}
+
+impl<R: Runtime> Creation<R> {
+    /// Provision and start the VM: the slow part, which needs no lock.
+    pub fn boot(&self) -> Result<(), PortError> {
+        self.reserved.boot()
+    }
+}
+
+impl<R> Drop for Creation<R> {
+    fn drop(&mut self) {
+        let mut set = self.booting.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(self.reserved.id());
+    }
+}
+
 /// The lifecycle API.
 pub struct Api<R, S> {
     fleet: Fleet<R, S>,
     unhealthy: Unhealthy,
     jobs: Arc<dyn Busy>,
     egress: Option<Arc<dyn Profiles>>,
+    booting: Booting,
 }
 
 impl<R: Runtime, S: SessionStore> Api<R, S> {
@@ -135,6 +167,7 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             unhealthy: Unhealthy::default(),
             jobs: Arc::new(NoJobs),
             egress: None,
+            booting: Booting::default(),
         }
     }
 
@@ -220,6 +253,9 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             Ok(id) => id,
             Err(e) => return error(400, &e.to_string()),
         };
+        if method != "GET" && self.is_booting(&id) {
+            return booting(&id);
+        }
         match (method, action) {
             ("GET", None) => self.status(&id),
             ("POST", None) => self.create(&id, body, may_attach),
@@ -337,6 +373,9 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         if !agents.contains(f.to.as_str()) {
             return error(404, "not found");
         }
+        if self.is_booting(&f.to) {
+            return booting(&f.to);
+        }
         if let Some(p) = &f.profiles {
             if !p.is_empty() && !may_attach {
                 return error(403, "attaching egress profiles needs scope egress:write");
@@ -351,22 +390,64 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         self.done(&f.to, made, 201)
     }
 
-    /// Create, attaching the body's `egress_profiles` (which needs `egress:write`) before boot.
+    /// Create in one go, boot included: [`Self::begin_create`], [`Creation::boot`],
+    /// [`Self::finish_create`].
     fn create(&self, id: &AgentId, body: &[u8], may_attach: bool) -> Reply {
-        let profiles = match profiles_in(body, "egress_profiles") {
-            Ok(p) => p,
-            Err(reply) => return reply,
-        };
+        match self.begin_create(id, body, may_attach) {
+            Ok(creation) => {
+                let booted = creation.boot();
+                self.finish_create(creation, booted)
+            }
+            Err(reply) => reply,
+        }
+    }
+
+    /// The part of a create that needs the lifecycle lock: check the body (its `egress_profiles`
+    /// need `egress:write`), admit the guest, issue its credential and record it `creating`. The
+    /// reply on refusal is the create's. The caller boots the result unlocked.
+    pub fn begin_create(
+        &self,
+        id: &AgentId,
+        body: &[u8],
+        may_attach: bool,
+    ) -> Result<Creation<R>, Reply> {
+        let profiles = profiles_in(body, "egress_profiles")?;
         if let Some(p) = &profiles {
             if !p.is_empty() && !may_attach {
-                return error(403, "attaching egress profiles needs scope egress:write");
+                return Err(error(
+                    403,
+                    "attaching egress profiles needs scope egress:write",
+                ));
             }
-            if let Err(reply) = self.usable(p) {
-                return reply;
-            }
+            self.usable(p)?;
+        }
+        let mut set = self.booting.lock().unwrap_or_else(|e| e.into_inner());
+        if set.contains(id) {
+            return Err(booting(id));
         }
         self.jobs.settle(id);
-        self.done(id, self.fleet.create_attached(id, profiles.as_deref()), 201)
+        let reserved = self
+            .fleet
+            .reserve(id, profiles.as_deref())
+            .map_err(|e| map_error(&e))?;
+        set.insert(id.clone());
+        Ok(Creation {
+            reserved,
+            booting: Arc::clone(&self.booting),
+        })
+    }
+
+    /// Commit a create begun by [`Self::begin_create`] with its boot's outcome: 201 and the
+    /// record, or the error (the agent stays `creating`, as for any failed create).
+    pub fn finish_create(&self, creation: Creation<R>, booted: Result<(), PortError>) -> Reply {
+        let committed = self.fleet.commit(&creation.reserved, booted);
+        self.done(creation.reserved.id(), committed, 201)
+    }
+
+    /// Whether `id`'s create is booting outside the lock.
+    fn is_booting(&self, id: &AgentId) -> bool {
+        let set = self.booting.lock().unwrap_or_else(|e| e.into_inner());
+        set.contains(id)
     }
 
     fn profiles(&self) -> Reply {
@@ -378,7 +459,11 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
                 let items: Vec<String> = all
                     .iter()
                     .map(|(name, hosts)| match hosts {
-                        Ok(n) => format!(r#"{{"name":"{name}","hosts":{n}}}"#),
+                        Ok(l) if l.exclusive() => format!(
+                            r#"{{"name":"{name}","hosts":{},"exclusive":true}}"#,
+                            l.len()
+                        ),
+                        Ok(l) => format!(r#"{{"name":"{name}","hosts":{}}}"#, l.len()),
                         Err(e) => format!(r#"{{"name":"{name}","error":"{}"}}"#, escape(e)),
                     })
                     .collect();
@@ -392,7 +477,8 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
     }
 
     /// `{"id","profiles","effective_hosts"}`, plus `"missing"` for attached profiles with no
-    /// file (they add nothing).
+    /// usable file. An exclusive or missing profile leaves the base list out of the count, as the
+    /// proxy leaves it out of the agent's list.
     fn egress(&self, id: &AgentId) -> Reply {
         let Some(egress) = &self.egress else {
             return no_egress();
@@ -404,13 +490,20 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         }
         let figures = egress.attached(id).and_then(|attached| {
             let listed = egress.list()?;
-            let mut hosts = egress.base_hosts()?;
-            let mut missing = Vec::new();
+            let mut hosts = 0;
+            let (mut missing, mut exclusive) = (Vec::new(), false);
             for p in &attached {
                 match listed.iter().find(|(n, _)| n == p) {
-                    Some((_, Ok(n))) => hosts += n,
+                    Some((_, Ok(l))) => {
+                        hosts += l.len();
+                        exclusive |= l.exclusive();
+                    }
                     _ => missing.push(format!(r#""{p}""#)),
                 }
+            }
+            // As the proxy does: an exclusive or missing profile drops the base list.
+            if !exclusive && missing.is_empty() {
+                hosts += egress.base_hosts()?;
             }
             Ok((attached, hosts, missing))
         });
@@ -580,6 +673,52 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             Ok(state) => self.agent(id, state, ok),
             Err(e) => map_error(&e),
         }
+    }
+}
+
+/// 409 for a change to an agent whose create is still booting.
+fn booting(id: &AgentId) -> Reply {
+    error(409, &format!("agent {id} is being created"))
+}
+
+/// A create through the lifecycle lock `api`, held only to reserve and to commit, so creates of
+/// different agents boot at the same time (ADR-027).
+pub fn create<R: Runtime, S: SessionStore>(
+    api: &Mutex<Api<R, S>>,
+    id: &AgentId,
+    body: &[u8],
+    may_attach: bool,
+) -> Reply {
+    let begun = {
+        let api = api.lock().unwrap_or_else(|e| e.into_inner());
+        api.begin_create(id, body, may_attach)
+    };
+    let creation = match begun {
+        Ok(c) => c,
+        Err(reply) => return reply,
+    };
+    // A panicking boot is a failed boot: it still reaches `finish_create`, which revokes the
+    // proxy credential, so the two never differ.
+    let booted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| creation.boot()))
+        .unwrap_or_else(|_| {
+            Err(PortError {
+                op: "create",
+                cause: "the boot panicked".into(),
+            })
+        });
+    let api = api.lock().unwrap_or_else(|e| e.into_inner());
+    api.finish_create(creation, booted)
+}
+
+/// The agent a `POST /api/v1/agents/{id}` creates, so the transport can boot it outside the
+/// lifecycle lock; `None` for any other request, or an id that does not parse (the locked path
+/// answers 400).
+pub fn create_target(method: &str, target: &str) -> Option<AgentId> {
+    let path = target.split_once('?').map_or(target, |(p, _)| p);
+    let id = path.strip_prefix(PREFIX)?;
+    match method == "POST" && !id.contains('/') {
+        true => AgentId::parse(id).ok(),
+        false => None,
     }
 }
 
@@ -792,6 +931,8 @@ pub(crate) fn escape(s: &str) -> String {
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use ac_ports::PortError;
 
@@ -1027,7 +1168,15 @@ mod tests {
             let p = |s| ProfileName::parse(s).map_err(|e| e.to_string());
             Ok(vec![
                 (p("node")?, Err("mode 644".into())),
-                (p("rust")?, Ok(2)),
+                (
+                    p("rust")?,
+                    ac_domain::Allowlist::new(["a.test", "b.test"]).map_err(|e| e.to_string()),
+                ),
+                (
+                    p("wall")?,
+                    ac_domain::Allowlist::parse_file("!exclusive\nendpoint mcp.test:8443\n")
+                        .map_err(|e| e.to_string()),
+                ),
             ])
         }
         fn base_hosts(&self) -> Result<usize, String> {
@@ -1062,7 +1211,7 @@ mod tests {
             call(&a, "GET", PROFILES),
             (
                 200,
-                r#"{"profiles":[{"name":"node","error":"mode 644"},{"name":"rust","hosts":2}]}"#
+                r#"{"profiles":[{"name":"node","error":"mode 644"},{"name":"rust","hosts":2},{"name":"wall","hosts":1,"exclusive":true}]}"#
                     .into()
             )
         );
@@ -1099,6 +1248,11 @@ mod tests {
             )
         );
         assert_eq!(e.of("a1"), ["rust"]);
+        // An exclusive profile drops the base list from the count.
+        assert_eq!(
+            send(&a, "PUT", path, r#"{"profiles":["wall","rust"]}"#, true).1,
+            r#"{"id":"a1","profiles":["wall","rust"],"effective_hosts":3}"#
+        );
         assert_eq!(
             send(&a, "PUT", path, r#"{"profiles":[]}"#, true).1,
             r#"{"id":"a1","profiles":[],"effective_hosts":3}"#
@@ -1112,7 +1266,7 @@ mod tests {
         );
         assert_eq!(
             call(&a, "GET", path).1,
-            r#"{"id":"a1","profiles":["gone"],"effective_hosts":3,"missing":["gone"]}"#
+            r#"{"id":"a1","profiles":["gone"],"effective_hosts":0,"missing":["gone"]}"#
         );
         let _ = call(&a, "DELETE", "/api/v1/agents/a1");
         assert_eq!(send(&a, "PUT", path, r#"{"profiles":[]}"#, true).0, 409);
@@ -1368,6 +1522,190 @@ mod tests {
         let mut got: Vec<u16> = racers.into_iter().map(|t| t.join().unwrap_or(0)).collect();
         got.sort_unstable();
         assert_eq!(got, [201, 507]);
+    }
+
+    /// Each create waits inside the runtime until `want` creates are inside at once, so a create
+    /// path that boots under the lifecycle lock times out instead of passing.
+    struct Gate {
+        inside: AtomicUsize,
+        want: usize,
+        fail: bool,
+    }
+    impl Gate {
+        fn new(want: usize, fail: bool) -> Self {
+            Self {
+                inside: AtomicUsize::new(0),
+                want,
+                fail,
+            }
+        }
+    }
+    impl Runtime for Gate {
+        fn create(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
+            self.inside.fetch_add(1, Ordering::SeqCst);
+            let start = Instant::now();
+            while self.inside.load(Ordering::SeqCst) < self.want {
+                if start.elapsed() > Duration::from_secs(5) {
+                    return Err(PortError {
+                        op: "create",
+                        cause: "creates did not overlap".into(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            match self.fail {
+                true => Err(PortError {
+                    op: "create",
+                    cause: "boot failed".into(),
+                }),
+                false => Ok(()),
+            }
+        }
+        fn pause(&self, _: &AgentId) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn resume(&self, _: &AgentId, _: &ac_ports::Boot) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn destroy(&self, _: &AgentId, _: bool) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn running(&self) -> Result<Vec<AgentId>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    type Locked = Arc<Mutex<Api<Gate, Store>>>;
+
+    fn gated(gate: Gate, admission: bool) -> Locked {
+        let mut fleet = Fleet::new(gate, Store::default());
+        if admission {
+            fleet = fleet.with_admission(Box::new(Shm9000), 512);
+        }
+        Arc::new(Mutex::new(Api::new(fleet)))
+    }
+
+    fn create_in(a: &Locked, id: &str) -> std::thread::JoinHandle<u16> {
+        let a = Arc::clone(a);
+        let id = AgentId::parse(id).unwrap_or_else(|e| panic!("{e}"));
+        std::thread::spawn(move || create(&a, &id, b"", false).status)
+    }
+
+    fn locked(a: &Locked, m: &str, t: &str) -> (u16, String) {
+        let api = a.lock().unwrap_or_else(|e| e.into_inner());
+        let r = api.handle(m, t, &Agents::All);
+        (r.status, r.body)
+    }
+
+    fn statuses(threads: Vec<std::thread::JoinHandle<u16>>) -> Vec<u16> {
+        let mut got: Vec<u16> = threads.into_iter().map(|t| t.join().unwrap_or(0)).collect();
+        got.sort_unstable();
+        got
+    }
+
+    /// Four creates boot at the same time: each waits in the runtime for all four.
+    #[test]
+    fn concurrent_creates_boot_outside_the_lock() {
+        let a = gated(Gate::new(4, false), false);
+        let threads: Vec<_> = ["c1", "c2", "c3", "c4"]
+            .iter()
+            .map(|id| create_in(&a, id))
+            .collect();
+        assert_eq!(statuses(threads), [201, 201, 201, 201]);
+        for id in ["c1", "c2", "c3", "c4"] {
+            let (_, body) = locked(&a, "GET", &format!("/api/v1/agents/{id}"));
+            assert!(body.contains(r#""state":"running""#), "{body}");
+        }
+    }
+
+    /// Room for two guests: of three creates booting at once, the reservations admit exactly two.
+    #[test]
+    fn unlocked_creates_cannot_over_admit() {
+        let a = gated(Gate::new(2, false), true);
+        let threads: Vec<_> = ["o1", "o2", "o3"]
+            .iter()
+            .map(|id| create_in(&a, id))
+            .collect();
+        assert_eq!(statuses(threads), [201, 201, 507]);
+    }
+
+    /// While an agent boots, every change to it is 409 and reads are served; afterwards it is
+    /// an ordinary running agent.
+    #[test]
+    fn a_booting_agent_refuses_changes() {
+        let a = gated(Gate::new(2, false), false);
+        let first = create_in(&a, "b1");
+        let start = Instant::now();
+        let b1 = AgentId::parse("b1").unwrap_or_else(|e| panic!("{e}"));
+        while !a.lock().is_ok_and(|api| api.is_booting(&b1)) {
+            assert!(start.elapsed() < Duration::from_secs(5), "b1 never booted");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for (m, t) in [
+            ("POST", "/api/v1/agents/b1"),
+            ("POST", "/api/v1/agents/b1/pause?force=false"),
+            ("DELETE", "/api/v1/agents/b1?purge=true&force=true"),
+            ("PUT", "/api/v1/agents/b1/egress"),
+            ("POST", "/api/v1/agents/b1/checkpoints"),
+            ("POST", "/api/v1/agents/b1/resume"),
+            ("POST", "/api/v1/agents/b1/restore"),
+            (
+                "DELETE",
+                "/api/v1/agents/b1/checkpoints/20261125T000000Z-0001",
+            ),
+            ("POST", "/api/v1/agents/b1/fork"),
+        ] {
+            let (status, body) = locked(&a, m, t);
+            assert_eq!(status, 409, "{m} {t}: {body}");
+            assert!(body.contains("is being created"), "{body}");
+        }
+        // A fork to the booting agent, from another one.
+        let (status, body) = {
+            let api = a.lock().unwrap_or_else(|e| e.into_inner());
+            let r = api.request(
+                "POST",
+                "/api/v1/agents/zz/fork",
+                br#"{"id":"b1"}"#,
+                &Agents::All,
+                false,
+            );
+            (r.status, r.body)
+        };
+        assert_eq!(status, 409, "fork to b1: {body}");
+        assert!(body.contains("is being created"), "{body}");
+        let (status, body) = locked(&a, "GET", "/api/v1/agents/b1");
+        assert_eq!(status, 200);
+        assert!(body.contains(r#""state":"creating""#), "{body}");
+        let second = create_in(&a, "b2");
+        assert_eq!(statuses(vec![first, second]), [201, 201]);
+        assert_eq!(
+            locked(&a, "POST", "/api/v1/agents/b1/pause?force=false").0,
+            200
+        );
+    }
+
+    /// A failed boot answers 500, leaves the agent `creating` as before, and frees the id: a
+    /// retry or a destroy is served, not refused as booting.
+    #[test]
+    fn a_failed_boot_releases_the_agent() {
+        let a = gated(Gate::new(1, true), true);
+        assert_eq!(statuses(vec![create_in(&a, "f1")]), [500]);
+        let (_, body) = locked(&a, "GET", "/api/v1/agents/f1");
+        assert!(body.contains(r#""state":"creating""#), "{body}");
+        assert_eq!(statuses(vec![create_in(&a, "f1")]), [500]);
+        let (status, body) = locked(&a, "DELETE", "/api/v1/agents/f1?purge=true&force=false");
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
+    fn only_a_bare_post_is_a_create_target() {
+        let a1 = AgentId::parse("a1").ok();
+        assert_eq!(create_target("POST", "/api/v1/agents/a1"), a1);
+        assert_eq!(create_target("POST", "/api/v1/agents/a1?x=1"), a1);
+        assert_eq!(create_target("GET", "/api/v1/agents/a1"), None);
+        assert_eq!(create_target("POST", "/api/v1/agents/a1/pause"), None);
+        assert_eq!(create_target("POST", "/api/v1/agents/BAD id"), None);
+        assert_eq!(create_target("POST", "/api/v1/agents"), None);
     }
 
     #[test]

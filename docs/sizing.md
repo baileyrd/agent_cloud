@@ -89,8 +89,9 @@ host RAM: MemAvailable was still 9.6 GiB at that moment.
 | Create while 6 agents run the load | **failed**: vsock timeout | 1 run |
 | Storm of 4 creates at once | 4.44 / 8.15 / 17.02 | 2 runs, n=8 |
 
-The storm mostly measures the gateway, not the disk. The gateway holds one lock across a create, so the four
-creates run one after another, and each create call lasts as long as its boot.
+The storm mostly measures the gateway, not the disk. The gateway held one lock across a create, so the four
+creates ran one after another, and each create call lasted as long as its boot. ADR-027 moves the boot out of
+the lock; this table is from before it.
 
 ## Claude Code (measured on a1)
 
@@ -554,7 +555,7 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
 - Free page reporting, virtio-mem. The `/dev/shm` resize and admission were checked live (ADR-012), but the
   staircase was not re-run with them.
 - A create while the load runs at N = 2–4; it was measured only at N=1 and N=6.
-- A truly parallel create storm. The gateway serializes creates.
+- A truly parallel create storm. Since ADR-027 creates boot outside the gateway's lock; not measured yet.
 
 ## Requirements that still hold
 

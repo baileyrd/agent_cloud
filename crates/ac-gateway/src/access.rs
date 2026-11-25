@@ -305,6 +305,12 @@ pub const ROUTES: &[Rule] = &[
                 false,
                 "A repeat with the same key returns the existing job.",
             ),
+            arg(
+                "credential",
+                Kind::Text,
+                false,
+                "An opaque short-lived secret for this job only, found in $AC_JOB_CREDENTIAL_FILE; never stored or shown.",
+            ),
         ],
     }),
     offer(rule("GET", "/api/v1/agents/{id}/jobs/{job}", S(JobsRead), None), Tool {
@@ -350,6 +356,17 @@ pub const ROUTES: &[Rule] = &[
     ), Tool {
         name: "cancel_job",
         about: "Cancel a queued or running job.",
+        send: Send::Query,
+        args: &[AGENT, JOB],
+    }),
+    offer(rule(
+        "GET",
+        "/api/v1/agents/{id}/jobs/{job}/witness",
+        S(JobsRead),
+        None,
+    ), Tool {
+        name: "get_job_witness",
+        about: "An ended job's witness record (ADR-029): state, times, exit code, changed paths and egress decisions, all from outside the VM, with its SHA-256.",
         send: Send::Query,
         args: &[AGENT, JOB],
     }),
@@ -562,6 +579,7 @@ mod tests {
             ("GET", job, S(JobsRead)),
             ("GET", &format!("{job}/output"), S(JobsRead)),
             ("POST", &format!("{job}/cancel"), S(JobsWrite)),
+            ("GET", &format!("{job}/witness"), S(JobsRead)),
             ("GET", "/api/v1/agents/a1/term", S(ViewerRead)),
             ("GET", "/api/v1/agents/a1/history", S(ViewerRead)),
             ("POST", &format!("{term}/window"), S(ViewerRead)),
@@ -576,7 +594,7 @@ mod tests {
         }
         assert_eq!(
             ROUTES.len(),
-            31,
+            32,
             "a new route needs a row above and in ADR-011"
         );
     }

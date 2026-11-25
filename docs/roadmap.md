@@ -63,7 +63,8 @@ items below in scope (R5). This file records what shipped and how it was verifie
   on another machine), daily by `ac-backup.timer`, with `ac-ctl restore-backup` replaying a chain (ADR-021; verified
   on BaileyServ 2026-10-29 against an SMB share on Beast: full and incremental backups of a1 and a2, a restore of
   a2; `ac-backup.timer` ran unattended every day 2026-10-30 to 2026-11-23, across a reboot). To do: boot a
-  restored workspace and read it back inside the VM; back up the registry, tokens and egress agents file too
+  restored workspace and read it back inside the VM. The registry, tokens and egress agents file are copied too
+  (ADR-021 addendum, `ac-ctl restore-state`); a live restore on the host is still to do
 - [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
   (BaileyServ, 2026-10-22)
 - [x] The watchdog tells slow from wedged: it acts only on sustained failures on an idle host, through a logged
@@ -79,7 +80,8 @@ items below in scope (R5). This file records what shipped and how it was verifie
   here instead of 3; builds 40% faster; 7% slower at 3 builds at once).
 - [ ] Measure a bigger build (a larger Rust workspace, C++ or npm) before trusting 2048 for every build
 - [ ] Measure on an SSD (every figure in sizing.md is from one rotational disk)
-- [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s)
+- [ ] Creates are serialized behind the gateway's API lock (a 4-agent storm takes 4 + 4 + 4 + 4 s). Fixed in
+  code (ADR-027: the VM boot runs outside the lock); the storm is still to be measured on the host
 - [x] Job start gate: a host-wide cap (cores), CPU PSI and load, and 15 s between starts; FIFO across agents;
   `queued_reason` and job counts in `GET /api/v1/capacity` (ADR-013)
 - [x] Measure the gate with real build jobs submitted together (`scripts/burst-test.sh`, 2026-10-24,
@@ -120,6 +122,9 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [x] Each job's changed paths in the agent's history, from btrfs snapshots at its start and end (ADR-019;
   verified on BaileyServ 2026-11-24: create, edit, rename and delete listed exactly, a cancelled job listed too,
   no snapshots left behind)
+- [ ] Each ended job's witness record (state, times, exit, changed paths, egress decisions) and its SHA-256,
+  from outside the VM, through REST and MCP (ADR-029, #1065). To verify on BaileyServ: a job's egress counts
+  match the proxy's journal
 
 ## Later
 - Local model option for an offline posture

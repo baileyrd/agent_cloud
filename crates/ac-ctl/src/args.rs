@@ -21,6 +21,7 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
        ac-ctl [--data DIR] [--workspaces DIR] [--keep N] [--full-every N] backup <dest> [<agent-id>...]
        ac-ctl [--data DIR] backups <dest> [<agent-id>]
        ac-ctl [--data DIR] [--workspaces DIR] restore-backup <dest> <agent-id> [<backup>]
+       ac-ctl [--data DIR] restore-state <dest> [<backup>]
        ac-ctl doctor [--profile idle|build|heavy] [--json] [--facts-file F] [--root DIR] [--explain]
        ac-ctl tune [--profile idle|build|heavy] [--facts-file F] [--root DIR] [--apply [--force] \
 [--restart-gateway]]
@@ -38,6 +39,11 @@ pub const USAGE: &str = "usage: ac-ctl --image IMAGE [--data DIR] [--workspaces 
     backed up (a plain directory needs workspace migrate). backups lists them. restore-backup
     replays one (default the newest) in place of a workspace with no VM, keeping the old one as
     a checkpoint. None of the three opens the registry: they work while ac-gateway runs.
+    backup with no agent named also copies the control-plane state to <dest>/_state/<id>/: the
+    agent list the gateway mirrors to <data>/state/agents, the tokens file (AC_TOKENS) and the
+    egress agents file (AC_EGRESS_AGENTS), with a manifest of checksums; --keep applies. backups
+    lists them as `state <id>`. restore-state (gateway stopped, no agents in the registry) puts
+    one back: the agents and their states, and the two files where none or the same is there.
   doctor compares this host's settings with what its facts recommend for the profile (ADR-014):
     read-only; exit 0 all ok, 1 warnings, 4 errors. --facts-file plans a host from a JSON file of
     facts (deploy/hosts/) instead of this one; --explain lists every rule and its evidence.
@@ -107,6 +113,8 @@ pub enum BackupOp {
     List(Option<AgentId>),
     /// Restore one backup (`None`: the newest) of the agent.
     Restore(AgentId, Option<BackupId>),
+    /// Restore one state backup (`None`: the newest) into a data directory with no agents.
+    RestoreState(Option<BackupId>),
 }
 
 /// `ac-ctl doctor`.
@@ -302,7 +310,10 @@ fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<Strin
         }
     }
     let word = pos.first().cloned().unwrap_or_default();
-    if !matches!(word.as_str(), "backup" | "backups" | "restore-backup") {
+    if !matches!(
+        word.as_str(),
+        "backup" | "backups" | "restore-backup" | "restore-state"
+    ) {
         return Ok(Err(all));
     }
     let (mut data, mut workspaces) = (PathBuf::from("/var/lib/agent-cloud"), None::<PathBuf>);
@@ -335,6 +346,12 @@ fn backup(args: impl Iterator<Item = String>) -> Result<Result<Backup, Vec<Strin
         "backups" => BackupOp::List(
             rest.next()
                 .map(|a| AgentId::parse(&a))
+                .transpose()
+                .map_err(ArgError::BadId)?,
+        ),
+        "restore-state" => BackupOp::RestoreState(
+            rest.next()
+                .map(|b| BackupId::parse(&b))
                 .transpose()
                 .map_err(ArgError::BadId)?,
         ),
@@ -656,7 +673,12 @@ mod tests {
         let cp = BackupId::parse("20261028-130512").ok();
         assert_eq!(
             b("--workspaces /w restore-backup /b a1 20261028-130512").op,
-            BackupOp::Restore(a("a1"), cp)
+            BackupOp::Restore(a("a1"), cp.clone())
+        );
+        assert_eq!(b("restore-state /b").op, BackupOp::RestoreState(None));
+        assert_eq!(
+            b("--data /d restore-state /b 20261028-130512").op,
+            BackupOp::RestoreState(cp)
         );
         for (line, want) in [
             ("backup", "missing backup destination"),

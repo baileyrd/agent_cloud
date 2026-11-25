@@ -17,6 +17,8 @@ use ac_egress::{Limits, Proxy, Upstream};
 use rusty_sha2::{Hash, Sha256};
 
 const PUBLIC: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1));
+/// A tailnet address: only an endpoint may reach it.
+const TAILNET: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(100, 101, 2, 3));
 
 struct Fake {
     names: HashMap<&'static str, IpAddr>,
@@ -30,7 +32,7 @@ impl Upstream for Fake {
     }
 
     fn connect(&self, addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
-        if addr.ip() != PUBLIC {
+        if addr.ip() != PUBLIC && addr.ip() != TAILNET {
             return Err(io::ErrorKind::ConnectionRefused.into());
         }
         TcpStream::connect_timeout(&self.echo, timeout)
@@ -62,6 +64,7 @@ fn start_with(limits: Limits, files: Option<EgressFiles>) -> SocketAddr {
         ("crates.test", PUBLIC),
         ("lan.test", IpAddr::from([192, 168, 50, 1])),
         ("meta.test", IpAddr::from([169, 254, 169, 254])),
+        ("mcp.test", TAILNET),
     ]);
     let list = Allowlist::new(["allowed.test", "lan.test", "meta.test", "gone.test"])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -218,8 +221,8 @@ fn digest_hex(secret: &str) -> String {
         .collect()
 }
 
-/// A directory with the agents file (a1 secret S1, a2 secret S2, a3 paused) and a `rust`
-/// profile allowing crates.test. a1's profiles are `a1_profiles`.
+/// A directory with the agents file (a1 secret S1, a2 secret S2, a3 paused), a `rust`
+/// profile allowing crates.test and an exclusive `gateway` profile with the endpoint mcp.test:8443. a1's profiles are `a1_profiles`.
 fn egress_dir(a1_profiles: &str) -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -228,6 +231,10 @@ fn egress_dir(a1_profiles: &str) -> PathBuf {
     let _ = std::fs::create_dir_all(dir.join("profiles"));
     let _ = std::fs::set_permissions(dir.join("profiles"), std::fs::Permissions::from_mode(0o700));
     write_private(&dir.join("profiles/rust.txt"), "crates.test\n");
+    write_private(
+        &dir.join("profiles/gateway.txt"),
+        "!exclusive\nendpoint mcp.test:8443\n",
+    );
     write_agents(&dir, a1_profiles);
     dir
 }
@@ -318,6 +325,35 @@ fn a_bad_credential_gets_407_never_the_base_list() {
             "{head}"
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_gateway_profile_reaches_only_the_gateway() {
+    let dir = egress_dir("gateway");
+    let proxy = start_with(Limits::default(), Some(files(&dir)));
+    let a1 = creds(&format!("a1:{S1}"));
+    assert_eq!(ask(proxy, "mcp.test:8443", &a1).0, 200);
+    for target in [
+        "mcp.test:443",
+        "mcp.test:22",
+        "allowed.test:443",
+        "crates.test:443",
+        "lan.test:443",
+    ] {
+        assert_eq!(ask(proxy, target, &a1).0, 403, "{target}");
+    }
+    // Anyone else: the endpoint is not theirs.
+    assert_eq!(ask(proxy, "mcp.test:8443", "").0, 403);
+    assert_eq!(
+        ask(proxy, "mcp.test:8443", &creds(&format!("a2:{S2}"))).0,
+        403
+    );
+    // With a mirror profile beside it.
+    write_agents(&dir, "gateway,rust");
+    assert_eq!(ask(proxy, "crates.test:443", &a1).0, 200);
+    assert_eq!(ask(proxy, "mcp.test:8443", &a1).0, 200);
+    assert_eq!(ask(proxy, "allowed.test:443", &a1).0, 403);
     let _ = std::fs::remove_dir_all(dir);
 }
 

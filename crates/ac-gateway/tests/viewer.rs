@@ -1270,7 +1270,8 @@ fn mcp_tools_follow_the_token_scopes() {
             "submit_job",
             "get_job",
             "get_job_output",
-            "cancel_job"
+            "cancel_job",
+            "get_job_witness"
         ]
     );
     assert_eq!(names(TOKEN).len(), ac_gateway::mcp::offers().count());

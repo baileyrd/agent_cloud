@@ -54,6 +54,9 @@ impl fmt::Display for Reason {
 pub enum Decision {
     /// Resolve the name and connect (after [`vet`]).
     Allow,
+    /// An operator's endpoint (`endpoint host:port` in a profile): resolve and connect after
+    /// [`vet_endpoint`], which accepts private addresses such as the tailnet's.
+    Endpoint,
     /// Refuse.
     Deny(Reason),
 }
@@ -149,18 +152,28 @@ pub fn identify(policy: &Policy, presented: &Presented) -> Result<Caller, Refuse
     Ok(Caller::Agent(agent.clone()))
 }
 
-/// The list `caller` gets: the base list, plus each attached profile that exists. A profile
-/// with no file adds nothing (the reader warns about it).
+/// The list `caller` gets: the base list, plus each attached profile that exists. If any
+/// attached profile is exclusive, the base list is left out: the agent reaches only what its
+/// profiles allow. An attached profile with no usable version (deleted, or never parsed since
+/// the proxy started) also leaves the base list out, since it may have been exclusive: the wall
+/// fails closed. The reader warns about it.
 pub fn allowlist(policy: &Policy, caller: &Caller) -> Allowlist {
-    let mut list = policy.base.clone();
     let Caller::Agent(id) = caller else {
-        return list;
+        return policy.base.clone();
     };
     let attached = policy.agents.iter().find(|a| &a.agent == id);
-    for name in attached.map_or(&[][..], |a| &a.profiles) {
-        if let Some(profile) = policy.profiles.get(name) {
-            list.merge(profile);
-        }
+    let names = attached.map_or(&[][..], |a| &a.profiles);
+    let profiles: Vec<&Allowlist> = names
+        .iter()
+        .filter_map(|name| policy.profiles.get(name))
+        .collect();
+    let closed = profiles.len() < names.len() || profiles.iter().any(|p| p.exclusive());
+    let mut list = match closed {
+        true => Allowlist::default(),
+        false => policy.base.clone(),
+    };
+    for profile in profiles {
+        list.merge(profile);
     }
     list
 }
@@ -197,8 +210,12 @@ pub fn judge(policy: &Policy, presented: &Presented, host: &str, port: u16) -> V
 
 /// Whether an agent may reach `host:port`. `host` must be a name on `list`: IP literals are
 /// refused, including forms like `127.1` or `2130706433` that resolvers also read as addresses.
+/// An endpoint on `list` allows exactly its host and port, whatever the port.
 pub fn decide(host: &str, port: u16, list: &Allowlist) -> Decision {
     let deny = Decision::Deny;
+    if list.endpoint(host, port) {
+        return Decision::Endpoint;
+    }
     if !PORTS.contains(&port) {
         return deny(Reason::Port(port));
     }
@@ -227,6 +244,86 @@ pub fn decide(host: &str, port: u16, list: &Allowlist) -> Decision {
 /// One non-public address refuses the lot: an allowed name that points into the LAN is hostile.
 pub fn vet(mut addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, Reason> {
     if let Some(bad) = addrs.iter().find(|a| !is_public(a.ip())) {
+        return Err(Reason::Private(bad.ip()));
+    }
+    if addrs.is_empty() {
+        return Err(Reason::NoAddress);
+    }
+    addrs.sort_by_key(SocketAddr::is_ipv6);
+    Ok(addrs)
+}
+
+/// The agents' bridge subnet, IPv4 `a.b.c.d/n`: an endpoint must never resolve into it (another
+/// agent, or the host's bridge address, which the proxy's unit may reach).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentNet {
+    base: u32,
+    prefix: u8,
+}
+
+impl AgentNet {
+    /// The default CNI bridge, `10.89.0.0/16`.
+    pub const DEFAULT: Self = Self {
+        base: u32::from_be_bytes([10, 89, 0, 0]),
+        prefix: 16,
+    };
+
+    /// Parse `a.b.c.d/n` with `n` in 8..=32; host bits are cleared.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad = || format!("{s:?}: expected an IPv4 subnet such as 10.89.0.0/16");
+        let (ip, prefix) = s.split_once('/').ok_or_else(bad)?;
+        let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| bad())?;
+        let prefix: u8 = prefix.parse().map_err(|_| bad())?;
+        if !(8..=32).contains(&prefix) {
+            return Err(bad());
+        }
+        let base = u32::from(ip) & Self::mask(prefix);
+        Ok(Self { base, prefix })
+    }
+
+    fn mask(prefix: u8) -> u32 {
+        u32::MAX << (32 - u32::from(prefix))
+    }
+
+    /// Whether `ip` is in it (an IPv6 address never is; v4-mapped ones are refused anyway).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => u32::from(v4) & Self::mask(self.prefix) == self.base,
+            IpAddr::V6(_) => false,
+        }
+    }
+}
+
+/// The addresses the proxy may connect to for an endpoint: all of `addrs`, IPv4 first, unless
+/// one is this host's own (loopback, unspecified), link-local, multicast or broadcast. Private
+/// ranges (the tailnet, the LAN) are what endpoints are for. Pointing an endpoint at this host's
+/// own LAN or tailnet address would reach the host's services: the operator must name another
+/// machine.
+pub fn vet_endpoint(
+    mut addrs: Vec<SocketAddr>,
+    agents: AgentNet,
+) -> Result<Vec<SocketAddr>, Reason> {
+    let local = |ip: IpAddr| {
+        agents.contains(ip)
+            || match ip {
+                IpAddr::V4(v4) => {
+                    v4.is_loopback()
+                        || v4.is_unspecified()
+                        || v4.is_link_local()
+                        || v4.is_multicast()
+                        || v4.is_broadcast()
+                        || v4.octets()[0] == 0
+                }
+                IpAddr::V6(v6) => {
+                    v6.is_loopback()
+                        || v6.is_unspecified()
+                        || v6.is_multicast()
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        || v6.to_ipv4_mapped().is_some()
+                }
+            }
+    };
+    if let Some(bad) = addrs.iter().find(|a| local(a.ip())) {
         return Err(Reason::Private(bad.ip()));
     }
     if addrs.is_empty() {
@@ -310,7 +407,7 @@ mod tests {
                 (profile("node"), entries(&["registry.npmjs.org"])),
             ]),
             agents: vec![
-                line("a1", Some(S1), &["missing", "rust"]),
+                line("a1", Some(S1), &["rust"]),
                 line("a2", Some(S2), &[]),
                 line("a3", None, &["rust"]),
             ],
@@ -350,7 +447,7 @@ mod tests {
                 "{host}"
             );
         }
-        // Not attached (node), and the missing profile adds nothing.
+        // Not attached (node).
         assert_eq!(
             verdict(&a1, "registry.npmjs.org"),
             Verdict::Decided(me(), Decision::Deny(Reason::NotAllowed))
@@ -399,6 +496,151 @@ mod tests {
         ));
     }
 
+    /// a4 has the exclusive `gateway` profile (one endpoint on the tailnet) and the `rust` mirror;
+    /// a5 has `gateway` alone.
+    fn walled() -> Policy {
+        let mut p = policy();
+        let gateway = Allowlist::parse_file("!exclusive\nendpoint mcp.tail.ts.net:8443\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        p.profiles.insert(profile("gateway"), gateway);
+        p.agents.push(Attachment {
+            agent: id("a4"),
+            digest: Some(digest(S1)),
+            profiles: vec![profile("gateway"), profile("rust")],
+        });
+        p.agents.push(Attachment {
+            agent: id("a5"),
+            digest: Some(digest(S2)),
+            profiles: vec![profile("gateway")],
+        });
+        p
+    }
+
+    #[test]
+    fn an_exclusive_gateway_profile_reaches_only_the_gateway() {
+        let p = walled();
+        let a5 = basic("a5", S2);
+        let me = || Caller::Agent(id("a5"));
+        let at = |host: &str, port: u16| judge(&p, &a5, host, port);
+        assert_eq!(
+            at("mcp.tail.ts.net", 8443),
+            Verdict::Decided(me(), Decision::Endpoint)
+        );
+        assert_eq!(
+            at("MCP.tail.ts.net.", 8443),
+            Verdict::Decided(me(), Decision::Endpoint)
+        );
+        // The gateway host is no generic CONNECT target: any other port is refused.
+        for port in [443, 80, 22, 8444] {
+            assert!(
+                matches!(
+                    at("mcp.tail.ts.net", port),
+                    Verdict::Decided(_, Decision::Deny(_))
+                ),
+                "{port}"
+            );
+        }
+        // No base list: the model API and GitHub are gone too.
+        for host in ["api.anthropic.com", "github.com", "index.crates.io"] {
+            assert_eq!(
+                at(host, 443),
+                Verdict::Decided(me(), Decision::Deny(Reason::NotAllowed)),
+                "{host}"
+            );
+        }
+        assert_eq!(allowlist(&p, &me()).len(), 1);
+        // Anonymous callers and other agents keep the base list and never get the endpoint.
+        assert!(matches!(
+            judge(&p, &Presented::None, "mcp.tail.ts.net", 8443),
+            Verdict::Decided(_, Decision::Deny(Reason::Port(8443)))
+        ));
+        assert!(matches!(
+            judge(&p, &basic("a1", S1), "api.anthropic.com", 443),
+            Verdict::Decided(_, Decision::Allow)
+        ));
+    }
+
+    #[test]
+    fn a_missing_profile_fails_closed() {
+        let mut p = policy();
+        p.agents[0].profiles = vec![profile("missing"), profile("rust")];
+        let a1 = basic("a1", S1);
+        assert!(matches!(
+            judge(&p, &a1, "index.crates.io", 443),
+            Verdict::Decided(_, Decision::Allow)
+        ));
+        assert!(matches!(
+            judge(&p, &a1, "api.anthropic.com", 443),
+            Verdict::Decided(_, Decision::Deny(Reason::NotAllowed))
+        ));
+    }
+
+    #[test]
+    fn a_mirror_profile_composes_with_the_gateway() {
+        let p = walled();
+        let a4 = basic("a4", S1);
+        let me = || Caller::Agent(id("a4"));
+        assert_eq!(
+            judge(&p, &a4, "index.crates.io", 443),
+            Verdict::Decided(me(), Decision::Allow)
+        );
+        assert_eq!(
+            judge(&p, &a4, "mcp.tail.ts.net", 8443),
+            Verdict::Decided(me(), Decision::Endpoint)
+        );
+        assert_eq!(
+            judge(&p, &a4, "api.anthropic.com", 443),
+            Verdict::Decided(me(), Decision::Deny(Reason::NotAllowed))
+        );
+    }
+
+    #[test]
+    fn endpoints_may_be_private_but_never_this_host() {
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            vet_endpoint(
+                vec![addr("[fd7a:115c:a1e0::1]:8443"), addr("100.101.2.3:8443")],
+                AgentNet::DEFAULT
+            ),
+            Ok(vec![
+                addr("100.101.2.3:8443"),
+                addr("[fd7a:115c:a1e0::1]:8443")
+            ])
+        );
+        assert!(vet_endpoint(vec![addr("192.168.50.10:8443")], AgentNet::DEFAULT).is_ok());
+        for bad in [
+            "127.0.0.1:8443",
+            "0.0.0.0:8443",
+            "169.254.1.1:8443",
+            "224.0.0.1:8443",
+            "[::1]:8443",
+            "[fe80::1]:8443",
+            "[::ffff:127.0.0.1]:8443",
+            "10.89.0.1:8443",
+            "10.89.3.7:8443",
+        ] {
+            assert!(
+                matches!(
+                    vet_endpoint(vec![addr("10.0.0.2:8443"), addr(bad)], AgentNet::DEFAULT),
+                    Err(Reason::Private(_))
+                ),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            vet_endpoint(Vec::new(), AgentNet::DEFAULT),
+            Err(Reason::NoAddress)
+        );
+        let other = AgentNet::parse("10.200.1.9/24").unwrap_or_else(|e| panic!("{e}"));
+        assert!(vet_endpoint(vec![addr("10.89.0.1:8443")], other).is_ok());
+        assert!(vet_endpoint(vec![addr("10.200.1.250:8443")], other).is_err());
+        for bad in ["10.89.0.0", "10.89.0.0/7", "10.89.0.0/33", "x/16", "::1/64"] {
+            assert!(AgentNet::parse(bad).is_err(), "{bad}");
+        }
+        // The ordinary check still refuses the tailnet.
+        assert!(vet(vec![addr("100.101.2.3:8443")]).is_err());
+    }
+
     #[test]
     fn would_allow_names_profiles_for_the_log() {
         let p = policy();
@@ -417,7 +659,7 @@ mod tests {
 
     fn reason(host: &str, port: u16) -> Option<Reason> {
         match decide(host, port, &list()) {
-            Decision::Allow => None,
+            Decision::Allow | Decision::Endpoint => None,
             Decision::Deny(r) => Some(r),
         }
     }

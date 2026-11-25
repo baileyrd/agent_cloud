@@ -38,9 +38,14 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # Second line of defence for the public-address check: no private destinations except the
-# agents themselves and the host's resolver stub.
+# agents themselves and the host's resolver stub. A profile `endpoint` on the tailnet or LAN (the MCP
+# gateway, ADR-016 addendum) needs its address allowed here too, with a drop-in:
+#   sudo systemctl edit ac-egress   ->   [Service]  IPAddressAllow=<gateway address>/32
 IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
 IPAddressAllow=10.89.0.0/16 127.0.0.53
+# Every decision line counts in a job's witness record (ADR-029): journald must not drop them when a job
+# floods the proxy with requests.
+LogRateLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

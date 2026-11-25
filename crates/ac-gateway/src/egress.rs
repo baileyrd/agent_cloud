@@ -24,12 +24,12 @@ const MAX_BYTES: u64 = 64 * 1024;
 /// The variables a boot overrides: the image sets the same names without a credential.
 pub const PROXY_VARS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
 
-/// Every profile by name: its entry count, or why the proxy would refuse it.
-pub type Listed = Vec<(ProfileName, Result<usize, String>)>;
+/// Every profile by name: its parsed list, or why the proxy would refuse it.
+pub type Listed = Vec<(ProfileName, Result<Allowlist, String>)>;
 
 /// Profiles and attachments, for the egress routes.
 pub trait Profiles: Send + Sync {
-    /// Every profile by name: its entry count, or why the proxy would refuse it.
+    /// Every profile by name: its parsed list, or why the proxy would refuse it.
     fn list(&self) -> Result<Listed, String>;
     /// Entries in the base list every agent gets.
     fn base_hosts(&self) -> Result<usize, String>;
@@ -195,12 +195,10 @@ impl Profiles for EgressStore {
             let Ok(name) = ProfileName::parse(stem) else {
                 continue;
             };
-            let hosts = read_private(&path, self.owner)
-                .and_then(|t| {
-                    Allowlist::parse_file(&t.unwrap_or_default()).map_err(|e| e.to_string())
-                })
-                .map(|l| l.len());
-            out.push((name, hosts));
+            let list = read_private(&path, self.owner).and_then(|t| {
+                Allowlist::parse_file(&t.unwrap_or_default()).map_err(|e| e.to_string())
+            });
+            out.push((name, list));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
@@ -208,7 +206,7 @@ impl Profiles for EgressStore {
 
     fn base_hosts(&self) -> Result<usize, String> {
         let text = read_private(&self.base, self.owner)?.unwrap_or_default();
-        Allowlist::parse_file(&text)
+        Allowlist::parse_base(&text)
             .map(|l| l.len())
             .map_err(|e| format!("{}: {e}", self.base.display()))
     }
@@ -404,7 +402,7 @@ mod tests {
             .1
             .as_ref()
             .is_err_and(|e| e.contains("group/world")));
-        assert_eq!(listed[1].1, Ok(2));
+        assert_eq!(listed[1].1.as_ref().map(Allowlist::len), Ok(2));
         assert_eq!(s.base_hosts(), Ok(2));
         assert_eq!(s.attached(&id("a1")), Ok(vec![]));
         assert!(s.attach(&id("a1"), &[p("rust")]).is_ok());

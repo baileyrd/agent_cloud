@@ -81,9 +81,8 @@ esac
 val() { sed -n "s/^$1=//p" "$ENV" | tail -n 1; }
 BIND=$(val AC_BIND)
 [ -z "$(val AC_TOKENS)" ] || export AC_TOKENS="$(val AC_TOKENS)" 
-# An admin token: the legacy AC_TOKEN_FILE, else the owner token from docs/install.md.
-TOKEN_FILE=$(val AC_TOKEN_FILE)
-[ -n "$TOKEN_FILE" ] || TOKEN_FILE=/etc/agent-cloud/owner.token
+# An admin token: the owner token from docs/install.md.
+TOKEN_FILE=/etc/agent-cloud/owner.token
 # The token goes to curl on stdin, not on its command line. $3: an optional (constant) JSON body.
 api() {
     printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")" |

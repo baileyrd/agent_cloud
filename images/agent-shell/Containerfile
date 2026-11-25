@@ -7,7 +7,7 @@ ARG CLAUDE_CODE_VERSION=latest
 
 RUN dnf install -y --setopt=install_weak_deps=False \
         nodejs npm git openssh-clients ripgrep jq procps-ng findutils which less tmux vim-minimal \
-        gcc gcc-c++ make python3 tini \
+        gcc gcc-c++ make python3 python3-pip tini \
     && dnf clean all
 
 # Installed globally by root: the agent user cannot modify or self-update it.

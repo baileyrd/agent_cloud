@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn gateway_bind_from_env_then_file_then_default() {
         let file =
-            || Some("# x\nAC_TOKEN_FILE=/t\nAC_BIND=10.0.0.1:1\n AC_BIND=100.64.0.2:8780\n".into());
+            || Some("# x\nAC_TOKENS=/t\nAC_BIND=10.0.0.1:1\n AC_BIND=100.64.0.2:8780\n".into());
         assert_eq!(
             gateway_bind(Some("127.0.0.1:9".into()), file()),
             "127.0.0.1:9"

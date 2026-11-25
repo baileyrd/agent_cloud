@@ -29,8 +29,9 @@ may execute untrusted code or be steered by prompt injection from web content.
 
 - [ ] `/dev/kvm` present; every agent runs under the Kata runtime class, never plain runc
 - [ ] SELinux enforcing; denials reviewed instead of disabling it
-- [ ] Gateway reachable only over Tailscale with HTTPS and a bearer token: on loopback behind
-  `tailscale serve` (ADR-024; to verify on BaileyServ)
+- [x] Gateway reachable only over Tailscale with HTTPS and a bearer token: on loopback behind
+  `tailscale serve` (ADR-024; verified on BaileyServ 2026-11-24: 401 without a token, 403 for a foreign Origin,
+  the same after a reboot)
 - [x] nftables egress rules: agents reach only the egress proxy (verified 2026-10-19 from a1:
   direct connections to the internet, the LAN, 169.254.169.254 and other host ports refused;
   no DNS)
@@ -51,7 +52,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] No git remotes with embedded tokens in workspaces
 - [ ] Data directory (registry + event logs) owned by the control-plane user, mode 0700; one process per directory is enforced by a lock
 - [ ] Backups for the data directory and workspace volumes, with a tested restore (workspaces: ADR-021, verified on
-  BaileyServ to an encrypted SMB share on Beast; the rest of the data directory: not yet)
+  BaileyServ to an encrypted SMB share on Beast, daily timer running unattended since 2026-10-30; the rest of
+  the data directory: not yet, Mill Board #467)
 - [ ] Production desktop image: Chromium managed policy applied; DevTools policy decided
 - [x] Terminal viewer: view-only by default, enforced in the gateway; one take-over holder;
   agent output sanitised to text and SGR before the browser (verified 2026-10-20, see [Viewer](#viewer))
@@ -99,7 +101,7 @@ What a stolen token gives its holder (on the private bind, until revoked):
 | `viewer:read` | Watch the listed agents' terminals live (any of their tmux windows) and read their history, which shows whatever the agents printed, secrets included | Type, take over, run jobs or change any agent's state; picking a window changes only its own view |
 | `viewer:control` (with `viewer:read`) | Take over the listed agents' shells: everything their agent users can do, including their logins | Change agent state or run jobs through the API (its shell access makes this moot inside those agents) |
 | `egress:write` (with `agents:read`) | Attach any installed profile to the listed agents, so those agents can reach its hosts (for `rust`, fetch and build any published crate) | Define hosts, change the base list, or reach anything itself; every change is audited |
-| `admin` (or the legacy `AC_TOKEN_FILE` token) | Everything on every agent: create, destroy and purge workspaces, run jobs, take over shells | Reach the host beyond what the agents' VMs and the egress allowlist allow |
+| `admin` | Everything on every agent: create, destroy and purge workspaces, run jobs, take over shells | Reach the host beyond what the agents' VMs and the egress allowlist allow |
 
 Revoke with `sudo ac-gateway token revoke <name>`; the gateway stops honouring it within a second. Audit lines
 (`audit token=<name> action=...`) in the journal and in each agent's history show what a token did.

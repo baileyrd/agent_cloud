@@ -1301,14 +1301,14 @@ impl ac_gateway::viewer::Terminal for NoTerm {
     }
 }
 
-fn legacy() -> Keys {
+fn admin_keys() -> Keys {
     let mut t = Tokens::default();
-    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let _ = t.add(Token::admin("owner", TOKEN));
     Keys::new(t)
 }
 
 fn serve(r: &Rig) -> SocketAddr {
-    serve_with(r, legacy())
+    serve_with(r, admin_keys())
 }
 
 fn serve_with(r: &Rig, keys: Keys) -> SocketAddr {
@@ -1317,7 +1317,7 @@ fn serve_with(r: &Rig, keys: Keys) -> SocketAddr {
 
 /// Behind `tailscale serve` (ADR-024): failures are logged with the `Tailscale-User-Login`.
 fn serve_behind_tailscale(r: &Rig) -> SocketAddr {
-    serve_app(r, legacy(), true)
+    serve_app(r, admin_keys(), true)
 }
 
 fn serve_app(r: &Rig, keys: Keys, tailscale: bool) -> SocketAddr {
@@ -1433,7 +1433,7 @@ fn routes_over_http() {
     }
 }
 
-/// Tokens made as `ac-gateway token create` makes them, plus the legacy one.
+/// Tokens made as `ac-gateway token create` makes them, plus an admin one.
 struct Scoped {
     file: TokenFile,
     keys: Keys,
@@ -1470,7 +1470,7 @@ fn scoped(root: &Path) -> Scoped {
 /// What the gateway's watcher does when the file changes.
 fn reload(file: &TokenFile, keys: &Keys) {
     let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
-    let _ = t.add(Token::admin(tokens::LEGACY, TOKEN));
+    let _ = t.add(Token::admin("owner", TOKEN));
     keys.set(t);
 }
 
@@ -1576,7 +1576,7 @@ fn scoped_tokens_over_http() {
     );
     assert_eq!(status(&t.read_a1, "GET", "/api/v1/agents/a2"), 404);
 
-    // The legacy token still does everything; audit lines name the token, never the secret.
+    // The admin token still does everything; audit lines name the token, never the secret.
     assert_eq!(status(TOKEN, "POST", "/api/v1/agents/a2/pause"), 200);
     let (_, _, history) = request(addr, "GET", &format!("{base}/history"), "");
     assert!(
@@ -1587,7 +1587,7 @@ fn scoped_tokens_over_http() {
     );
     let (_, _, history) = request(addr, "GET", "/api/v1/agents/a2/history", "");
     assert!(
-        history.contains("audit token=legacy action=pause status=200"),
+        history.contains("audit token=owner action=pause status=200"),
         "{history}"
     );
     assert!(!history.contains(TOKEN) && !history.contains(&t.jobs_a1));

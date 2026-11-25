@@ -279,10 +279,12 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   length or inode changes (checked each second). At startup a file that is unreadable, not a regular file,
   owned by another user, group/world accessible, over 64 KiB or malformed (unknown scope, bad agent id, bad
   digest, duplicate name or digest) stops the gateway; so does having no token at all. A bad later version is
-  logged and the current tokens stay; a deleted file leaves only the legacy token. A revoked token's open
+  logged and the current tokens stay; a deleted file leaves no tokens. A revoked token's open
   viewer streams end at their next message or keep-alive (within about 5 s).
 - *Legacy:* `AC_TOKEN_FILE` still works and is the `admin` token for every agent named `legacy` (a reserved
   name). Deprecated: the gateway says so at startup; migrate as in install.md and drop it later.
+  *Removed 2026-11-24 (#640):* no host uses it; a gateway.env that still sets it refuses the start, and
+  `legacy` is no longer a reserved name.
 - *Matching:* the presented `Bearer` token is hashed with SHA-256 (`rusty_sha2`) and compared with every
   digest using `rusty_crypto_key::constant_time_eq` (both first-party, ADR-008).
 - *Routes:* every route under `/api/` has exactly one entry in `access::ROUTES`, checked before dispatch. A path

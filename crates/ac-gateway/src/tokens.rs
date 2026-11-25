@@ -5,8 +5,7 @@
 //! is a comma list of [`Scope`] names, `agents` is `*` or a comma list of agent ids, `sha256` is the
 //! hex digest of the token (the token itself is shown once, by `ac-gateway token create`, and never
 //! stored), `created` and `expires` are Unix seconds (ADR-022: from `expires` on, the token is
-//! refused; without it, the token lasts until revoked). The old single token (`AC_TOKEN_FILE`) is
-//! an implicit `admin` token for every agent named `legacy`.
+//! refused; without it, the token lasts until revoked).
 //!
 //! The file is re-read when it changes (as ac-egress's allowlist is): a missing file means no file
 //! tokens; an unreadable, too open or malformed one is an error, so the gateway refuses to start
@@ -27,8 +26,6 @@ use rusty_sha2::{Hash, Sha256};
 const MAX_BYTES: u64 = 64 * 1024;
 /// Longest token name.
 const MAX_NAME: usize = 32;
-/// The implicit token from `AC_TOKEN_FILE`.
-pub const LEGACY: &str = "legacy";
 /// Written at the top of a new tokens file.
 const HEADER: &str =
     "# agent-cloud API tokens (ADR-011, ADR-022): name scopes agents sha256(token) created [expires]\n\
@@ -195,7 +192,7 @@ impl fmt::Debug for Token {
 }
 
 impl Token {
-    /// An `admin` token for every agent with this name and secret (the legacy token, tests).
+    /// An `admin` token for every agent with this name and secret (tests).
     pub fn admin(name: &str, secret: &str) -> Self {
         Self {
             name: name.to_owned(),
@@ -238,9 +235,6 @@ impl Tokens {
                 continue;
             }
             let token = parse_line(line).map_err(|e| format!("line {}: {e}", n + 1))?;
-            if token.name == LEGACY {
-                return Err(format!("line {}: the name {LEGACY} is reserved", n + 1));
-            }
             tokens
                 .add(token)
                 .map_err(|e| format!("line {}: {e}", n + 1))?;
@@ -714,7 +708,6 @@ mod tests {
                 format!("{} jobs:read a1 {DIGEST}", "a".repeat(33)),
                 "bad token name",
             ),
-            (format!("legacy admin * {DIGEST}"), "reserved"),
             (format!("{ok}\n{ok}"), "line 2: duplicate token name"),
             (
                 format!("{ok}\nother admin * {DIGEST}"),
@@ -769,9 +762,9 @@ mod tests {
     #[test]
     fn find_needs_the_exact_bearer_token() {
         let mut t = parse(&format!("ci jobs:read a1 {DIGEST}"));
-        let _ = t.add(Token::admin(LEGACY, "s3cret"));
+        let _ = t.add(Token::admin("owner", "s3cret"));
         assert!(matches!(t.find(Some("Bearer test")), Presented::Known(k) if k.name == "ci"));
-        assert!(matches!(t.find(Some("Bearer s3cret")), Presented::Known(k) if k.name == LEGACY));
+        assert!(matches!(t.find(Some("Bearer s3cret")), Presented::Known(k) if k.name == "owner"));
         for missing in [
             None,
             Some(""),
@@ -959,7 +952,7 @@ mod tests {
         assert!(!t.live(20) && !t.live(u64::MAX), "at and after");
         t.expires = None;
         assert!(t.live(u64::MAX), "no expiry: until revoked");
-        assert!(Token::admin(LEGACY, "s").live(u64::MAX));
+        assert!(Token::admin("owner", "s").live(u64::MAX));
     }
 
     #[test]

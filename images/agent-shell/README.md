@@ -83,8 +83,9 @@ Per-agent hosts (ADR-016): the gateway boots every VM with its own `HTTPS_PROXY`
 forms, `http://<id>:<secret>@10.89.0.1:3128`, overriding the image's. The secret is new on every create and
 resume. With it the proxy adds the profiles attached to that agent (`PUT /api/v1/agents/<id>/egress`); a wrong
 one gets 407. Without it (the image's own URL, or an agent booted by `ac-ctl`) only the base list applies. Claude
-Code (`claude -p`), curl and cargo (`cargo fetch`) were checked with it on 2026-10-25; pip and npm read the
-same variables but are untested. Do not print `$HTTPS_PROXY` in shared output: it is the agent's credential until its next resume.
+Code (`claude -p`), curl and cargo (`cargo fetch`) were checked with it on 2026-10-25, pip and npm with the
+`python` and `node` profiles on 2026-11-24. Images built before 2026-11-24 have no pip: run
+`python3 -m ensurepip --user` in the agent, or re-import the image and resume the agent. Do not print `$HTTPS_PROXY` in shared output: it is the agent's credential until its next resume.
 
 Plain `ctr run` containers have no network, and `ctr run --cni` does not work with Kata: it attaches the
 network after the VM has booted, so the guest never gets an interface. With `--network`, `ac-ctl` instead

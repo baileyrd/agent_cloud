@@ -644,6 +644,13 @@ mod tests {
         calls
     }
 
+    /// The pages hide controls a token cannot use with `hidden`; a `display` rule in the style
+    /// sheet would otherwise show them again (forms are `display: flex`).
+    #[test]
+    fn hidden_wins_over_display_rules() {
+        assert!(UI_STYLE.contains("[hidden] { display: none !important; }"));
+    }
+
     #[test]
     fn the_management_pages_call_only_catalog_routes() {
         let mut seen = 0;

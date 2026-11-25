@@ -298,6 +298,14 @@ curl -sS -H "Authorization: Bearer $TOKEN" -X PUT --data-binary '{"profiles":["g
 # {"id":"a1","profiles":["gateway"],"effective_hosts":1}   add "rust" etc. for package mirrors
 ```
 
+The proxy's unit denies private destinations as a second line of defence, so allow the gateway's address too
+(its tailnet address, from `tailscale ip -4 <gateway-host>`), then restart it:
+
+```bash
+sudo systemctl edit ac-egress        # add:  [Service]  IPAddressAllow=<gateway address>/32
+sudo systemctl restart ac-egress
+```
+
 The agent then reaches that host on that port only (also on the tailnet or LAN), and nothing else: not the model
 API, not GitHub, not the gateway host on any other port.
 

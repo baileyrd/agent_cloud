@@ -722,7 +722,9 @@ hosts to the base list, on ports 443 and 80, to public addresses; LEL's gateway 
 - *Private addresses:* an endpoint's addresses are vetted by `vet_endpoint`, which accepts private ranges (the
   tailnet's 100.64.0.0/10, RFC 1918, ULA) but refuses loopback, unspecified, link-local, multicast, broadcast and
   IPv4-mapped forms. Every other host keeps `vet`, which refuses all non-public addresses. An endpoint pointed at
-  this host's own LAN or tailnet address would reach its services: name another machine.
+  this host's own LAN or tailnet address would reach its services: name another machine. The proxy's unit
+  (`IPAddressDeny=` of private ranges) still blocks the address until the operator allows exactly it with a
+  drop-in (`IPAddressAllow=<address>/32`, docs/install.md), so a profile alone cannot open a private range.
 - *Nothing else leaks:* `agentfw.nft` already rejects every packet from `acbr0` but TCP to the proxy port, so an
   agent has no DNS and no direct IP egress; names are resolved by the proxy only. Anonymous callers and other
   agents never get another agent's endpoint.

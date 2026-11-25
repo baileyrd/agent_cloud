@@ -1415,3 +1415,47 @@ the digest. Resource peaks are not in v1: no per-job figure exists without new s
 - *JSON as the canonical form.* Key order, escaping and number formatting all need pinning down for a stable
   digest; fixed lines are easier to rebuild in any language.
 - *Sign the record.* Needs a key held off the guest and a rotation story; worth it once LEL verifies offline.
+
+## ADR-030: A web UI from static in-repo pages over the existing API
+**Status:** proposed (2026-11-25). Mill Board card #516 (R5).
+**Context:** ADR-025 keeps an agent_cloud web UI for managing agents and jobs. It must add no backend surface:
+it calls only routes already in the operation catalog (ADR-020), authenticates with a bearer token (ADR-011)
+and is served behind `tailscale serve` (ADR-024). The terminal and desktop viewers already set the pattern:
+static pages from `ac-gateway`, about 300 lines of in-repo JavaScript each, `fetch` with the token held in
+page memory, CSP `'self'` only, tested in a stub DOM with node's built-in runner.
+
+**Decision:** the UI is more of the same. It is static HTML, CSS and plain JavaScript under
+`crates/ac-gateway/assets/`, compiled in with `include_str!` and served under `/ui/`. There is no build step,
+no npm package and no third-party code.
+- *Auth:* the page asks for a token once and keeps it in a closure. It is never put in storage, a cookie or
+  the URL. Every call is `fetch` with `Authorization: Bearer`. The page reads `GET /api/v1/whoami` and hides
+  what the token's scopes cannot do. The gateway still refuses it, so this is convenience, not a check.
+- *Surface:* only routes in `access::ROUTES`. A test lists every API path the UI's scripts name and fails if
+  one is not in the catalog, so the UI cannot grow a private route.
+- *Rendering:* agent-written text (job output, history) is set with `textContent` and never parsed as HTML.
+  Live job output uses the AG-UI stream (#471) and the viewer links (ADR-006).
+- *Pages, one PR each (#516's slices):*
+  1. agents: list with state, create, pause, resume, destroy, purge
+  2. jobs: submit, status (long-poll), output, cancel, changed paths and witness
+  3. checkpoints, forks and restore
+  4. capacity (`GET /api/v1/capacity`, queued reasons)
+  5. egress: the profiles, and attaching them to an agent (`egress:write`)
+  6. links into the terminal and desktop viewers from each agent
+- *Not in the UI:* backups (ADR-021) and token management (ADR-011) have no API routes. Both are host-local
+  on purpose: `ac-ctl` and `ac-gateway token` over sudo. Adding routes for them is new backend surface, and
+  a token-minting route would let a stolen token mint more. They stay out unless a later ADR adds routes.
+
+**Alternatives considered:**
+- *Server-rendered pages from the gateway* (HTML built in Rust, forms posting back). A browser form cannot
+  send `Authorization`, so this needs a cookie session: a new login route, CSRF tokens and session storage.
+  That is new backend surface.
+- *htmx or Preact from a vendored file.* This is third-party code in a page that holds an admin token, and
+  htmx would still need its header hooks for the bearer token. The viewer pages show that plain JS is enough
+  at this size.
+- *A separate SPA with a build step* (React, Svelte). It would need a toolchain and lockfile in a Rust repo,
+  plus a second deploy artifact, all for six pages.
+
+**Consequences:** each page is small and self-contained, and the security properties match the viewer's,
+which are already reviewed. Reloading asks for the token again, which is intended. Sharing code between pages
+means a shared `ui.js` (token prompt, `fetch` wrapper, `whoami`); it is added by the first slice and kept
+under about 150 lines. Backups and tokens stay on the host's command line.

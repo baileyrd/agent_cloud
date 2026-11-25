@@ -45,7 +45,7 @@ pub fn snapshot(rendered: &str) -> EventKind {
 }
 
 /// `CUSTOM` `log_incomplete`, sent before the run's last event when the stream could not read
-/// the log to its end: `why` is `read_failed` or `read_limit`. The job's outcome is unchanged.
+/// the log to its end: `why` is `read_failed`, `read_limit`, `no_copy` or `capped`. The job's outcome is unchanged.
 pub fn log_incomplete(why: &str) -> EventKind {
     EventKind::Custom {
         name: "log_incomplete".to_owned(),

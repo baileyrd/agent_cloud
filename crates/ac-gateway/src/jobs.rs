@@ -1762,6 +1762,8 @@ enum ReadEnd {
     Failed,
     /// An ended job's host copy is missing or unreadable.
     NoCopy,
+    /// An ended job's host copy holds only the log's tail (it was capped).
+    Capped,
     /// The read budget ran out with more to read.
     Limit,
 }
@@ -1773,6 +1775,7 @@ impl ReadEnd {
             Self::Eof => None,
             Self::Failed => Some("read_failed"),
             Self::NoCopy => Some("no_copy"),
+            Self::Capped => Some("capped"),
             Self::Limit => Some("read_limit"),
         }
     }
@@ -1927,18 +1930,21 @@ impl EventStream {
                 None => ReadEnd::Eof,
             });
         };
-        if !dir.join(STREAM_WHOLE).exists() {
-            if self.skip > 0 {
-                self.fail(
-                    "the job's log was capped when it ended; replay from this cursor is unavailable",
-                    "replay_unavailable",
-                );
-                return None;
-            }
-            self.ids = false;
+        if dir.join(STREAM_WHOLE).exists() {
+            self.feed(&copy);
+            return Some(ReadEnd::Eof);
         }
+        if self.skip > 0 {
+            self.fail(
+                "the job's log was capped when it ended; replay from this cursor is unavailable",
+                "replay_unavailable",
+            );
+            return None;
+        }
+        // Only the tail: sent without ids (nothing to resume from), then marked incomplete.
+        self.ids = false;
         self.feed(&copy);
-        Some(ReadEnd::Eof)
+        Some(ReadEnd::Capped)
     }
 
     /// Read up to `reads` chunks of the log from the VM, and say how the reading stopped.

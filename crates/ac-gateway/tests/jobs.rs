@@ -2884,6 +2884,10 @@ fn an_ended_job_replays_as_one_ag_ui_run_in_order() {
         "{body}"
     );
     assert!(body.contains(r#""delta":"Looking.""#), "{body}");
+    assert!(
+        !body.contains("log_incomplete"),
+        "a whole copy is complete: {body}"
+    );
 
     // Resuming after line 2 sends only what follows it.
     let (_, _, again) = request(addr, "GET", &format!("{path}?after=2"), "");
@@ -3039,10 +3043,16 @@ fn a_cursor_from_the_live_stream_is_not_replayed_against_a_capped_log() {
     );
     assert!(again.contains(r#""code":"replay_unavailable""#), "{again}");
 
-    // A replay from the start sends the copy without ids, so it hands out no wrong cursor.
+    // A replay from the start sends the copy without ids, so it hands out no wrong cursor, and
+    // says it is only the tail before the outcome.
     let (_, _, all) = request(addr, "GET", &path, "");
     let events = events_of(&all);
-    assert_eq!(types(&events).last(), Some(&"RUN_FINISHED"), "{all}");
+    let t = types(&events);
+    assert_eq!(&t[t.len() - 2..], ["CUSTOM", "RUN_FINISHED"], "{all}");
+    assert!(
+        all.contains(r#""name":"log_incomplete""#) && all.contains(r#""value":"capped""#),
+        "{all}"
+    );
     assert!(events.iter().all(|e| e.1.is_none()), "{all}");
     assert!(
         all.contains("line 1200 ") && !all.contains("line 1 x"),

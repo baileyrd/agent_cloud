@@ -1486,3 +1486,7 @@ It is hidden when the call fails. A job's own queued reason shows on the jobs pa
 load error (such a profile cannot be picked). It shows the agent's effective host count and any attached
 profile that no longer exists. With `egress:write`, **Save profiles** sends `PUT .../egress` with the ticked
 names. Profiles are edited on the host, not here: the API has no route to change one (ADR-016).
+
+**Addendum (2026-11-25, slice 6):** the agent page's header links to the terminal viewer (`/ui/<agent>`) and the
+desktop stream (`/ui/desk/<agent>`, #473), shown only to a token with `viewer:read`. The viewers ask for their
+own token: this page's token is never passed on, since it lives only in this page's closure.

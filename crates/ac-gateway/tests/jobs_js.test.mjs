@@ -34,7 +34,8 @@ const job = (id, state, more = {}) => ({
 });
 
 // Loads the page for agent a1 against a fake gateway. `answers` maps "METHOD path" (query left
-// off) to a list of [status, body] replies used in turn (the last repeats); a string body is text.
+// off) to a list of [status, body] replies used in turn (the last repeats); a string body is text,
+// and status 0 is a network failure with `body` as its message.
 async function load({ scopes, answers = {}, confirm = () => true }) {
   const els = {};
   const sent = [];
@@ -52,6 +53,7 @@ async function load({ scopes, answers = {}, confirm = () => true }) {
     const list = answers[`${init.method} ${url.split('?')[0]}`];
     if (!list) return reply(404, { error: 'not found' });
     const [status, body] = list.length > 1 ? list.shift() : list[0];
+    if (status === 0) throw new Error(body);
     return reply(status, body);
   }
   const window = { prompt: () => TOKEN, confirm };
@@ -78,7 +80,8 @@ test('lists the jobs with cancel only for active ones and only with jobs:write',
 });
 
 test('submitting follows the job with long-polls, then shows output and witness as text', async () => {
-  const record = JSON.stringify({ state: 'succeeded', changed: ['/workspace/a.txt'] });
+  // ADR-029's line form, as `ac_domain::witness::render` writes it: not JSON.
+  const record = 'agent a1\njob j9\nstate succeeded\nchanged /workspace/a.txt\n';
   const { els, sent } = await load({
     scopes: ['jobs:read', 'jobs:write'],
     answers: {
@@ -100,8 +103,7 @@ test('submitting follows the job with long-polls, then shows output and witness 
   assert.deepEqual(polls, [`${BASE}/j9`, `${BASE}/j9?wait=25`]);
   assert.equal(els.state.textContent, 'succeeded · exit 0');
   assert.equal(els.output.textContent, '<img src=x onerror=alert(1)> done');
-  assert.match(els.witness.textContent, /"\/workspace\/a.txt"/);
-  assert.match(els.witness.textContent, /sha256 ab12$/);
+  assert.equal(els.witness.textContent, `${record}sha256 ab12`, 'the record verbatim, then its digest');
 });
 
 test('cancel is confirmed, and the gateway refusal is shown', async () => {
@@ -131,7 +133,7 @@ test('picking another job stops following the first', async () => {
       [`GET ${BASE}/j2`]: [[200, job('j2', 'running')]],
       [`GET ${BASE}/j1`]: [[200, job('j1', 'failed', { reason: 'exit 1' })]],
       [`GET ${BASE}/j1/output`]: [[409, { error: 'no output' }]],
-      [`GET ${BASE}/j1/witness`]: [[200, { record: '{}', sha256: 'cd' }]],
+      [`GET ${BASE}/j1/witness`]: [[200, { record: 'job j1\n', sha256: 'cd' }]],
     },
   });
   buttons(els, 0)[0].onclick();
@@ -144,4 +146,21 @@ test('picking another job stops following the first', async () => {
   assert.equal(els.picked.textContent, 'j1');
   assert.equal(els.state.textContent, 'failed · exit 1');
   assert.equal(els.output.textContent, '(no output: no output)');
+});
+
+test('a failure while following a picked job is shown, not left unhandled', async () => {
+  const { els } = await load({
+    scopes: ['jobs:read'],
+    answers: {
+      [`GET ${BASE}`]: [[200, { jobs: [job('j1', 'succeeded', { exit_code: 0 })] }]],
+      [`GET ${BASE}/j1`]: [[200, job('j1', 'succeeded', { exit_code: 0 })]],
+      [`GET ${BASE}/j1/output`]: [[200, 'done']],
+      [`GET ${BASE}/j1/witness`]: [[0, 'network down']],
+    },
+  });
+  buttons(els, 0)[0].onclick();
+  await tick();
+  await tick();
+  assert.equal(els.note.textContent, 'j1: network down');
+  assert.equal(els.note.className, 'bad');
 });

@@ -42,7 +42,7 @@
 
   function row(job) {
     const actions = el('td', undefined, { className: 'actions' });
-    actions.append(el('button', 'Show', { type: 'button', onclick: () => pick(job.job_id) }));
+    actions.append(el('button', 'Show', { type: 'button', onclick: () => follow(job.job_id) }));
     if (may('jobs:write') && ACTIVE.includes(job.state)) {
       actions.append(el('button', 'Cancel', { type: 'button', onclick: () => cancel(job.job_id) }));
     }
@@ -61,13 +61,14 @@
     $('empty').hidden = r.data.jobs.length > 0;
   }
 
-  // The picked job's ended view: its final message and its witness record with digest.
+  // The picked job's ended view: its final message and its witness record with digest. The record
+  // is shown verbatim (ADR-029's line form): its SHA-256 is over exactly those bytes.
   async function ended(job) {
     const out = await api('GET', '/api/v1/agents/{id}/jobs/{job}/output', { ...ids, job }, { text: true });
     $('output').textContent = out.ok ? out.data : `(no output: ${errorText(out)})`;
     const w = await api('GET', '/api/v1/agents/{id}/jobs/{job}/witness', { ...ids, job });
     $('witness').textContent = w.ok
-      ? `${JSON.stringify(JSON.parse(w.data.record), null, 2)}\nsha256 ${w.data.sha256}`
+      ? `${w.data.record}sha256 ${w.data.sha256}`
       : `(no witness: ${errorText(w)})`;
   }
 
@@ -99,6 +100,11 @@
     }
   }
 
+  // Pick a job from a click or a submit: a failure is shown, not left as an unhandled rejection.
+  function follow(job) {
+    pick(job).catch((e) => note(`${job}: ${e.message ?? e}`, true));
+  }
+
   async function submit(event) {
     event.preventDefault();
     const prompt = $('prompt').value;
@@ -114,7 +120,7 @@
     note(`Submitted ${r.data.job_id}.`);
     $('prompt').value = '';
     await refresh();
-    pick(r.data.job_id);
+    follow(r.data.job_id);
   }
 
   async function start() {

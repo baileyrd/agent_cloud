@@ -697,7 +697,15 @@ pub fn create<R: Runtime, S: SessionStore>(
         Ok(c) => c,
         Err(reply) => return reply,
     };
-    let booted = creation.boot();
+    // A panicking boot is a failed boot: it still reaches `finish_create`, which revokes the
+    // proxy credential, so the two never differ.
+    let booted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| creation.boot()))
+        .unwrap_or_else(|_| {
+            Err(PortError {
+                op: "create",
+                cause: "the boot panicked".into(),
+            })
+        });
     let api = api.lock().unwrap_or_else(|e| e.into_inner());
     api.finish_create(creation, booted)
 }
@@ -1639,11 +1647,32 @@ mod tests {
             ("DELETE", "/api/v1/agents/b1?purge=true&force=true"),
             ("PUT", "/api/v1/agents/b1/egress"),
             ("POST", "/api/v1/agents/b1/checkpoints"),
+            ("POST", "/api/v1/agents/b1/resume"),
+            ("POST", "/api/v1/agents/b1/restore"),
+            (
+                "DELETE",
+                "/api/v1/agents/b1/checkpoints/20261125T000000Z-0001",
+            ),
+            ("POST", "/api/v1/agents/b1/fork"),
         ] {
             let (status, body) = locked(&a, m, t);
             assert_eq!(status, 409, "{m} {t}: {body}");
             assert!(body.contains("is being created"), "{body}");
         }
+        // A fork to the booting agent, from another one.
+        let (status, body) = {
+            let api = a.lock().unwrap_or_else(|e| e.into_inner());
+            let r = api.request(
+                "POST",
+                "/api/v1/agents/zz/fork",
+                br#"{"id":"b1"}"#,
+                &Agents::All,
+                false,
+            );
+            (r.status, r.body)
+        };
+        assert_eq!(status, 409, "fork to b1: {body}");
+        assert!(body.contains("is being created"), "{body}");
         let (status, body) = locked(&a, "GET", "/api/v1/agents/b1");
         assert_eq!(status, 200);
         assert!(body.contains(r#""state":"creating""#), "{body}");

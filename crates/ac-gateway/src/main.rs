@@ -450,7 +450,7 @@ fn run() -> Result<(), String> {
         Ok(changed) => {
             for (id, state) in changed {
                 let why = match state {
-                    State::Running => "its VM booted before a restart; marked running",
+                    State::Creating => "was half booted at a restart; VM stopped, still creating (create or destroy it)",
                     _ => "had no VM; marked paused",
                 };
                 eprintln!("ac-gateway: reconcile: {id} {why}");

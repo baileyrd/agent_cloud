@@ -1278,9 +1278,12 @@ lock throughout.
   configured guest size. No new state was added to the lifecycle.
 - *An agent that is booting* is in a set the gateway keeps. Every change to it is refused with 409 (`agent
   {id} is being created`): a second create, pause, destroy, egress, checkpoints, restore, a fork to or from it.
-  Reads are served and show `creating`. The entry goes when the commit is done, also if the boot panics.
-- *After a crash between boot and commit* the startup reconcile marks a `Creating` agent whose VM is up as
-  `Running`. One whose VM is not stays `Creating` (retry the create, or destroy it); its credential is swept.
+  Reads are served and show `creating`. The entry goes when the commit is done. A boot that panics is caught
+  and committed as a failed boot, so its credential is revoked too.
+- *After a gateway stop during a boot* the startup reconcile stops a `Creating` agent's VM if it is up, revokes
+  its credential and leaves it `Creating`. A live VM does not mean the boot finished: the CPU, memory and pids
+  limits (ADR-023) are applied after `ctr run`, so promoting it to `Running` could leave an agent without them.
+  Retry the create, or destroy it. One whose VM is not up stays `Creating`; its credential is swept.
 **Consequences:** Creates of different agents boot at the same time, so a storm is bounded by the host
 (containerd, CNI with host-local IPAM, disk), not by the gateway. The runtime must be `Sync`; `CtrRuntime` is.
 Forks still boot under the lock: they are rarer and also copy a workspace. To measure: a 4-create storm on the

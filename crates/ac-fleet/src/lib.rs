@@ -418,24 +418,29 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     /// Bring the registry in line with the runtime after a host reboot or a VM crash: an agent
     /// recorded `Running` whose VM is gone has what it left behind (network, Kata state) cleaned
     /// up and becomes `Paused`, so `resume` boots it again on its workspace. An agent recorded
-    /// `Creating` whose VM is up (the gateway stopped between its boot and the commit) becomes
-    /// `Running`; one whose VM is not stays `Creating`, like a failed create. Returns the agents
-    /// it changed and their new state. Stops at the first failure; running it again is safe.
+    /// `Creating` whose VM is up (the gateway stopped during its boot) has the VM stopped and its
+    /// proxy credential revoked, and stays `Creating`, like a failed create: a live VM does not
+    /// mean the boot finished (its CPU, memory and pids limits come after `ctr run`), so it is
+    /// never promoted to `Running`. Create it again, or destroy it. Returns the agents it acted
+    /// on and their state afterwards. Stops at the first failure; running it again is safe.
     pub fn reconcile(&self) -> Result<Vec<(AgentId, State)>, FleetError> {
         let live = self.runtime.running()?;
         let mut changed = Vec::new();
         for (id, state) in self.store.list()? {
             let up = live.contains(&id);
-            let command = match (state, up) {
-                (State::Running, false) => Command::Pause,
-                (State::Creating, true) => Command::Ready,
-                _ => continue,
-            };
-            if command == Command::Pause {
-                self.runtime.pause(&id)?;
+            match (state, up) {
+                (State::Running, false) => {
+                    self.runtime.pause(&id)?;
+                    let next = self.persist(&id, state, Command::Pause)?;
+                    changed.push((id, next));
+                }
+                (State::Creating, true) => {
+                    self.runtime.pause(&id)?;
+                    self.revoke(&id)?;
+                    changed.push((id, State::Creating));
+                }
+                _ => {}
             }
-            let next = self.persist(&id, state, command)?;
-            changed.push((id, next));
         }
         if let Some(e) = &self.egress {
             e.sweep(&live)?;
@@ -570,7 +575,7 @@ mod tests {
         calls: RefCell<Vec<&'static str>>,
         fail: bool,
         /// What `running` reports.
-        live: Vec<AgentId>,
+        live: RefCell<Vec<AgentId>>,
         /// What each create or resume was given.
         boots: RefCell<Vec<Boot>>,
     }
@@ -604,7 +609,7 @@ mod tests {
             self.call(if purge { "purge" } else { "destroy" })
         }
         fn running(&self) -> Result<Vec<AgentId>, PortError> {
-            self.call("running").map(|()| self.live.clone())
+            self.call("running").map(|()| self.live.borrow().clone())
         }
     }
 
@@ -617,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_pauses_running_agents_whose_vm_is_gone_and_finishes_booted_creates() {
+    fn reconcile_pauses_running_agents_whose_vm_is_gone_and_stops_half_booted_creates() {
         let store = FakeStore::default();
         for (name, state) in [
             ("up", State::Running),
@@ -630,7 +635,7 @@ mod tests {
             let _ = store.set_state(&agent(name), state);
         }
         let rt = FakeRuntime {
-            live: vec![agent("up"), agent("booted")],
+            live: RefCell::new(vec![agent("up"), agent("booted")]),
             ..Default::default()
         };
         let fleet = Fleet::new(&rt, store);
@@ -639,17 +644,19 @@ mod tests {
         assert_eq!(
             changed,
             [
-                (agent("booted"), State::Running),
+                (agent("booted"), State::Creating),
                 (agent("gone"), State::Paused)
             ]
         );
-        assert_eq!(*rt.calls.borrow(), ["running", "pause"]);
+        assert_eq!(*rt.calls.borrow(), ["running", "pause", "pause"]);
         let state = |n| fleet.state(&agent(n)).ok().flatten();
         assert_eq!(state("gone"), Some(State::Paused));
         assert_eq!(state("up"), Some(State::Running));
         assert_eq!(state("half"), Some(State::Creating));
-        assert_eq!(state("booted"), Some(State::Running));
-        // Nothing left to do the second time; the agent can be resumed.
+        assert_eq!(state("booted"), Some(State::Creating), "never promoted");
+        // Nothing left to do the second time (the half boot's VM is gone now); the agent can be
+        // resumed.
+        rt.live.borrow_mut().retain(|a| *a != agent("booted"));
         assert!(matches!(fleet.reconcile().as_deref(), Ok([])));
         assert!(matches!(fleet.resume(&agent("gone")), Ok(State::Running)));
     }
@@ -918,7 +925,7 @@ mod tests {
     #[test]
     fn illegal_commands_never_touch_credentials_and_reconcile_sweeps() {
         let rt = FakeRuntime {
-            live: vec![agent("up")],
+            live: RefCell::new(vec![agent("up")]),
             ..Default::default()
         };
         let (fleet, egress) = with_egress(&rt, None);

@@ -40,6 +40,14 @@ const LOGIN_MAX: usize = 256;
 const PAGE: &str = include_str!("../assets/viewer.html");
 const SCRIPT: &str = include_str!("../assets/viewer.js");
 const STYLE: &str = include_str!("../assets/viewer.css");
+/// The management pages (ADR-030): shared script and style, then one page per slice.
+const UI_SCRIPT: &str = include_str!("../assets/ui.js");
+const UI_STYLE: &str = include_str!("../assets/ui.css");
+const AGENTS_PAGE: &str = include_str!("../assets/agents.html");
+const AGENTS_SCRIPT: &str = include_str!("../assets/agents.js");
+/// The management pages' scripts, whose API calls must all be in the catalog.
+#[cfg(test)]
+const UI_SCRIPTS: [(&str, &str); 2] = [("ui.js", UI_SCRIPT), ("agents.js", AGENTS_SCRIPT)];
 
 /// For agent-written text: never sniffed, never rendered as a page.
 const UNTRUSTED: [(&str, &str); 4] = [
@@ -460,9 +468,15 @@ fn asset(method: &str, path: &str) -> Option<Response> {
     if method != "GET" {
         return Some(json(error(405, "method not allowed")));
     }
+    const JS: &str = "text/javascript; charset=utf-8";
+    const CSS: &str = "text/css; charset=utf-8";
     let (body, kind) = match name {
-        "viewer.js" => (SCRIPT, "text/javascript; charset=utf-8"),
-        "viewer.css" => (STYLE, "text/css; charset=utf-8"),
+        "" => (AGENTS_PAGE, "text/html; charset=utf-8"),
+        "viewer.js" => (SCRIPT, JS),
+        "viewer.css" => (STYLE, CSS),
+        "ui.js" => (UI_SCRIPT, JS),
+        "ui.css" => (UI_STYLE, CSS),
+        "agents.js" => (AGENTS_SCRIPT, JS),
         id if ac_domain::AgentId::parse(id).is_ok() => (PAGE, "text/html; charset=utf-8"),
         _ => return Some(json(error(404, "not found"))),
     };
@@ -574,11 +588,77 @@ mod tests {
         assert!(asset("GET", "/ui/..%2Fetc").is_some_and(|r| r.status == StatusCode::from_u16(404)));
         assert!(asset("POST", "/ui/a1").is_some_and(|r| r.status == StatusCode::from_u16(405)));
         assert!(asset("GET", "/api/v1/agents").is_none());
+        let index = asset("GET", "/ui/");
+        assert!(index.is_some_and(|r| r.status == StatusCode::OK
+            && r.headers.get("content-security-policy") == Some(CSP)
+            && r.headers.get("content-type") == Some("text/html; charset=utf-8")));
+        for js in ["/ui/ui.js", "/ui/agents.js"] {
+            assert!(asset("GET", js).is_some_and(
+                |r| r.headers.get("content-type") == Some("text/javascript; charset=utf-8")
+            ));
+        }
+    }
+
+    /// Each `'METHOD', '/api/v1/...'` call in the management pages' scripts, and any API path not
+    /// written that way (which fails the test: every call must be checkable).
+    fn ui_calls(script: &str) -> Vec<(String, String)> {
+        let mut calls = Vec::new();
+        for (at, _) in script.match_indices("'/api/v1/") {
+            let path: String = script[at + 1..]
+                .chars()
+                .take_while(|c| *c != '\'')
+                .collect();
+            let method = script[..at]
+                .strip_suffix("', ")
+                .and_then(|head| head.rsplit_once('\''))
+                .map(|(_, m)| m.to_owned())
+                .unwrap_or_default();
+            calls.push((method, path));
+        }
+        calls
+    }
+
+    #[test]
+    fn the_management_pages_call_only_catalog_routes() {
+        let mut seen = 0;
+        for (name, script) in UI_SCRIPTS {
+            for (method, path) in ui_calls(script) {
+                assert!(
+                    crate::access::ROUTES
+                        .iter()
+                        .any(|r| r.method == method && r.path == path),
+                    "{name}: {method:?} {path} is not in access::ROUTES"
+                );
+                seen += 1;
+            }
+            assert!(
+                !script.contains("`/api/"),
+                "{name}: build API paths with UI.url"
+            );
+            assert!(
+                !script.contains("\"/api/"),
+                "{name}: write API paths in single quotes"
+            );
+        }
+        assert!(seen >= 6, "the scan found the calls ({seen})");
+        assert_eq!(
+            ui_calls("x('GET', '/api/v1/bad')"),
+            [("GET".into(), "/api/v1/bad".into())]
+        );
+        assert_eq!(ui_calls("x('/api/v1/bad')")[0].0, "");
     }
 
     #[test]
     fn page_makes_no_external_requests_and_keeps_the_token_in_memory() {
-        for (name, text) in [("html", PAGE), ("js", SCRIPT), ("css", STYLE)] {
+        for (name, text) in [
+            ("html", PAGE),
+            ("js", SCRIPT),
+            ("css", STYLE),
+            ("ui.js", UI_SCRIPT),
+            ("ui.css", UI_STYLE),
+            ("agents.html", AGENTS_PAGE),
+            ("agents.js", AGENTS_SCRIPT),
+        ] {
             for banned in [
                 "http://",
                 "https://",
@@ -593,9 +673,11 @@ mod tests {
                 assert!(!text.contains(banned), "{name} contains {banned}");
             }
         }
-        assert!(
-            !PAGE.contains("<script>") && !PAGE.contains("style="),
-            "no inline script or style"
-        );
+        for page in [PAGE, AGENTS_PAGE] {
+            assert!(
+                !page.contains("<script>") && !page.contains("style="),
+                "no inline script or style"
+            );
+        }
     }
 }

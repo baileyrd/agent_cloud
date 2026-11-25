@@ -1,0 +1,31 @@
+:root {
+  --bg: #111317;
+  --fg: #d8dce3;
+  --bar: #1c1f26;
+  --line: #2a2e37;
+  --dim: #9aa1ad;
+  --accent: #6aa9ff;
+  --warn: #f0a050;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+  padding: 8px 16px; background: var(--bar); border-bottom: 1px solid var(--line);
+}
+#who { flex: 1; color: var(--dim); font-size: 12px; }
+main { padding: 16px; max-width: 960px; }
+form { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+input, button {
+  font: inherit; color: var(--fg); background: var(--bar);
+  border: 1px solid var(--line); border-radius: 4px; padding: 4px 10px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+#note { min-height: 1.4em; color: var(--dim); }
+#note.bad { color: var(--warn); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-weight: normal; }
+td.actions { display: flex; gap: 6px; justify-content: flex-end; }

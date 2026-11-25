@@ -1417,7 +1417,7 @@ the digest. Resource peaks are not in v1: no per-job figure exists without new s
 - *Sign the record.* Needs a key held off the guest and a rotation story; worth it once LEL verifies offline.
 
 ## ADR-030: A web UI from static in-repo pages over the existing API
-**Status:** proposed (2026-11-25). Mill Board card #516 (R5).
+**Status:** accepted (2026-11-25, Nano). Mill Board card #516 (R5). Slice 1: the agents page at `/ui/`.
 **Context:** ADR-025 keeps an agent_cloud web UI for managing agents and jobs. It must add no backend surface:
 it calls only routes already in the operation catalog (ADR-020), authenticates with a bearer token (ADR-011)
 and is served behind `tailscale serve` (ADR-024). The terminal and desktop viewers already set the pattern:
@@ -1459,3 +1459,9 @@ no npm package and no third-party code.
 which are already reviewed. Reloading asks for the token again, which is intended. Sharing code between pages
 means a shared `ui.js` (token prompt, `fetch` wrapper, `whoami`); it is added by the first slice and kept
 under about 150 lines. Backups and tokens stay on the host's command line.
+
+**Addendum (2026-11-25, slice 1):** the pages share `ui.js` (token prompt, `api`, `whoami`, an element helper)
+and `ui.css`. The agents page is the UI's index, `/ui/`, so it cannot clash with an agent id under `/ui/<id>`.
+Every call is written as a single-quoted method and catalog pattern side by side (for example `'POST'` then
+the pause route with its `{id}` segment); `web::tests::the_management_pages_call_only_catalog_routes` reads
+the scripts and fails on any pair that is not in `access::ROUTES`, or any API path written another way.

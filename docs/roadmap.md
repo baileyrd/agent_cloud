@@ -126,8 +126,9 @@ items below in scope (R5). This file records what shipped and how it was verifie
   from outside the VM, through REST and MCP (ADR-029, #1065). To verify on BaileyServ: a job's egress counts
   match the proxy's journal
 - [ ] Launch contract for untrusted agents ([launch-contract.md](launch-contract.md), #1066): the gateway calls,
-  token, failures; tested end to end over HTTP with fakes; `scripts/untrusted-run.sh` for the host (#1067). Open:
-  how a gateway-only agent reaches the model, and LEL's in-VM jail image
+  token, failures; tested end to end over HTTP with fakes; `scripts/untrusted-run.sh` for the host (#1067).
+  Model access: `AC_JOB_MODEL_URL` sends credentialed jobs to LEL's gateway (ADR-028 addendum). Open: LEL's
+  in-VM jail image
 
 ## Later
 - Local model option for an offline posture

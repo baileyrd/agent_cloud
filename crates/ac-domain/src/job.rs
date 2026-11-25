@@ -303,6 +303,35 @@ impl Credential {
     }
 }
 
+/// Where jobs with a credential reach the model (ADR-028 addendum): an `https://` URL on the LEL
+/// gateway, exported to `claude` as `ANTHROPIC_BASE_URL` with the job's credential as
+/// `ANTHROPIC_AUTH_TOKEN`, so no model login lives in the VM. At most 512 bytes of URL
+/// characters, without user info (`@`), quotes or spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelUrl(String);
+
+impl ModelUrl {
+    /// Parse `https://host[:port][/path]`; `Err` says what is wrong.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let rest = s
+            .strip_prefix("https://")
+            .ok_or_else(|| format!("{s:?}: must start with https://"))?;
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let ok = |b: u8| b.is_ascii_alphanumeric() || b"-._~:/?#[]!&()*+,;=%".contains(&b);
+        if host.is_empty() || s.len() > 512 || !s.bytes().all(ok) {
+            return Err(format!(
+                "{s:?}: want https://host[:port][/path], at most 512 bytes, no user info, quotes or spaces"
+            ));
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    /// The URL.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl fmt::Debug for Credential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Credential(..)")
@@ -337,6 +366,32 @@ mod tests {
             );
         }
         assert!(Credential::parse(&"x".repeat(MAX_CREDENTIAL)).is_ok());
+    }
+
+    #[test]
+    fn model_urls_are_plain_https() {
+        for good in [
+            "https://lel.tail.ts.net:8443",
+            "https://gw.lan/anthropic/v1",
+        ] {
+            assert_eq!(
+                ModelUrl::parse(good).map(|u| u.as_str().to_owned()),
+                Ok(good.to_owned())
+            );
+        }
+        let long = format!("https://x/{}", "a".repeat(512));
+        for bad in [
+            "http://gw:8443",
+            "https://",
+            "https:///path",
+            "https://user:pw@gw",
+            "https://gw/a b",
+            "https://gw/'x'",
+            "https://gw/$(id)",
+            long.as_str(),
+        ] {
+            assert!(ModelUrl::parse(bad).is_err(), "{bad}");
+        }
     }
 
     const EVENTS: [JobEvent; 7] = [Start, Exit(0), Exit(3), Fail, Cancel, Timeout, Interrupt];

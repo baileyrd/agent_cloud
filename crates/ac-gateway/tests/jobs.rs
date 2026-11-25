@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ac_ctr::{CtrConfig, CtrRuntime};
 use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
-use ac_domain::job::Credential;
+use ac_domain::job::{Credential, ModelUrl};
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
@@ -48,6 +48,8 @@ struct World {
     starts: Vec<(String, Vec<u8>, u32, Vec<String>)>,
     /// The credential each start was handed (job, secret).
     credentials: Vec<(String, Option<String>)>,
+    /// The model URL each start was handed (job, url).
+    models: Vec<(String, Option<String>)>,
     /// What every `read` appends, as an agent echoing its credential would.
     echo: String,
     /// What `status` reports per job; `Running` if absent.
@@ -124,6 +126,7 @@ impl JobRunner for Fake {
         job: &JobId,
         prompt: &[u8],
         credential: Option<&Credential>,
+        model: Option<&ModelUrl>,
         timeout: u32,
         claude: &[String],
     ) -> Result<(), String> {
@@ -133,6 +136,8 @@ impl JobRunner for Fake {
         }
         w.credentials
             .push((job.to_string(), credential.map(|c| c.expose().to_owned())));
+        w.models
+            .push((job.to_string(), model.map(|m| m.as_str().to_owned())));
         w.starts
             .push((job.to_string(), prompt.to_vec(), timeout, claude.to_vec()));
         Ok(())
@@ -346,6 +351,17 @@ const HOT: Pressure = Pressure {
 };
 
 fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limits, Load)>) -> Rig {
+    build_with(store, fake, root, gate, |j| j)
+}
+
+/// [`build`], with `extra` applied to the jobs before the clock and notes.
+fn build_with(
+    store: Arc<EngineStore>,
+    fake: Fake,
+    root: PathBuf,
+    gate: Option<(Limits, Load)>,
+    extra: impl FnOnce(Jobs) -> Jobs,
+) -> Rig {
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let notes = Arc::new(Mutex::new(Vec::new()));
     let (c, n) = (Arc::clone(&clock), Arc::clone(&notes));
@@ -356,7 +372,7 @@ fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limit
     if let Some((limits, load)) = gate {
         jobs = jobs.with_gate(limits, load);
     }
-    let jobs = jobs
+    let jobs = extra(jobs)
         .with_clock(move || c.load(Ordering::SeqCst))
         .with_notes(move |id, text| {
             let _ = n.lock().map(|mut v| v.push(format!("{id}: {text}")));
@@ -2259,9 +2275,19 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let root = tmp();
     let (rt, log) = ctr(&root, "");
     let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
+    let model = model_url();
     for (n, prompt) in hostile_prompts().iter().enumerate() {
         let job = JobId::from_random([n as u8, 1, 2, 3, 4, 5, 6, 7]);
-        let r = rt.start(&agent("a1"), &job, prompt.as_bytes(), None, 60, &flags);
+        // Without a credential the model URL is not passed on.
+        let r = rt.start(
+            &agent("a1"),
+            &job,
+            prompt.as_bytes(),
+            None,
+            Some(&model),
+            60,
+            &flags,
+        );
         assert!(r.is_ok(), "{r:?}");
         let file = root.join(format!("workspaces/a1/.job-{job}.prompt"));
         assert_eq!(
@@ -2270,17 +2296,22 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
         );
         let argv = argvs(&log).pop().unwrap_or_default();
         // timeout -s TERM -k 3 30 ctr -n agents task exec --exec-id <x> a1 sh -c <START>
-        // ac-job-start <RUN> <job> <0|1> <secs> <flags...>: constants, the job id, whether a
-        // credential follows on stdin, and the operator's flags only.
+        // ac-job-start <RUN> <job> <0|1> <model|-> <secs> <flags...>: constants, the job id,
+        // whether a credential follows on stdin, the operator's model URL, and their flags only.
         assert_eq!(argv[..6], ["timeout", "-s", "TERM", "-k", "3", "30"]);
         assert_eq!(argv[6..11], ["ctr", "-n", "agents", "task", "exec"]);
         assert_eq!(argv[13..16], ["a1", "sh", "-c"]);
         assert_eq!(argv[17], "ac-job-start");
         assert_eq!(
-            argv[19..22],
-            [job.to_string(), "0".to_owned(), "360".to_owned()]
+            argv[19..23],
+            [
+                job.to_string(),
+                "0".to_owned(),
+                "-".to_owned(),
+                "360".to_owned()
+            ]
         );
-        assert_eq!(argv[22..], flags[..]);
+        assert_eq!(argv[23..], flags[..]);
         let held = log.lock().map(|l| {
             l.iter()
                 .all(|r| matches!(r.stdin, platform_mock::process::StdioKind::Pipe))
@@ -2301,7 +2332,7 @@ fn ctr_start_is_argv_only_and_the_prompt_arrives_byte_for_byte() {
     let link = root.join(format!("workspaces/a1/.job-{job}.prompt"));
     let _ = std::os::unix::fs::symlink(&victim, &link);
     assert!(rt
-        .start(&agent("a1"), &job, b"evil", None, 60, &flags)
+        .start(&agent("a1"), &job, b"evil", None, None, 60, &flags)
         .is_err());
     assert_eq!(
         std::fs::read_to_string(&victim).ok().as_deref(),
@@ -2317,12 +2348,17 @@ fn ctr_start_hands_a_credential_on_stdin_never_in_argv_or_the_workspace() {
     let flags: Vec<String> = FLAGS.map(str::to_owned).to_vec();
     let job = JobId::from_random([7; 8]);
     let cred = Credential::parse("LEL-SECRET-token.42").unwrap_or_else(|e| panic!("{e}"));
-    let r = rt.start(&agent("a1"), &job, b"go", Some(&cred), 60, &flags);
+    let r = rt.start(&agent("a1"), &job, b"go", Some(&cred), None, 60, &flags);
     assert!(r.is_ok(), "{r:?}");
     let argv = argvs(&log).pop().unwrap_or_default();
     assert_eq!(
-        argv[19..22],
-        [job.to_string(), "1".to_owned(), "360".to_owned()]
+        argv[19..23],
+        [
+            job.to_string(),
+            "1".to_owned(),
+            "-".to_owned(),
+            "360".to_owned()
+        ]
     );
     assert!(
         argv.iter().all(|a| !a.contains("LEL-SECRET")),
@@ -2335,7 +2371,46 @@ fn ctr_start_hands_a_credential_on_stdin_never_in_argv_or_the_workspace() {
         .into_iter()
         .any(|p| std::fs::read(&p).is_ok_and(|b| b.windows(10).any(|w| w == b"LEL-SECRET")));
     assert!(!leaked, "credential written under the workspace root");
+    // With a model URL, it goes to the runner, which exports it with the credential as token.
+    let job = JobId::from_random([8; 8]);
+    let r = rt.start(
+        &agent("a1"),
+        &job,
+        b"go",
+        Some(&cred),
+        Some(&model_url()),
+        60,
+        &flags,
+    );
+    assert!(r.is_ok(), "{r:?}");
+    let argv = argvs(&log).pop().unwrap_or_default();
+    assert_eq!(argv[21], "https://gw.tail.test:8443/v1");
+    assert!(argv[18].contains("ANTHROPIC_BASE_URL=\"$model\""));
+    assert!(argv[18].contains("ANTHROPIC_AUTH_TOKEN=$(cat \"$c/credential\")"));
+    assert!(argv.iter().all(|a| !a.contains("LEL-SECRET")));
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn model_url() -> ModelUrl {
+    ModelUrl::parse("https://gw.tail.test:8443/v1").unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn the_model_url_goes_to_the_runner_with_every_start() {
+    let (store, root) = registry();
+    let r = build_with(store, Fake::default(), root, None, |j| {
+        j.with_model_url(model_url())
+    });
+    let id = field(
+        &r.submit("a1", &format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#))
+            .1,
+        "job_id",
+    );
+    r.jobs.tick();
+    assert_eq!(
+        r.fake.w().models.last().cloned(),
+        Some((id, Some("https://gw.tail.test:8443/v1".to_owned())))
+    );
 }
 
 /// Every file under `dir`.

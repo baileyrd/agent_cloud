@@ -12,9 +12,15 @@ whole flow, and `scripts/untrusted-run.sh` runs it on a real host with the in-VM
    endpoint <lel-gateway-host>:<port>
    ```
    Plus the `IPAddressAllow=<address>/32` drop-in on `ac-egress` (docs/install.md). With `!exclusive`, the agent
-   loses the base allowlist: it reaches that one host on that one port and nothing else. See "Open question:
-   model access" below.
-2. **A launcher token** for a fixed pool of agent ids:
+   loses the base allowlist: it reaches that one host on that one port and nothing else.
+2. **The model URL** (ADR-028 addendum), in `/etc/agent-cloud/gateway.env`:
+   ```
+   AC_JOB_MODEL_URL=https://<lel-gateway-host>:<port>
+   ```
+   Same host and port as the profile's endpoint (a path is allowed). A job that carries a credential then runs
+   `claude` with `ANTHROPIC_BASE_URL` set to it and the credential as `ANTHROPIC_AUTH_TOKEN`, so the agent needs
+   no Claude login and reaches the model only through LEL's gateway. See "Model access" below.
+3. **A launcher token** for a fixed pool of agent ids:
    ```
    sudo ac-gateway token create lel-launcher \
      --scopes agents:read,agents:write,egress:write,jobs:read,jobs:write \
@@ -42,8 +48,8 @@ Notes on each step:
    with the base list. The VM is up when the 201 arrives: creates take about 4 s each, and since ADR-027 they
    run in parallel. Check `GET /egress` if you want to be sure: `"profiles":["gateway"]`.
 2. **The credential** is the short-lived token LEL mints for this claim (ADR-028): 1 to 4096 bytes of
-   `A-Za-z0-9-._~+/=`. The job's process reads it from the file named by `$AC_JOB_CREDENTIAL_FILE`. It is gone
-   when the job ends, however it ends. It is never in a reply, the registry, a log or the workspace.
+   `A-Za-z0-9-._~+/=`. The job's process reads it from the file named by `$AC_JOB_CREDENTIAL_FILE`, and with
+   `AC_JOB_MODEL_URL` set `claude` uses it as its model token. It is gone when the job ends, however it ends. It is never in a reply, the registry, a log or the workspace.
    - Use one `idempotency_key` per claim. A retry with the same key returns the same job.
    - `timeout_secs` is 1 to 14400 and defaults to 1800; at the deadline the job ends `timed_out`.
    - The prompt is at most 64 KiB.
@@ -92,15 +98,17 @@ Notes on each step:
   as zero requests.
 - **Always destroy and purge**, also after a failure. An agent left running holds memory that admission counts.
 
-## Open question: model access
-With only `gateway` attached, the agent cannot reach `api.anthropic.com`, so a job whose harness is Claude Code
-cannot call the model, and it fails. There are two ways out. The choice is Nano's and LEL's:
-- *The LEL gateway fronts the model.* The harness points at it (`ANTHROPIC_BASE_URL`) and authenticates with the
-  job credential, so no model login lives in the VM at all. This fits D101: one reachable host, no long-lived
-  secret. It needs a small runner change, a gateway setting that exports those two variables for jobs with a
-  credential, and LEL's gateway has to proxy the model API.
-- *Add `api.anthropic.com` to the profile.* It works today, but the VM then needs a Claude login on its
-  workspace, which is a long-lived secret, and the agent can reach the model API directly.
+## Model access
+Decided (Nano and LEL): *LEL's gateway fronts the model.* With only `gateway` attached the agent cannot reach
+`api.anthropic.com`, so a Claude Code job reaches the model through LEL's gateway instead, authenticated with the
+job credential: no model login lives in the VM, and model access ends with LEL's token. LEL's side:
+- proxy the Anthropic Messages API at `AC_JOB_MODEL_URL` (Claude Code sends `Authorization: Bearer
+  <credential>` to `$ANTHROPIC_BASE_URL/v1/messages`);
+- accept the credential minted for the claim, and refuse it once the claim ends.
+
+A job without a credential keeps using the agent's own login, so it fails on a gateway-only agent. The witness
+counts the model calls under `egress_allow <endpoint>`; an `egress_deny api.anthropic.com:443` there means the
+harness tried the model directly.
 
 ## What is in the VM
 Today the image is `images/agent-shell`: Fedora, Claude Code, an unprivileged `agent` user, tini as PID 1, no

@@ -4,9 +4,9 @@
 # create an agent with only the `gateway` egress profile, submit a job with a short-lived
 # credential, wait for it, read its result and witness, then destroy and purge it. Run as root:
 #   sudo scripts/untrusted-run.sh            (AGENT=lel-check by default; KEEP=1 skips the purge)
-# Needs /etc/agent-cloud/egress/profiles/gateway.txt (docs/install.md) and a logged-in image login
-# on the agent's workspace if the job is to reach the model (with only `gateway` it cannot: the
-# job then fails, and the egress and witness checks still run).
+# Needs /etc/agent-cloud/egress/profiles/gateway.txt (docs/install.md). The job reaches the model
+# only if AC_JOB_MODEL_URL in gateway.env points at LEL's gateway (ADR-028 addendum); without it
+# the job fails, and the egress and witness checks still run.
 set -u
 fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -20,6 +20,7 @@ NS=agents
 AGENT=${AGENT:-lel-check}
 val() { sed -n "s/^$1=//p" "$ENV" | tail -n 1; }
 BIND=$(val AC_BIND)
+MODEL=$(val AC_JOB_MODEL_URL)
 DATA=$(val AC_DATA); DATA=${DATA:-/var/lib/agent-cloud}
 [ -z "$(val AC_TOKENS)" ] || export AC_TOKENS="$(val AC_TOKENS)"
 [ -n "$BIND" ] || { echo "no AC_BIND in $ENV" >&2; exit 2; }
@@ -108,7 +109,8 @@ while [ "$i" -lt 12 ]; do
 done
 case $state in
     succeeded) pass "job $JOB succeeded" ;;
-    failed|timed_out) echo "info  job $JOB ended $state (expected with only the gateway profile: no model API)" ;;
+    failed|timed_out) [ -n "$MODEL" ] && bad "job $JOB ended $state through $MODEL" \
+        || echo "info  job $JOB ended $state (expected without AC_JOB_MODEL_URL: no model API)" ;;
     *) bad "job $JOB: $state" ;;
 esac
 out=$(gx cred "ls -d /dev/shm/ac-job-$JOB 2>/dev/null || echo gone")
@@ -142,8 +144,12 @@ print(w["record"], end="")' "$w")
         printf '%s\n' "$check" | sed -n '2,$s/^/      /p'
         printf '%s' "$check" | grep -q "^egress_allow $ENDPOINT " \
             && pass "witness counts the gateway connects" || bad "witness has no egress_allow $ENDPOINT"
-        printf '%s' "$check" | grep -q '^egress_deny api.anthropic.com:443 ' \
-            && pass "witness counts the refused model API connect" || bad "witness has no egress_deny api.anthropic.com:443"
+        if [ -z "$MODEL" ]; then
+            printf '%s' "$check" | grep -q '^egress_deny api.anthropic.com:443 ' \
+                && pass "witness counts the refused model API connect" || bad "witness has no egress_deny api.anthropic.com:443"
+        elif printf '%s' "$check" | grep -q '^egress_deny api.anthropic.com:443 '; then
+            bad "the job tried api.anthropic.com directly despite AC_JOB_MODEL_URL"
+        fi
         ;;
     *) bad "witness: $r" ;;
 esac

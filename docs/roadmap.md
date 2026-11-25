@@ -63,7 +63,8 @@ items below in scope (R5). This file records what shipped and how it was verifie
   on another machine), daily by `ac-backup.timer`, with `ac-ctl restore-backup` replaying a chain (ADR-021; verified
   on BaileyServ 2026-10-29 against an SMB share on Beast: full and incremental backups of a1 and a2, a restore of
   a2; `ac-backup.timer` ran unattended every day 2026-10-30 to 2026-11-23, across a reboot). To do: boot a
-  restored workspace and read it back inside the VM; back up the registry, tokens and egress agents file too
+  restored workspace and read it back inside the VM. The registry, tokens and egress agents file are copied too
+  (ADR-021 addendum, `ac-ctl restore-state`); a live restore on the host is still to do
 - [x] Load test to N=6 with `scripts/capacity-bench.sh`; [sizing.md](sizing.md) now holds measured numbers
   (BaileyServ, 2026-10-22)
 - [x] The watchdog tells slow from wedged: it acts only on sustained failures on an idle host, through a logged

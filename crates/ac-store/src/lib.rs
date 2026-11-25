@@ -7,9 +7,12 @@
 //!
 //! Jobs (ADR-010) live beside the agents in a second file, `jobs.mmap`, under the same lock.
 //!
+//! [`mirror::Mirrored`] keeps a plain-text copy of the agent list for backups (ADR-021 addendum).
+//!
 //! Holds only bounded registry data; unbounded history belongs in `ac-history`.
 
 mod jobs;
+pub mod mirror;
 
 use std::path::Path;
 

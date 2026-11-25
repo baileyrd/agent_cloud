@@ -1,5 +1,7 @@
 # Back up every agent's workspace as btrfs send stream files (ADR-021), run by ac-backup.timer.
-# ac-ctl backup does not open the registry, so it runs while ac-gateway and the agents do.
+# ac-ctl backup does not open the registry, so it runs while ac-gateway and the agents do. It also copies the
+# control-plane state (the agent list the gateway mirrors, the tokens file, the egress agents file) to
+# <dest>/_state/ (ADR-021 addendum); set AC_TOKENS or AC_EGRESS_AGENTS here if the gateway uses other paths.
 # The destination is any directory, best a share on another machine, mounted at
 # /mnt/agent-backups; to use another path, `systemctl edit ac-backup.service` and override
 # ExecStart and RequiresMountsFor. A run that leaves any agent without a backup (a

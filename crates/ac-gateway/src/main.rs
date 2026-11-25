@@ -91,6 +91,7 @@ use ac_gateway::viewer::Hub;
 use ac_gateway::watchdog::Watchdog;
 use ac_gateway::web::App;
 use ac_gateway::{bind, Api, Unhealthy};
+use ac_store::mirror::Mirrored;
 use ac_store::EngineStore;
 use platform::events::{SignalEvent, SignalSource};
 use platform_linux::{LinuxSignalSource, LinuxSpawner};
@@ -98,7 +99,7 @@ use rusty_serve::{Server, ShutdownHandle};
 
 const TOKENS: &str = "/etc/agent-cloud/tokens";
 
-type Gateway = App<CtrRuntime<LinuxSpawner>, Arc<EngineStore>>;
+type Gateway = App<CtrRuntime<LinuxSpawner>, Mirrored<Arc<EngineStore>>>;
 
 /// A number >= 0 from the environment, `default` when unset.
 fn num(key: &str, default: f64) -> Result<f64, String> {
@@ -430,7 +431,12 @@ fn run() -> Result<(), String> {
     let store = Arc::new(EngineStore::open(&data).map_err(|e| e.to_string())?);
     let snapshots = CtrRuntime::new(LinuxSpawner, cfg.clone());
     log_volumes(&snapshots);
-    let mut fleet = Fleet::new(runtime, Arc::clone(&store))
+    // A plain-text copy of the agent list for `ac-ctl backup` (ADR-021 addendum).
+    let registry = Mirrored::new(Arc::clone(&store), ac_store::mirror::path(&data));
+    if let Err(e) = registry.sync() {
+        eprintln!("ac-gateway: {e}; backups will not have the agent list until it is written");
+    }
+    let mut fleet = Fleet::new(runtime, registry)
         .with_admission(Box::new(capacity), margin)
         .with_snapshots(Arc::new(snapshots), checkpoint_max()?);
     let egress = match networked {

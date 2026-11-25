@@ -12,6 +12,7 @@ pub mod job;
 pub mod lifecycle;
 pub mod limits;
 pub mod schedule;
+pub mod state;
 pub mod tune;
 
 pub use allowlist::{Allowlist, AllowlistError};

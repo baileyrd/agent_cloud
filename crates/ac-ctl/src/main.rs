@@ -14,6 +14,7 @@ mod args;
 mod backup;
 mod doctor;
 mod factsjson;
+mod state;
 mod tune;
 
 use std::io;

@@ -986,11 +986,38 @@ of the snapshot, including a send that fails half way and a broken chain.
   `<data>/backups/<id>/*` with `btrfs subvolume delete`. Streams at `<dest>` need only `btrfs receive -f` on any
   btrfs, none of this code.
 
-**Not now:** the registry, tokens and the egress agents file (the data directory outside workspaces; copying the
-registry needs the gateway's cooperation, and agents and tokens can be recreated); checkpoints in backups; a
+**Not now:** ~~the registry, tokens and the egress agents file~~ (added below, 2026-11-25); checkpoints in backups; a
 gateway route or MCP tool; uploads to object storage without a mount; compression (`btrfs send --compressed-data`
 needs a newer kernel and protocol 2) and encryption (use an encrypted share or filesystem); a checksum beside each
 stream (btrfs checks every command in a stream on receive).
+
+**Addendum (2026-11-25, proposed; Mill Board card #467): control-plane state.** A lost host also loses which
+agents exist and in what state, the API tokens and the egress attachments. `ac-ctl backup` with no agent named now
+copies those too.
+- *The agent list without the registry:* the registry is a set of mmap files the gateway holds open, so a copy
+  of them taken while it writes is not safe, and `ac-ctl` cannot open it beside the gateway. The gateway's
+  session store is wrapped (`ac_store::mirror::Mirrored`) so that every state change, and every start, rewrites
+  `<data>/state/agents` whole and atomically (temp file, fsync, rename, 0600): one `<agent-id> <state>` line per
+  agent. A reader always sees one consistent list. A failed copy is logged, not returned, since the state did
+  change; the next change rewrites it. Jobs are not copied: they are history, not what a host needs to come back.
+- *The two files* (`AC_TOKENS`, `AC_EGRESS_AGENTS`) are already replaced atomically by their writers, so a
+  plain read is consistent. Tokens hold digests only (ADR-011); the egress file holds per-boot proxy
+  credentials, which a new boot replaces anyway.
+- *Layout:* `<dest>/_state/<id>/` with `agents`, `tokens` and `egress-agents` (the ones the host has; the agent
+  list is required) and a `MANIFEST` of `<sha256> <bytes> <file>` lines, all 0600. `_state` is not a valid
+  agent id, so it never meets an agent's stream directory. Written as `<id>.part`, flushed, then renamed; a
+  leftover `.part` is removed by the next run. `--keep` applies: the newest `keep` stay. A failed state copy makes
+  the run exit 1, like a workspace that was not backed up. `ac-ctl backups <dest>` lists them as `state <id>`.
+- *Restore:* `ac-ctl restore-state <dest> [<id>]` (default the newest). Refused while another process holds the
+  data directory (stop `ac-gateway`), when the registry already has an agent, when a tokens or egress file is
+  there with other content (move it aside), and when any file fails its manifest. Every check runs before the
+  first write. It writes the two files (0600), records each agent with its saved state, and rewrites the mirror.
+  At its next start the gateway's reconcile marks agents recorded running but with no VM paused; restore
+  their workspaces with `restore-backup`, then resume them.
+- *Rules* are pure (`ac_domain::state`: names, the agent list and manifest formats, verification); the file I/O
+  is `ac-ctl`'s `state` module.
+- *Not covered:* job records and history, the gateway env file, egress profiles and the base allowlist (operator
+  config, kept in this repo's `deploy/` or by the operator).
 
 ## ADR-022: Token expiry, opt-in per token
 **Status:** proposed (2026-10-28; unit and HTTP tests, not yet on BaileyServ).

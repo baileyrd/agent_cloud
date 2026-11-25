@@ -538,6 +538,13 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
   and the 15 s cold-boot penalty, but not the CPU-bound slowdown of builds at once. That is an inference.
 - Cold boots should approach the ~4 s warm figure. That is an inference: no SSD was measured.
 
+## Desktop image
+
+`images/agent-desktop` (agent-shell plus Xorg dummy, Xfce and Chromium) targets Kata's default 2048 MiB.
+**Not measured yet:** the image size (`scripts/build-images.sh desktop` prints it), the guest's used memory and
+the sandbox's `memory.current` at idle with the desktop up, and with Chromium open on a page
+(`scripts/desktop-smoke.sh` prints the idle figures). Record them here with the date.
+
 ## Not measured
 
 - Any SSD or NVMe disk; everything here is one rotational disk.

@@ -67,53 +67,25 @@ denials with `sudo ausearch -m avc -ts recent`; do not disable SELinux as a firs
 
 Build with podman, import into containerd.
 
-- **Desktop layer:** Xorg with the dummy driver (see below), Xfce, Chromium, the managed
-  policy file, and the streaming layer chosen in [ADR-006](decisions.md).
-- **Shell layer:** unprivileged user, agent harness, git, language toolchains.
+- **Desktop layer:** [images/agent-desktop](../images/agent-desktop/README.md), built on the shell
+  image: Xorg with the dummy driver, Xfce and Chromium under a managed policy. The streaming layer
+  comes with the open part of [ADR-006](decisions.md).
+- **Shell layer:** [images/agent-shell](../images/agent-shell/README.md): unprivileged user, agent
+  harness, git, language toolchains.
 
 ```bash
-podman build -t agent-desktop ./desktop
-podman save agent-desktop | sudo ctr images import -
+scripts/build-images.sh                       # builds both and imports them into containerd
+sudo ac-ctl --image localhost/agent-desktop:dev --network create d1
+sudo scripts/desktop-smoke.sh d1
 ```
 
-Minimal Xorg dummy config:
+The Xorg config is [images/agent-desktop/xorg.conf](../images/agent-desktop/xorg.conf) and the Chromium
+policy [images/agent-desktop/chromium-policy.json](../images/agent-desktop/chromium-policy.json), installed
+at `/etc/chromium/policies/managed/agent.json`. DevTools are off in it (decided; see the image's README).
 
-```
-Section "Device"
-    Identifier "dummy"
-    Driver "dummy"
-    VideoRam 256000
-EndSection
-
-Section "Screen"
-    Identifier "screen0"
-    Device "dummy"
-    DefaultDepth 24
-    SubSection "Display"
-        Depth 24
-        Virtual 1920 1080
-    EndSubSection
-EndSection
-```
-
-Chromium managed policy, at `/etc/chromium/policies/managed/agent.json`
-(use `/etc/opt/chrome/policies/managed/` for Google Chrome):
-
-```json
-{
-  "AutofillAddressEnabled": false,
-  "AutofillCreditCardEnabled": false,
-  "AudioCaptureAllowed": false,
-  "BrowserGuestModeEnabled": false,
-  "BrowserAddPersonEnabled": false,
-  "BookmarkBarEnabled": false
-}
-```
-
-Leave `DeveloperToolsAvailability` unset while developing so you can debug the agent's
-browsing; set it to `2` for production images if you want to match the observed lockdown.
-
-**Checkpoint:** run the desktop image under Kata; Xorg starts on `:0` and `xrandr` shows `DUMMY0`.
+**Checkpoint:** `scripts/desktop-smoke.sh` ends with `PASS`: `xrandr` shows `DUMMY0`; Xorg, xfce4-session and
+xfwm4 run as `agent`; chrome://policy shows the managed policies in effect; and guest used memory and the sandbox
+cgroup's `memory.current` are both at most 2 GiB at idle.
 
 ## Phase 5: Decide the pod shape
 
@@ -462,6 +434,12 @@ How to use it:
    viewers stay where they are (no `select-window`). If the window closes the page falls back to the agent's.
 4. What was shown while someone watched, with take-over and audit events: `GET /api/v1/agents/<id>/history?limit=N`
    (plain text; for example `curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/agents/a1/history`).
+
+**Agents page** (ADR-030, #516): `http://localhost:8780/ui/` (or the tailnet HTTPS URL with `/ui/`). It asks for a
+token once, keeps it in memory only, and lists the agents that token is for, with their state and health. With
+`agents:write` it can create, pause, resume, destroy and purge them. Destroy and purge are confirmed first, and a
+pause or destroy refused because the agent has a job offers to retry with `force=true`, which interrupts the job.
+Without `agents:write` the page is read-only (and the gateway refuses the calls anyway).
 
 The gateway also probes each running agent every 30 s (`AC_PROBE_INTERVAL` in `gateway.env`; 0 turns it off).
 A probe answering within 10 s is healthy. Failures while the host is busy are logged "slow, host busy, not acting".

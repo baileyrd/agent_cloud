@@ -1,0 +1,31 @@
+# Desktop agent image: agent-shell plus an Xorg dummy display, Xfce and policy-locked Chromium.
+# Build agent-shell first (scripts/build-images.sh does both and imports them into containerd).
+ARG BASE=localhost/agent-shell:dev
+FROM ${BASE}
+
+USER root
+# agent-shell sets the egress proxy (10.89.0.1), which a build host cannot reach: clear it for dnf only.
+RUN env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+        dnf install -y --setopt=install_weak_deps=False \
+        xorg-x11-server-Xorg xorg-x11-drv-dummy xorg-x11-xauth xrandr \
+        xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-settings xfce4-terminal dbus-x11 \
+        adwaita-icon-theme dejavu-sans-fonts dejavu-sans-mono-fonts liberation-fonts \
+        chromium \
+    && dnf clean all
+
+# Xorg runs as the agent (Fedora's Xorg is not setuid; the dummy driver needs no devices). The X socket
+# directory must exist, sticky and root-owned, before an unprivileged server starts.
+RUN install -d -m 1777 /tmp/.X11-unix
+COPY xorg.conf /etc/agent-desktop/xorg.conf
+# Chromium reads every file in this directory; root-owned, so the agent cannot loosen it.
+COPY chromium-policy.json /etc/chromium/policies/managed/agent.json
+COPY desktop-session /usr/local/bin/desktop-session
+RUN chmod 0644 /etc/agent-desktop/xorg.conf /etc/chromium/policies/managed/agent.json \
+    && chmod 0755 /usr/local/bin/desktop-session
+
+# Jobs and the terminal viewer's tmux inherit DISPLAY, so `chromium` from the shell opens on the desktop.
+ENV DISPLAY=:0 XDG_RUNTIME_DIR=/tmp/runtime-agent
+USER agent
+WORKDIR /workspace
+# tini (from agent-shell) stays PID 1 and reaps; desktop-session keeps Xorg and Xfce up.
+CMD ["/usr/local/bin/desktop-session"]

@@ -54,7 +54,8 @@ may execute untrusted code or be steered by prompt injection from web content.
 - [ ] Backups for the data directory and workspace volumes, with a tested restore (workspaces: ADR-021, verified on
   BaileyServ to an encrypted SMB share on Beast, daily timer running unattended since 2026-10-30; the rest of
   the data directory: not yet, Mill Board #467)
-- [ ] Production desktop image: Chromium managed policy applied; DevTools policy decided
+- [ ] Production desktop image: Chromium managed policy applied (`images/agent-desktop`, to verify under Kata);
+  DevTools policy decided: off, with remote debugging (images/agent-desktop/README.md)
 - [x] Terminal viewer: view-only by default, enforced in the gateway; one take-over holder;
   agent output sanitised to text and SGR before the browser (verified 2026-10-20, see [Viewer](#viewer))
 - [x] No `ctr task exec` ever gets stdin EOF while its guest process lives, from a pipe, a file or

@@ -529,6 +529,7 @@ H | curl -sS -H @- "$J/6b941feec45a4c25?wait=30"     # returns when the state ch
 H | curl -sS -H @- $J/6b941feec45a4c25/output        # pong (the final message, plain text)
 H | curl -sS -H @- "$J/6b941feec45a4c25/output?part=stream"   # the stream-json log
 H | curl -sS -H @- -X POST $J/6b941feec45a4c25/cancel
+H | curl -sS -H @- $J/6b941feec45a4c25/witness        # an ended job: record and sha256 (ADR-029)
 H | curl -sS -H @- $J                                # the agent's jobs, newest first
 ```
 

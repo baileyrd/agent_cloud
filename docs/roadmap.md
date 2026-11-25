@@ -122,6 +122,9 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [x] Each job's changed paths in the agent's history, from btrfs snapshots at its start and end (ADR-019;
   verified on BaileyServ 2026-11-24: create, edit, rename and delete listed exactly, a cancelled job listed too,
   no snapshots left behind)
+- [ ] Each ended job's witness record (state, times, exit, changed paths, egress decisions) and its SHA-256,
+  from outside the VM, through REST and MCP (ADR-029, #1065). To verify on BaileyServ: a job's egress counts
+  match the proxy's journal
 
 ## Later
 - Local model option for an offline posture

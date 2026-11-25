@@ -359,6 +359,17 @@ pub const ROUTES: &[Rule] = &[
         send: Send::Query,
         args: &[AGENT, JOB],
     }),
+    offer(rule(
+        "GET",
+        "/api/v1/agents/{id}/jobs/{job}/witness",
+        S(JobsRead),
+        None,
+    ), Tool {
+        name: "get_job_witness",
+        about: "An ended job's witness record (ADR-029): state, times, exit code, changed paths and egress decisions, all from outside the VM, with its SHA-256.",
+        send: Send::Query,
+        args: &[AGENT, JOB],
+    }),
     rule("GET", "/api/v1/agents/{id}/term", S(ViewerRead), None),
     offer(rule("GET", "/api/v1/agents/{id}/history", S(ViewerRead), None), Tool {
         name: "get_history",
@@ -568,6 +579,7 @@ mod tests {
             ("GET", job, S(JobsRead)),
             ("GET", &format!("{job}/output"), S(JobsRead)),
             ("POST", &format!("{job}/cancel"), S(JobsWrite)),
+            ("GET", &format!("{job}/witness"), S(JobsRead)),
             ("GET", "/api/v1/agents/a1/term", S(ViewerRead)),
             ("GET", "/api/v1/agents/a1/history", S(ViewerRead)),
             ("POST", &format!("{term}/window"), S(ViewerRead)),
@@ -582,7 +594,7 @@ mod tests {
         }
         assert_eq!(
             ROUTES.len(),
-            31,
+            32,
             "a new route needs a row above and in ADR-011"
         );
     }

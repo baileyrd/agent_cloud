@@ -17,7 +17,7 @@ use ac_domain::job::Credential;
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
-use ac_gateway::jobs::{self, Answer, Changes, JobRunner, Jobs, Part, Probe, Route};
+use ac_gateway::jobs::{self, Answer, Changes, EgressLog, JobRunner, Jobs, Part, Probe, Route};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::web::App;
@@ -218,6 +218,37 @@ impl Changes for Fake {
     }
 }
 
+/// The proxy's log as a test sets it; `Err` reads as an unreadable journal. Records each window.
+#[derive(Clone)]
+struct Log(Arc<Mutex<Logged>>);
+
+/// What `read` returns, and the windows asked for.
+type Logged = (Result<String, String>, Vec<(u64, u64)>);
+
+impl Default for Log {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new((Ok(String::new()), Vec::new()))))
+    }
+}
+
+impl Log {
+    fn set(&self, log: Result<&str, &str>) {
+        let mut l = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        l.0 = log.map(str::to_owned).map_err(str::to_owned);
+    }
+    fn windows(&self) -> Vec<(u64, u64)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
+    }
+}
+
+impl EgressLog for Log {
+    fn between(&self, since_ms: u64, until_ms: u64) -> Result<String, String> {
+        let mut l = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        l.1.push((since_ms, until_ms));
+        l.0.clone()
+    }
+}
+
 // ---- a rig: real registry, fake runner, fake clock ---------------------------------------------
 
 struct Rig {
@@ -226,6 +257,7 @@ struct Rig {
     fake: Fake,
     clock: Arc<AtomicU64>,
     notes: Arc<Mutex<Vec<String>>>,
+    egress: Log,
     root: PathBuf,
 }
 
@@ -312,7 +344,10 @@ fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limit
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let notes = Arc::new(Mutex::new(Vec::new()));
     let (c, n) = (Arc::clone(&clock), Arc::clone(&notes));
-    let mut jobs = jobs_over(&store, fake.clone(), &root).with_changes(fake.clone());
+    let egress = Log::default();
+    let mut jobs = jobs_over(&store, fake.clone(), &root)
+        .with_changes(fake.clone())
+        .with_egress_log(egress.clone());
     if let Some((limits, load)) = gate {
         jobs = jobs.with_gate(limits, load);
     }
@@ -327,6 +362,7 @@ fn build(store: Arc<EngineStore>, fake: Fake, root: PathBuf, gate: Option<(Limit
         fake,
         clock,
         notes,
+        egress,
         root,
     }
 }
@@ -542,6 +578,123 @@ fn started_jobs_note_what_they_changed_and_drop_their_snapshot() {
     assert_eq!(w.sealed, [done.clone(), unstarted.clone()]);
     assert_eq!(w.ended, [done, unstarted], "a never-started job has none");
     assert!(w.snapshots.is_empty(), "every snapshot dropped");
+}
+
+/// The witness record and digest of a job's reply (ADR-029).
+fn witness(r: &Rig, job: &str) -> (u16, String, String) {
+    let (status, body) = r.json(Route::Witness(agent("a1"), job_id(job)), "");
+    if status != 200 {
+        return (status, body, String::new());
+    }
+    let parsed = rusty_json::Value::parse(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    let text = |k: &str| {
+        parsed
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("no {k} in {body}"))
+            .to_owned()
+    };
+    (status, text("record"), text("sha256"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use rusty_sha2::{Hash, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn a_witness_comes_when_the_job_ends_and_its_digest_covers_the_record() {
+    let r = rig();
+    let id = r.ok("a1", "SECRET-PROMPT");
+    assert_eq!(witness(&r, &id).0, 409, "queued");
+    r.jobs.tick();
+    assert_eq!(witness(&r, &id).0, 409, "running");
+    r.egress.set(Ok(
+        "ac-egress: allow 10.89.0.21 agent=a1 api.anthropic.com:443\n\
+                     ac-egress: deny 10.89.0.21 agent=a1 evil.example:443: not on allowlist\n\
+                     ac-egress: allow 10.89.0.22 agent=a2 crates.io:443\n",
+    ));
+    r.advance(7_000);
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (status, pending, _) = witness(&r, &id);
+    assert_eq!(status, 200);
+    assert!(pending.contains("\nchanges pending\n"), "{pending}");
+    r.diff_all();
+    let (_, record, digest) = witness(&r, &id);
+    assert_eq!(digest, sha256_hex(record.as_bytes()));
+    assert!(record.starts_with(&format!(
+        "agent_cloud.witness v1\nagent a1\njob {id}\nstate succeeded\nexit_code 0\n"
+    )));
+    assert!(
+        record.contains("\nchanges listed 4\nchanged .job-j.done\nchanged .jobs/j/prompt.txt\nchanged src/.jobs\nchanged src/main.rs\n"),
+        "{record}"
+    );
+    assert!(
+        record.ends_with("egress journal 2\negress_allow api.anthropic.com:443 1\negress_deny evil.example:443 1\n"),
+        "{record}"
+    );
+    for agent_text in ["SECRET-PROMPT", "result of", "<script>", "crates.io"] {
+        assert!(!record.contains(agent_text), "{agent_text} in {record}");
+    }
+    let windows = r.egress.windows();
+    let job = r.get("a1", &id);
+    let window = (
+        field(&job, "started_ms").parse().unwrap_or(0),
+        field(&job, "finished_ms").parse().unwrap_or(0),
+    );
+    assert!(
+        windows.iter().all(|w| *w == window),
+        "{windows:?} vs {window:?}"
+    );
+    assert_eq!(
+        witness(&r, &id).2,
+        digest,
+        "the same facts, the same digest"
+    );
+    r.egress.set(Err("journalctl: no such unit"));
+    let (_, blind, other) = witness(&r, &id);
+    assert!(blind.ends_with("\negress unavailable\n"), "{blind}");
+    assert_ne!(other, digest);
+}
+
+#[test]
+fn a_witness_says_what_the_compare_could_not_list() {
+    let r = rig();
+    r.fake.w().diff_fails = true;
+    let failed = r.ok("a1", "a");
+    r.jobs.tick();
+    r.fake.set(&failed, Probe::Exited(Some(1)));
+    r.tick();
+    r.diff_all();
+    assert!(witness(&r, &failed).1.contains("\nchanges failed\n"));
+    r.fake.w().diff_fails = false;
+    r.fake.w().too_many = true;
+    let many = r.ok("a1", "b");
+    r.jobs.tick();
+    r.fake.set(&many, Probe::Exited(Some(0)));
+    r.tick();
+    r.diff_all();
+    assert!(witness(&r, &many).1.contains("\nchanges too_many\n"));
+    let never = r.ok("a1", "c");
+    assert_eq!(
+        r.json(Route::Cancel(agent("a1"), job_id(&never)), "").0,
+        200
+    );
+    let (_, record, _) = witness(&r, &never);
+    assert!(
+        record.contains("\nstarted_ms -\n")
+            && record.ends_with("\nchanges none\negress journal 0\n"),
+        "{record}"
+    );
+    assert_eq!(
+        r.json(Route::Witness(agent("a1"), job_id("00000000000000ff")), "")
+            .0,
+        404
+    );
 }
 
 /// Issue #26 review: a job whose listing is over the cap (a few hundred thousand files) still gets

@@ -302,7 +302,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST /api/v1/agents/{id}` (create) | `agents:write` |
   | `POST /api/v1/agents/{id}/pause`, `.../resume` | `agents:write` |
   | `DELETE /api/v1/agents/{id}` (destroy; `?purge=true`, `?force=true`) | `agents:write` |
-  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output` | `jobs:read` |
+  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output`, `.../jobs/{job}/witness` | `jobs:read` |
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
   | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
@@ -754,7 +754,7 @@ Origin check.
 - *One tool per REST route* (declared on the route in `access::ROUTES` since ADR-020): `whoami`; `list_agents`, `get_agent`, `get_capacity`,
   `list_egress_profiles`, `get_agent_egress` (`agents:read`); `create_agent`, `pause_agent`, `resume_agent`,
   `destroy_agent` (`agents:write`); `set_agent_egress` (`egress:write`); `list_jobs`, `get_job`,
-  `get_job_output` (`jobs:read`); `submit_job`, `cancel_job` (`jobs:write`); `get_history` (`viewer:read`);
+  `get_job_output`, `get_job_witness` (`jobs:read`, ADR-029); `submit_job`, `cancel_job` (`jobs:write`); `get_history` (`viewer:read`);
   `list_checkpoints` (`agents:read`); `create_checkpoint`, `delete_checkpoint`, `restore_checkpoint`,
   `fork_agent` (`agents:write`, ADR-018). A tool takes its method, path and scope from the route that offers it.
 - *Same path as REST:* a call becomes that route's method, target and body, then goes through `access::check`
@@ -1318,3 +1318,55 @@ before the start fails the job instead of starting it bare; timeout, cancel and 
 kill that removes the file; the `ctr` start puts it on stdin, never in argv, never under the workspace root.
 Still to check live (with #1067): the file exists during the job and is gone after each kind of end.
 
+## ADR-029: A job's witness record, from outside the VM
+**Status:** proposed (2026-11-25). Mill Board card #1065 (LEL D101).
+**Context:** LEL's BBP claim needs evidence about a job that the agent cannot forge. The gateway already holds
+facts the guest cannot write: the job's registry record (ADR-010), the paths it changed from btrfs snapshots
+(ADR-019), and the egress proxy's decision for every request its agent made (ADR-007, ADR-016). Nothing gathered
+them per job, and the change list lived only as a history note.
+
+**Decision:** `GET /api/v1/agents/{id}/jobs/{job}/witness` (`jobs:read`), and the MCP tool `get_job_witness`
+from the same catalog route (ADR-020), return `{"record": "<text>", "sha256": "<hex>"}` for an ended job. The
+digest is SHA-256 over the record's UTF-8 bytes, so a verifier recomputes it from the record alone. 409 while the
+job is queued or running; 404 for an unknown agent or job.
+- *Record v1:* one `key value` line each, `\n`-terminated, in this order; a missing value is `-`:
+  ```
+  agent_cloud.witness v1
+  agent <id>
+  job <job id>
+  state <succeeded|failed|cancelled|timed_out|interrupted>
+  exit_code <n|->
+  created_ms <ms>
+  started_ms <ms|->
+  finished_ms <ms|->
+  changes <listed N|too_many|failed|pending|none>
+  changed <path>                      (N lines, sorted, unique; only after `changes listed`)
+  egress <journal N|unavailable>
+  egress_<allow|deny> <host:port> <count>   (N lines, sorted by verdict then target)
+  ```
+  Paths are workspace-relative and escaped as `btrfs receive --dump` prints them (ADR-019), so none holds
+  whitespace or a control byte. A different layout takes `v2`.
+- *Changes:* what the job's compare found is kept in `<data>/jobs/<agent>/<job>/changes` (mode 0600) when it
+  runs, beside the job's prompt and output, and pruned with them. `pending` until then: re-fetch for the final
+  record. `none` for a job that never started or a gateway without change tracking. `too_many` and `failed` say
+  so, as the history note does, so a job cannot hide what it did by breaking the listing.
+- *Egress:* the gateway reads `journalctl --unit=ac-egress.service` for the job's window, widened to whole
+  seconds, and counts `allow` and `deny` lines tagged `agent=<id>` (ADR-016's per-agent credential). Other
+  agents', unattributed (`agent=-`) and `error` lines are left out. A failed read, or more than 16 MiB of journal
+  for the window, gives `egress unavailable` rather than a partial count. A job's neighbour in the same second of
+  the same agent can add to its counts; jobs of one agent never overlap otherwise.
+- *Left out on purpose:* the prompt, the result, the stream log and the job's `reason`. Each is agent-written or
+  may quote agent-written text, and the record must hold only what the host observed.
+
+**Consequences:** LEL can store the digest on its claim and later fetch and recheck the record. The record is as
+trustworthy as the host: the gateway signs nothing, so a verifier trusts it through the token-authenticated
+channel. Journal retention bounds how long `egress journal` can be rebuilt: an old job's record may change to
+`journal 0` once its lines rotate out, which changes its digest. LEL should keep the record it fetched, not only
+the digest. Resource peaks are not in v1: no per-job figure exists without new sampling.
+
+**Alternatives:**
+- *Have the proxy keep per-job counters.* The proxy does not know jobs, and the journal already holds every
+  decision with the agent's name.
+- *JSON as the canonical form.* Key order, escaping and number formatting all need pinning down for a stable
+  digest; fixed lines are easier to rebuild in any language.
+- *Sign the record.* Needs a key held off the guest and a rotation story; worth it once LEL verifies offline.

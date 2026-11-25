@@ -13,6 +13,7 @@ pub mod capacity;
 pub mod exec;
 pub mod facts;
 pub mod host;
+pub mod journal;
 mod limits;
 pub mod snap;
 

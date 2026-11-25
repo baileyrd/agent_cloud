@@ -455,6 +455,7 @@ mod tests {
             "list_jobs",
             "get_job",
             "get_job_output",
+            "get_job_witness",
             "submit_job",
             "cancel_job",
             "get_history",

@@ -11,7 +11,8 @@
 //!   queued job says why it waits in `queued_reason` (ADR-013; `null` until the supervisor's next
 //!   tick, within a second);
 //! - `GET jobs/{job}/output[?part=stream]`: the final message, or the stream-json log, as text;
-//! - `POST jobs/{job}/cancel`.
+//! - `POST jobs/{job}/cancel`;
+//! - `GET jobs/{job}/witness`: an ended job's witness record and its SHA-256 (ADR-029).
 //!
 //! A queued job starts when its agent is free and the host-wide gate is open ([`schedule`]): fewer
 //! than `max_running` jobs run, the CPU is not saturated, and the last start was long enough ago.
@@ -42,10 +43,12 @@ use ac_domain::changes::Changed;
 use ac_domain::health::Pressure;
 use ac_domain::job::{self, Credential};
 use ac_domain::schedule::{self, Limits, Wait};
+use ac_domain::witness::{self, EgressSource};
 use ac_domain::{AgentId, Job, JobEvent, JobId, JobState, State};
 use ac_ports::{HostLoad, JobStore, SessionStore};
 use platform::process::Spawner;
 use rusty_json::Value;
+use rusty_sha2::{Hash, Sha256};
 
 use crate::{error, escape, Busy, JobCounts, Reply};
 
@@ -53,6 +56,8 @@ use crate::{error, escape, Busy, JobCounts, Reply};
 pub const MAX_QUEUE: usize = 8;
 /// Finished jobs kept per agent (registry records and host copies).
 pub const KEEP: usize = 20;
+/// Where a job's compare result is kept in its host directory, for its witness record.
+pub const CHANGES_FILE: &str = "changes";
 /// Longest `?wait=`.
 pub const MAX_WAIT_SECS: u64 = 30;
 /// Long-polls at once; more are refused, so they cannot take the lifecycle API's connections.
@@ -304,6 +309,20 @@ impl<S: Spawner + Send + Sync + 'static> Changes for CtrRuntime<S> {
     }
 }
 
+/// The egress proxy's log for a time window (ADR-029), for witness records. Implemented over
+/// the journal for [`CtrRuntime`]; tests use a fake.
+pub trait EgressLog: Send + Sync + 'static {
+    /// The proxy's log lines from `since_ms` to `until_ms`, possibly a little wider.
+    fn between(&self, since_ms: u64, until_ms: u64) -> Result<String, String>;
+}
+
+impl<S: Spawner + Send + Sync + 'static> EgressLog for CtrRuntime<S> {
+    fn between(&self, since_ms: u64, until_ms: u64) -> Result<String, String> {
+        self.egress_journal(since_ms, until_ms)
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// The history note for a job whose listing was over the cap: what it changed is not listed, but
 /// that it changed a great deal is said.
 pub fn too_many_note(id: &JobId) -> String {
@@ -516,6 +535,8 @@ pub enum Route {
     Output(AgentId, JobId),
     /// `POST .../jobs/{job}/cancel`.
     Cancel(AgentId, JobId),
+    /// `GET .../jobs/{job}/witness`.
+    Witness(AgentId, JobId),
 }
 
 /// Parse a job route: `None` if `path` is not one.
@@ -542,7 +563,8 @@ pub fn route(method: &str, path: &str) -> Option<Result<Route, Reply>> {
         ("GET", [_], Some(j)) => Route::Get(id, j),
         ("GET", [_, "output"], Some(j)) => Route::Output(id, j),
         ("POST", [_, "cancel"], Some(j)) => Route::Cancel(id, j),
-        (_, [] | [_] | [_, "output" | "cancel"], _) => {
+        ("GET", [_, "witness"], Some(j)) => Route::Witness(id, j),
+        (_, [] | [_] | [_, "output" | "cancel" | "witness"], _) => {
             return Some(Err(error(405, "method not allowed")))
         }
         _ => return Some(Err(error(404, "not found"))),
@@ -647,6 +669,7 @@ pub struct Jobs {
     agents: Arc<dyn SessionStore + Send + Sync>,
     runner: Box<dyn JobRunner>,
     changes: Option<Box<dyn Changes>>,
+    egress: Option<Box<dyn EgressLog>>,
     dir: PathBuf,
     claude: Vec<String>,
     notes: Notes,
@@ -748,6 +771,7 @@ impl Jobs {
             agents,
             runner: Box::new(runner),
             changes: None,
+            egress: None,
             dir,
             claude,
             notes: Box::new(|_, _| {}),
@@ -765,6 +789,13 @@ impl Jobs {
             queued: Condvar::new(),
             secrets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Read each witness record's egress decisions from `log` (ADR-029). Without this, records
+    /// say `egress unavailable`.
+    pub fn with_egress_log(mut self, log: impl EgressLog) -> Self {
+        self.egress = Some(Box::new(log));
+        self
     }
 
     /// Record state changes with `notes` (the agent's history log).
@@ -864,6 +895,7 @@ impl Jobs {
                 Some(_) => error(400, "part must be result or stream"),
             },
             Route::Cancel(id, job) => self.cancel(&id, &job),
+            Route::Witness(id, job) => self.witness(&id, &job),
         };
         Answer::Json(reply)
     }
@@ -953,6 +985,71 @@ impl Jobs {
         match self.transition(agent, id, JobEvent::Cancel, Some("cancelled by a caller")) {
             Ok(j) => ok(200, self.render(&j)),
             Err(reply) => reply,
+        }
+    }
+
+    /// An ended job's witness record (ADR-029) and its SHA-256, from the registry, the changes
+    /// kept when its compare ran and the proxy's log for its agent while it ran. Nothing the
+    /// agent wrote is read. 409 until the job ends; `changes pending` until its compare has run.
+    fn witness(&self, agent: &AgentId, id: &JobId) -> Reply {
+        let j = match self.find(agent, id) {
+            Ok(j) => j,
+            Err(reply) => return reply,
+        };
+        if !j.state.is_terminal() {
+            return error(
+                409,
+                &format!(
+                    "job {id} is {}; its witness comes when it ends",
+                    j.state.name()
+                ),
+            );
+        }
+        let changes = match self.kept_changes(&j) {
+            Ok(changes) => changes,
+            Err(e) => return error(500, &format!("job {id} changes: {e}")),
+        };
+        let record = witness::render(&j, &changes, &self.egress_of(&j));
+        let digest: String = Sha256::digest(record.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        ok(
+            200,
+            format!(
+                r#"{{"record":{},"sha256":"{digest}"}}"#,
+                Value::from(record).to_json_string()
+            ),
+        )
+    }
+
+    /// What the job's compare found, as kept in its host directory by [`Jobs::diff_next`].
+    fn kept_changes(&self, j: &Job) -> Result<witness::Changes, String> {
+        if j.started_ms.is_none() || self.changes.is_none() {
+            return Ok(witness::Changes::None);
+        }
+        match std::fs::read_to_string(self.job_dir(j).join(CHANGES_FILE)) {
+            Ok(text) => witness::parse_changes(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(witness::Changes::Pending),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The proxy's decisions for the job's agent while it ran; none for a job that never started.
+    fn egress_of(&self, j: &Job) -> EgressSource {
+        let Some(log) = &self.egress else {
+            return EgressSource::Unavailable;
+        };
+        let Some(started) = j.started_ms else {
+            return EgressSource::Journal(Vec::new());
+        };
+        let finished = j.finished_ms.unwrap_or(started).max(started);
+        match log.between(started, finished) {
+            Ok(text) => EgressSource::Journal(witness::decisions(&text, &j.agent)),
+            Err(e) => {
+                eprintln!("ac-gateway: jobs: {}/{}: egress log: {e}", j.agent, j.id);
+                EgressSource::Unavailable
+            }
         }
     }
 
@@ -1343,17 +1440,25 @@ impl Jobs {
         let (Some((agent, id)), Some(changes)) = (next, &self.changes) else {
             return false;
         };
-        match changes.diff(&agent, &id) {
-            Ok(Some(Changed::Paths(paths))) => (self.notes)(&agent, &change_note(&id, &paths)),
-            Ok(Some(Changed::TooMany)) => (self.notes)(&agent, &too_many_note(&id)),
-            Ok(None) => {}
+        let kept = match changes.diff(&agent, &id) {
+            Ok(Some(Changed::Paths(paths))) => {
+                (self.notes)(&agent, &change_note(&id, &paths));
+                witness::Changes::Listed(paths)
+            }
+            Ok(Some(Changed::TooMany)) => {
+                (self.notes)(&agent, &too_many_note(&id));
+                witness::Changes::TooMany
+            }
+            Ok(None) => witness::Changes::None,
             // Noted too, so a job cannot hide what it did by making its listing fail (a send
             // timed out on millions of files); the cause, host paths and all, only in the log.
             Err(e) => {
                 eprintln!("ac-gateway: jobs: {agent}/{id}: changes: {e}");
                 (self.notes)(&agent, &format!("job {id} changes could not be listed"));
+                witness::Changes::Failed
             }
-        }
+        };
+        self.keep_changes(&agent, &id, &kept);
         self.queue().listing = None;
         true
     }
@@ -1389,6 +1494,19 @@ impl Jobs {
             Ok(Some(_)) => None,
             Ok(None) => Some(error(404, &format!("agent {agent} not found"))),
             Err(e) => Some(error(500, &e.to_string())),
+        }
+    }
+
+    /// Keep what a job's compare found for its witness record, beside its prompt and output.
+    /// A job already pruned has no directory, and nothing is kept.
+    fn keep_changes(&self, agent: &AgentId, id: &JobId, changes: &witness::Changes) {
+        let dir = self.dir.join(agent.as_str()).join(id.as_str());
+        if !dir.is_dir() {
+            return;
+        }
+        let text = witness::render_changes(changes);
+        if let Err(e) = write_private(&dir.join(CHANGES_FILE), text.as_bytes()) {
+            eprintln!("ac-gateway: jobs: {agent}/{id}: keeping changes: {e}");
         }
     }
 

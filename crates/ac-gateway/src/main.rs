@@ -497,6 +497,7 @@ fn run() -> Result<(), String> {
         )
         .with_gate(gate, ProcPressure)
         .with_changes(CtrRuntime::new(LinuxSpawner, cfg.clone()))
+        .with_egress_log(CtrRuntime::new(LinuxSpawner, cfg.clone()))
         .with_notes(move |id, text| notes.note(id, text)),
     );
     jobs.startup();

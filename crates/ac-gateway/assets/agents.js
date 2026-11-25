@@ -47,10 +47,10 @@
     await refresh();
   }
 
-  // The agent's id, linking to its jobs page.
+  // The agent's id, linking to its own page.
   function link(id) {
     const td = el('td');
-    td.append(el('a', id, { href: `/ui/jobs/${encodeURIComponent(id)}` }));
+    td.append(el('a', id, { href: `/ui/agent/${encodeURIComponent(id)}` }));
     return td;
   }
 

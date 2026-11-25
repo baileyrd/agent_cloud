@@ -37,3 +37,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax-check shell scripts
         run: ./scripts/ci-local.sh scripts
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Viewer page tests
+        run: ./scripts/ci-local.sh web

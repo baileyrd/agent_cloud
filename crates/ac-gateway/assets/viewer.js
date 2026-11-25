@@ -199,8 +199,13 @@
     PageDown: 'NPage', Insert: 'IC', Delete: 'DC',
   };
 
+  // Ctrl+V and Ctrl+Shift+V are the browser's paste on Windows and Linux: leave them to it, so the
+  // paste handler below sends the clipboard. A literal ^V is sent with Ctrl+Alt+V.
+  const isPaste = (e) => e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'v';
+
   function keyOf(e) {
-    if (e.isComposing || e.metaKey) return null;
+    if (e.isComposing || e.metaKey || isPaste(e)) return null;
+    if (e.ctrlKey && e.altKey && e.key.toLowerCase() === 'v') return { key: 'C-v' };
     const mods = (e.ctrlKey ? 'C-' : '') + (e.altKey ? 'M-' : '');
     if (e.key === 'Tab') return { key: e.shiftKey ? 'BTab' : `${mods}Tab` };
     if (NAMED[e.key]) return { key: mods + (e.shiftKey && e.key.startsWith('Arrow') ? 'S-' : '') + NAMED[e.key] };

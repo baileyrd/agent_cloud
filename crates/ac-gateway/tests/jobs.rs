@@ -78,6 +78,8 @@ struct World {
     leftovers_fail: usize,
     /// Jobs with snapshots on disk from an earlier run, as `leftovers` reports them.
     leftovers: Vec<(AgentId, JobId)>,
+    /// Each job's stream-json log, when a test writes one (`read` of the stream then returns it).
+    logs: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Default)]
@@ -167,11 +169,24 @@ impl JobRunner for Fake {
         Ok(())
     }
     fn read(&self, _: &AgentId, job: &JobId, part: Part) -> Result<Vec<u8>, String> {
+        if let (Part::Stream, Some(log)) = (part, self.w().logs.get(job.as_str())) {
+            return Ok(log.clone());
+        }
         let echo = self.w().echo.clone();
         Ok(match part {
             Part::Result => format!("result of {job} <script>{echo}").into_bytes(),
             Part::Stream => format!("{{\"type\":\"result\"}}\n{echo}").into_bytes(),
         })
+    }
+
+    fn read_from(&self, _: &AgentId, job: &JobId, offset: u64) -> Result<Vec<u8>, String> {
+        let w = self.w();
+        let log = w.logs.get(job.as_str()).ok_or("no such file")?;
+        let start = usize::try_from(offset)
+            .map_err(|e| e.to_string())?
+            .min(log.len());
+        let end = (start + jobs::EVENTS_CHUNK).min(log.len());
+        Ok(log[start..end].to_vec())
     }
 }
 
@@ -2769,4 +2784,288 @@ fn queued_job_starts_through_ctr_when_the_gate_opens_and_not_before() {
     assert_eq!(starts(), 1);
     assert_eq!(field(&get(""), "state"), "running");
     let _ = std::fs::remove_dir_all(root);
+}
+
+// ---- the AG-UI event stream (#471) -----------------------------------------------------------
+
+const LOG: &str = concat!(
+    r#"{"type":"system","subtype":"init"}"#,
+    "\n",
+    r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+    "\n",
+    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"src"}]}}"#,
+    "\n",
+    "not json\n",
+    r#"{"type":"result","result":"done"}"#,
+    "\n",
+);
+
+/// A rig whose event streams poll every 20 ms.
+fn quick() -> Rig {
+    let (store, root) = registry();
+    build_with(store, Fake::default(), root, None, |j| {
+        j.with_events_poll(Duration::from_millis(20))
+    })
+}
+
+/// (type, SSE id) of each event in an SSE body read raw (chunk-size lines are skipped).
+fn events_of(body: &str) -> Vec<(String, Option<u64>)> {
+    let mut out = Vec::new();
+    let mut id = None;
+    for line in body.lines() {
+        if let Some(n) = line.strip_prefix("id: ") {
+            id = n.trim().parse().ok();
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            out.push((field(data, "type"), id.take()));
+        }
+    }
+    out
+}
+
+fn types(events: &[(String, Option<u64>)]) -> Vec<&str> {
+    events.iter().map(|(t, _)| t.as_str()).collect()
+}
+
+/// Run `id` to `probe` with `log` written.
+fn finish(r: &Rig, id: &str, log: &str, probe: Probe) {
+    r.jobs.tick();
+    r.fake
+        .w()
+        .logs
+        .insert(id.to_owned(), log.as_bytes().to_vec());
+    r.fake.set(id, probe);
+    r.tick();
+}
+
+#[test]
+fn an_ended_job_replays_as_one_ag_ui_run_in_order() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "go");
+    finish(&r, &id, LOG, Probe::Exited(Some(0)));
+    assert_eq!(r.state("a1", &id), "succeeded");
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let (status, head, body) = request(addr, "GET", &path, "");
+    assert_eq!(status, 200, "{body}");
+    for h in [
+        "content-type: text/event-stream",
+        "x-content-type-options: nosniff",
+    ] {
+        assert!(head.contains(h), "{h}: {head}");
+    }
+    let events = events_of(&body);
+    assert_eq!(
+        types(&events),
+        [
+            "RUN_STARTED",
+            "STATE_SNAPSHOT",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+            "RUN_FINISHED",
+        ],
+        "{body}"
+    );
+    // A line's events carry its line number once, on the last of them.
+    let ids: Vec<u64> = events.iter().filter_map(|e| e.1).collect();
+    assert_eq!(ids, [2, 3], "{body}");
+    assert!(
+        body.contains(r#""runId":""#) && body.contains(&id),
+        "{body}"
+    );
+    assert!(body.contains(r#""delta":"Looking.""#), "{body}");
+
+    // Resuming after line 2 sends only what follows it.
+    let (_, _, again) = request(addr, "GET", &format!("{path}?after=2"), "");
+    assert_eq!(
+        types(&events_of(&again)),
+        [
+            "RUN_STARTED",
+            "STATE_SNAPSHOT",
+            "TOOL_CALL_RESULT",
+            "RUN_FINISHED"
+        ],
+        "{again}"
+    );
+    assert_eq!(request(addr, "GET", &format!("{path}?after=x"), "").0, 400);
+    assert_eq!(
+        request(
+            addr,
+            "GET",
+            "/api/v1/agents/a1/jobs/0000000000000000/events",
+            ""
+        )
+        .0,
+        404
+    );
+    assert_eq!(request(addr, "POST", &path, "").0, 405);
+}
+
+#[test]
+fn failed_and_cancelled_jobs_end_with_run_error() {
+    let r = quick();
+    let addr = serve(&r);
+    let failed = r.ok("a1", "fails");
+    finish(&r, &failed, LOG, Probe::Exited(Some(3)));
+    assert_eq!(r.state("a1", &failed), "failed");
+    let (_, _, body) = request(
+        addr,
+        "GET",
+        &format!("/api/v1/agents/a1/jobs/{failed}/events"),
+        "",
+    );
+    let events = events_of(&body);
+    assert_eq!(types(&events).last(), Some(&"RUN_ERROR"), "{body}");
+    assert!(body.contains(r#""code":"failed""#), "{body}");
+
+    let queued = r.ok("a2", "never runs");
+    assert_eq!(
+        request(
+            addr,
+            "POST",
+            &format!("/api/v1/agents/a2/jobs/{queued}/cancel"),
+            ""
+        )
+        .0,
+        200
+    );
+    let (_, _, body) = request(
+        addr,
+        "GET",
+        &format!("/api/v1/agents/a2/jobs/{queued}/events"),
+        "",
+    );
+    assert_eq!(
+        types(&events_of(&body)),
+        ["RUN_STARTED", "STATE_SNAPSHOT", "RUN_ERROR"],
+        "{body}"
+    );
+    assert!(body.contains(r#""code":"cancelled""#), "{body}");
+}
+
+#[test]
+fn a_running_job_streams_live_and_ends_when_it_does() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "live");
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &id), "running");
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let reader = std::thread::spawn(move || request(addr, "GET", &path, ""));
+    // Half a line, then the rest of the log while it runs, then the end.
+    let first = &LOG[..LOG.find("Looking").unwrap_or(0)];
+    r.fake
+        .w()
+        .logs
+        .insert(id.clone(), first.as_bytes().to_vec());
+    std::thread::sleep(Duration::from_millis(100));
+    r.fake.w().logs.insert(id.clone(), LOG.as_bytes().to_vec());
+    std::thread::sleep(Duration::from_millis(100));
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (status, _, body) = reader.join().unwrap_or_else(|_| panic!("reader panicked"));
+    assert_eq!(status, 200);
+    let events = events_of(&body);
+    let t = types(&events);
+    assert_eq!(t.first(), Some(&"RUN_STARTED"), "{body}");
+    assert_eq!(t.last(), Some(&"RUN_FINISHED"), "{body}");
+    assert_eq!(
+        t.iter().filter(|e| **e == "TEXT_MESSAGE_CONTENT").count(),
+        1,
+        "{body}"
+    );
+    // queued is never seen here; running then succeeded are.
+    assert!(
+        t.iter().filter(|e| **e == "STATE_SNAPSHOT").count() >= 2,
+        "{body}"
+    );
+    assert!(body.contains(": keep-alive"), "{body}");
+}
+
+#[test]
+fn event_text_is_redacted_with_the_jobs_credential() {
+    let r = quick();
+    let addr = serve(&r);
+    let body = format!(r#"{{"prompt":"go","credential":"{CRED}"}}"#);
+    let (status, reply) = r.submit("a1", &body);
+    assert_eq!(status, 202, "{reply}");
+    let id = field(&reply, "job_id");
+    r.jobs.tick();
+    let log = format!(
+        "{}\n",
+        r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"key SECRET"}]}}"#
+            .replace("SECRET", CRED)
+    );
+    r.fake.w().logs.insert(id.clone(), log.into_bytes());
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let reader = std::thread::spawn(move || request(addr, "GET", &path, ""));
+    std::thread::sleep(Duration::from_millis(100));
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (_, _, events) = reader.join().unwrap_or_else(|_| panic!("reader panicked"));
+    assert!(!events.contains(CRED), "{events}");
+    assert!(events.contains("key [credential redacted]"), "{events}");
+}
+
+#[test]
+fn events_need_jobs_read_for_the_agent() {
+    let r = quick();
+    let t = scoped(&r.root);
+    let addr = serve_with(&r, t.keys.clone());
+    let a1 = r.ok("a1", "x");
+    let a2 = r.ok("a2", "y");
+    let path = |agent: &str, job: &str| format!("/api/v1/agents/{agent}/jobs/{job}/events");
+    assert_eq!(
+        request_as(addr, &t.read_a1, "GET", &path("a1", &a1), "").0,
+        403
+    );
+    assert_eq!(
+        request_as(addr, &t.viewer, "GET", &path("a1", &a1), "").0,
+        403
+    );
+    assert_eq!(
+        request_as(addr, &t.jobs_a1, "GET", &path("a2", &a2), "").0,
+        404
+    );
+    assert_eq!(
+        request_as(addr, "wrong", "GET", &path("a1", &a1), "").0,
+        401
+    );
+    // Allowed: cancel so the stream ends.
+    assert_eq!(
+        request(
+            addr,
+            "POST",
+            &format!("/api/v1/agents/a1/jobs/{a1}/cancel"),
+            ""
+        )
+        .0,
+        200
+    );
+    let (status, _, body) = request_as(addr, &t.jobs_a1, "GET", &path("a1", &a1), "");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("RUN_ERROR"), "{body}");
+}
+
+#[test]
+fn event_streams_are_capped() {
+    let r = quick();
+    let id = r.ok("a1", "held open");
+    let streams: Vec<_> = (0..jobs::MAX_STREAMS)
+        .map(|_| Jobs::events(&r.jobs, &agent("a1"), &job_id(&id), "").map_err(|e| e.status))
+        .collect();
+    assert!(streams.iter().all(Result::is_ok));
+    let over = Jobs::events(&r.jobs, &agent("a1"), &job_id(&id), "")
+        .map(drop)
+        .map_err(|e| e.status);
+    assert_eq!(over, Err(429));
+    drop(streams);
+    assert!(
+        Jobs::events(&r.jobs, &agent("a1"), &job_id(&id), "").is_ok(),
+        "seats come back"
+    );
 }

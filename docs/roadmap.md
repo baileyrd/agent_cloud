@@ -42,7 +42,8 @@ items below in scope (R5). This file records what shipped and how it was verifie
   valid tokens still work), each failure logged with the tailnet user behind Serve (ADR-024, PR #35; verified on
   BaileyServ 2026-11-24). Per-address limits are not possible behind Serve, where every peer is loopback
 - [x] Drop the deprecated `AC_TOKEN_FILE` (#640; BaileyServ confirmed off it 2026-11-24)
-- [ ] Per-job event stream (AG-UI via `rusty_agui`)
+- [ ] Per-job event stream (AG-UI via `rusty_agui`): `GET .../jobs/{job}/events` (ADR-010 addendum, #471); a live
+  check with an AG-UI client on BaileyServ is still to do
 - [x] Session registry on the multimodal engine (`ac-store`) and event log (`ac-history`)
 - [x] Fleet lifecycle and `ctr`/Kata adapter (`ac-fleet`, `ac-ctr`), tested against fakes and on the host
 

@@ -255,10 +255,38 @@ never the registry's state or times. Output is read through execs, so a wedged a
 The image's PID 1 is `tini` (running `sleep infinity`), which reaps orphans, so a killed job leaves no
 zombies (verified 2026-10-22: none after a cancel through the API, a `pkill` of `claude` and killed
 orphans; before, with `sleep infinity` as PID 1, they stayed until the agent was paused).
-**Not now:** `rusty_agui` (AG-UI events over SSE) fits a later per-job event stream that turns the
-stream-json log into `RUN_STARTED`/`TEXT_MESSAGE_*`/`TOOL_CALL_*`/`RUN_FINISHED`; it does not fit the
-control plane (AG-UI has no queue, job id or re-attach; a run is one request). Long-polling the status
-is enough for now.
+**Not the control plane:** AG-UI has no queue, job id or re-attach (a run is one request), so jobs stay
+on this API and long-polling. A read-only AG-UI view of each job came later (addendum below).
+
+**Addendum (2026-11-25, #471): each job as an AG-UI run.** `GET .../jobs/{job}/events[?after=N]` (`jobs:read`
+for the agent; not an MCP tool, since a tool call answers once) streams the job as Server-Sent Events in
+AG-UI's format, built with `rusty_agui` from the same rusty_mill pin (ADR-008). It is for watching:
+CopilotKit or any AG-UI client renders the run live. It is not evidence: the witness record (ADR-029) is.
+- *Mapping* (`ac-gateway/src/agui.rs`): `RUN_STARTED` (thread = agent id, run = job id), then
+  `STATE_SNAPSHOT` with the job as `GET .../jobs/{job}` renders it, again at each state change. Each log
+  line's `assistant` text block becomes `TEXT_MESSAGE_START`/`CONTENT`/`END`, each `tool_use` block becomes
+  `TOOL_CALL_START`/`ARGS`/`END` (the input as JSON), and each `user` `tool_result` becomes
+  `TOOL_CALL_RESULT`. Other lines (system, result, thinking, unparsable) make nothing. `succeeded` ends with
+  `RUN_FINISHED` (result = the job); the other ends with `RUN_ERROR`, code = the state.
+- *Trust:* this is the first place the gateway parses the agent's log. It parses with `rusty_json` (no
+  serde), line by line. A line over 1 MiB is skipped and any text over 64 KiB is cut. Every event passes
+  `rusty_agui`'s ordering verifier, and a violation ends the run with `RUN_ERROR` `sequence`. The outcome
+  comes from the registry, never from the log, so an agent can write anything into the messages but
+  cannot make a failed job look finished. Lines are redacted with the job's credential (ADR-028), which
+  the stream captures when it opens, because the registry forgets the credential when the job ends,
+  before the last read. Served `nosniff` and `no-store`.
+- *Reading:* while the job runs, the stream polls every 2 s. It reads the registry, then up to 4 x 256 KiB
+  of the log from where it stopped, through one `dd` exec. Once the job ends it reads the rest and closes.
+  A job that had already ended is replayed from the host's copy, which is its last 1 MiB. At most 8 streams
+  are open at once (429 beyond), because each one execs. Keep-alive comments go out between polls. The
+  stream ends within one poll of its token being revoked or expiring (ADR-022), like a viewer stream.
+- *Resuming:* each line's events carry the line number as their SSE `id`, on the last of them. A client
+  that reconnects passes the last id it saw as `?after=N` and gets `RUN_STARTED`, the state, then the
+  lines after N. Browsers cannot set `Authorization` on an `EventSource`, so clients use `fetch` and
+  resume explicitly. `Last-Event-ID` is not read. After a long log (over 1 MiB) has ended, line numbers
+  count from the start of the host's copy.
+- *Not done:* partial messages (`--include-partial-messages`) and reasoning events. The log has whole
+  messages only, so text arrives one message at a time.
 
 ## ADR-011: Scoped API tokens
 **Status:** accepted (2026-10-21).
@@ -302,7 +330,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST /api/v1/agents/{id}` (create) | `agents:write` |
   | `POST /api/v1/agents/{id}/pause`, `.../resume` | `agents:write` |
   | `DELETE /api/v1/agents/{id}` (destroy; `?purge=true`, `?force=true`) | `agents:write` |
-  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output`, `.../jobs/{job}/witness` | `jobs:read` |
+  | `GET .../{id}/jobs`, `.../jobs/{job}`, `.../jobs/{job}/output`, `.../jobs/{job}/witness`, `.../jobs/{job}/events` | `jobs:read` |
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
   | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |

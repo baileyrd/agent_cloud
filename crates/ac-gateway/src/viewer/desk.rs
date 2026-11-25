@@ -463,3 +463,64 @@ fn track_buttons(pressed: &mut Vec<Button>, cmd: &DeskInput) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seat() -> (DeskSeat, Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let seat = DeskSeat {
+            tx,
+            queued: Arc::new(AtomicUsize::new(0)),
+        };
+        (seat, rx)
+    }
+
+    fn desk(seat: DeskSeat) -> Desk {
+        Desk {
+            gen: 1,
+            viewers: HashMap::from([("v".to_owned(), seat)]),
+            frame: None,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn frames_leave_the_reserve_for_control_messages() {
+        let (seat, _rx) = seat();
+        for _ in 0..QUEUE * 2 {
+            assert!(seat.frame(b"frame".to_vec()), "a viewer behind is kept");
+        }
+        assert_eq!(seat.queued.load(Ordering::SeqCst), QUEUE - RESERVED);
+        for _ in 0..RESERVED {
+            assert!(seat.control(b"mode".to_vec()));
+        }
+        assert!(!seat.control(b"mode".to_vec()), "past the reserve");
+        assert_eq!(seat.queued.load(Ordering::SeqCst), QUEUE);
+    }
+
+    #[test]
+    fn a_viewer_behind_on_frames_keeps_its_seat_through_a_broadcast() {
+        let (seat, rx) = seat();
+        for _ in 0..QUEUE {
+            seat.frame(b"frame".to_vec());
+        }
+        let mut d = desk(seat);
+        broadcast(&mut d, "mode");
+        assert!(d.viewers.contains_key("v"));
+        let got: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert_eq!(got.len(), QUEUE - RESERVED + 1);
+        assert_eq!(got.last().map(Vec::as_slice), Some(&b"mode"[..]));
+    }
+
+    #[test]
+    fn a_gone_viewer_is_dropped() {
+        let (seat, rx) = seat();
+        drop(rx);
+        assert!(!seat.frame(b"frame".to_vec()));
+        let mut d = desk(seat);
+        broadcast(&mut d, "mode");
+        assert!(d.viewers.is_empty());
+    }
+}

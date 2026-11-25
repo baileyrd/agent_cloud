@@ -1353,8 +1353,6 @@ struct DeskWorld {
     input_clients: usize,
     /// For each `q` a frame client got: whether its stdout was still being read.
     quit_with_stdout: Vec<bool>,
-    /// Bytes the frame clients' stdout handed the gateway.
-    frame_bytes: usize,
 }
 
 impl FakeDesk {
@@ -1381,7 +1379,6 @@ struct DeskIn {
 
 /// A frame client's stdout: what the test pushes, then EOF once the client has quit.
 struct DeskOut {
-    desk: FakeDesk,
     rx: Receiver<Vec<u8>>,
     pending: Vec<u8>,
     alive: Rc<Cell<bool>>,
@@ -1403,7 +1400,6 @@ impl File for DeskOut {
         let n = buf.len().min(self.pending.len());
         buf[..n].copy_from_slice(&self.pending[..n]);
         self.pending.drain(..n);
-        self.desk.world().frame_bytes += n;
         Ok(n)
     }
     fn write(&mut self, b: &[u8]) -> platform::error::Result<usize> {
@@ -1484,7 +1480,6 @@ impl Desktop for FakeDesk {
             out_open: Some(Rc::clone(&open)),
         };
         let out = DeskOut {
-            desk: self.clone(),
             rx,
             pending: Vec::new(),
             alive: Rc::clone(&alive),
@@ -1657,31 +1652,6 @@ fn a_desktop_is_watched_and_taken_over_on_the_terminals_lock() {
         desk.push(&jpeg(b"tick"));
         desk.world().frames.is_empty()
     });
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_desktop_viewer_behind_on_frames_keeps_take_over() {
-    let (fake, desk, dir) = (Fake::new(), FakeDesk::default(), tmp("desk-slow"));
-    let addr = serve_desk(&fake, &desk, &dir, owner_keys());
-    let mut d = Viewer::open_kind(addr, TOKEN, "a1", "desk").unwrap_or_else(|c| panic!("{c}"));
-    d.until("\"t\":\"mode\"");
-    wait_for("frame client", || desk.world().frame_clients == 1);
-    // More distinct 1 MiB frames than the socket buffers and the queue hold, unread.
-    let frames: Vec<Vec<u8>> = (0..32u8).map(|i| jpeg(&vec![i; 1 << 20])).collect();
-    for f in &frames {
-        desk.push(f);
-    }
-    let total: usize = frames.iter().map(Vec::len).sum();
-    wait_for("frames read", || desk.world().frame_bytes >= total);
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(d.post(addr, "takeover", "").0, 200);
-    assert_eq!(
-        d.post(addr, "pointer", "move 1 1").0,
-        200,
-        "the viewer kept its seat and the lock"
-    );
-    d.until(&format!("\"owner\":\"{}\"", d.id));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -13,12 +13,14 @@
 //! - `POST /api/v1/agents/{id}/desk/{viewer}/{takeover|release|pointer|keys|text}`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ac_ctr::{CtrRuntime, Exec};
 use ac_domain::AgentId;
-use ac_viewer::desk::{self, DeskError, DeskInput};
+use ac_viewer::desk::{self, Button, DeskError, DeskInput};
 use ac_viewer::registry::{Full, Held};
 use ac_viewer::screen;
 use platform::process::Spawner;
@@ -30,6 +32,12 @@ use crate::{error, Reply};
 /// Messages queued per desktop viewer. Frames are large, so few; a frame that finds the queue full
 /// is skipped for that viewer, which then sees the next one.
 const QUEUE: usize = 8;
+/// Slots frames never take, so a control message (`mode`, `bye`) reaches a viewer that is behind
+/// on frames instead of dropping it.
+const RESERVED: usize = 2;
+/// How long the frame client's output is still read after its quit, so ffmpeg can finish a write
+/// and see the `q`.
+const DRAIN: Duration = Duration::from_secs(2);
 /// What the frame client runs: display `:0`, 4 frames a second, JPEG quality 10 of 31.
 const FRAMES: [&str; 19] = [
     "ffmpeg",
@@ -116,19 +124,55 @@ impl DeskAction {
     }
 }
 
+/// One desktop viewer's queue, and how many messages wait in it (its [`super::Stream`] counts
+/// them down), so frames can leave [`RESERVED`] slots free.
+pub(crate) struct DeskSeat {
+    tx: SyncSender<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl DeskSeat {
+    /// Queue a control message; `false` if the viewer is gone or its reserve is used up.
+    fn control(&self, msg: Vec<u8>) -> bool {
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        let sent = self.tx.try_send(msg).is_ok();
+        if !sent {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+        }
+        sent
+    }
+
+    /// Queue a frame unless only the reserve is left (then it is skipped); `false` if the viewer
+    /// is gone.
+    fn frame(&self, msg: Vec<u8>) -> bool {
+        if self.queued.load(Ordering::SeqCst) >= QUEUE - RESERVED {
+            return true;
+        }
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        match self.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(e) => {
+                self.queued.fetch_sub(1, Ordering::SeqCst);
+                matches!(e, TrySendError::Full(_))
+            }
+        }
+    }
+}
+
 /// A watched desktop: lives exactly as long as its frame client.
 pub(crate) struct Desk {
     gen: u64,
-    pub(crate) viewers: HashMap<String, SyncSender<Vec<u8>>>,
+    pub(crate) viewers: HashMap<String, DeskSeat>,
     /// The latest frame message, for a viewer that joins.
     frame: Option<Vec<u8>>,
     pub(crate) owner: Option<SyncSender<DeskInput>>,
 }
 
-/// Send a control message to every viewer; one whose queue is full is dropped (it reconnects).
+/// Send a control message to every viewer; one that is gone, or has not read even the reserved
+/// slots, is dropped (it reconnects).
 pub(crate) fn broadcast(desk: &mut Desk, msg: &str) {
     desk.viewers
-        .retain(|_, tx| tx.try_send(msg.as_bytes().to_vec()).is_ok());
+        .retain(|_, seat| seat.control(msg.as_bytes().to_vec()));
 }
 
 impl Hub {
@@ -138,6 +182,11 @@ impl Hub {
         }
         let viewer = new_viewer_id();
         let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let seat = DeskSeat {
+            tx,
+            queued: Arc::new(AtomicUsize::new(0)),
+        };
+        let queued = Arc::clone(&seat.queued);
         let start = {
             let mut st = self.inner.lock();
             match st.registry.join(id.as_str(), &viewer) {
@@ -156,12 +205,12 @@ impl Hub {
                 frame: None,
                 owner: None,
             });
-            let _ = tx.try_send(screen::hello(&viewer).into_bytes());
-            let _ = tx.try_send(screen::mode(owner.as_deref()).into_bytes());
+            seat.control(screen::hello(&viewer).into_bytes());
+            seat.control(screen::mode(owner.as_deref()).into_bytes());
             if let Some(frame) = &desk.frame {
-                let _ = tx.try_send(frame.clone());
+                seat.frame(frame.clone());
             }
-            desk.viewers.insert(viewer.clone(), tx);
+            desk.viewers.insert(viewer.clone(), seat);
             let start = (desk.gen == gen).then_some(gen);
             st.tokens.insert(viewer.clone(), who.to_owned());
             start
@@ -177,6 +226,7 @@ impl Hub {
             id: id.clone(),
             viewer,
             kind: Kind::Desk,
+            queued: Some(queued),
         })
     }
 
@@ -293,10 +343,7 @@ impl Inner {
         let Some(desk) = st.desks.get_mut(id.as_str()).filter(|d| d.gen == gen) else {
             return;
         };
-        desk.viewers.retain(|_, tx| match tx.try_send(msg.clone()) {
-            Ok(()) | Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
-        });
+        desk.viewers.retain(|_, seat| seat.frame(msg.clone()));
         desk.frame = Some(msg);
     }
 
@@ -305,8 +352,8 @@ impl Inner {
         let mut st = self.lock();
         if st.desks.get(id.as_str()).is_some_and(|d| d.gen == gen) {
             if let Some(desk) = st.desks.remove(id.as_str()) {
-                for tx in desk.viewers.values() {
-                    let _ = tx.try_send(screen::bye(reason).into_bytes());
+                for seat in desk.viewers.values() {
+                    seat.control(screen::bye(reason).into_bytes());
                 }
             }
         }
@@ -321,12 +368,42 @@ fn frames(inner: Arc<Inner>, id: AgentId, gen: u64) {
     inner.desk_ended(&id, gen, &reason);
 }
 
-/// Read frames until the client exits or the desktop is no longer watched; the client is closed
-/// (quit, then signals) on every way out, when `exec` drops.
+/// Read frames until the client exits or the desktop is no longer watched, then close the client
+/// while its stdout is still open: closed first, `ctr` would die of SIGPIPE before passing on the
+/// quit, and leave ffmpeg running in the guest.
 fn run_frames(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
     let desktop = inner.desktop.as_ref().ok_or("no desktop stream")?;
     let mut exec = desktop.attach_frames(id)?;
     let mut out = exec.take_stdout().ok_or("frame client has no stdout")?;
+    let result = pump(inner, id, gen, out.as_mut());
+    quit_draining(&mut exec, out.as_mut());
+    drop(exec);
+    drop(out);
+    result
+}
+
+/// Ask the frame client to quit and read (and discard) its output until it exits or [`DRAIN`]
+/// passes; dropping the [`Exec`] after this escalates to signals if it is still running.
+fn quit_draining(exec: &mut Exec, out: &mut dyn platform::fs::File) {
+    if exec.send(FRAMES_QUIT).is_err() {
+        return;
+    }
+    let end = Instant::now() + DRAIN;
+    let mut buf = vec![0u8; READ];
+    while Instant::now() < end {
+        if !matches!(out.read(&mut buf), Ok(n) if n > 0) {
+            return;
+        }
+    }
+}
+
+/// Split the frame client's output into frames and send each new one to the viewers.
+fn pump(
+    inner: &Inner,
+    id: &AgentId,
+    gen: u64,
+    out: &mut dyn platform::fs::File,
+) -> Result<(), String> {
     let mut splitter = desk::Frames::new();
     let mut last: Option<Vec<u8>> = None;
     let mut buf = vec![0u8; READ];
@@ -350,7 +427,7 @@ fn run_frames(inner: &Inner, id: &AgentId, gen: u64) -> Result<(), String> {
 }
 
 /// The input loop: forwards the lock holder's commands until the lock moves (the sender is
-/// dropped), then closes.
+/// dropped), then lets go of any mouse button it left pressed and closes.
 fn input(inner: Arc<Inner>, id: AgentId, rx: Receiver<DeskInput>) {
     let Some(desktop) = inner.desktop.as_ref() else {
         return;
@@ -362,11 +439,27 @@ fn input(inner: Arc<Inner>, id: AgentId, rx: Receiver<DeskInput>) {
             return;
         }
     };
+    let mut pressed: Vec<Button> = Vec::new();
     while let Ok(cmd) = rx.recv() {
+        track_buttons(&mut pressed, &cmd);
         for line in cmd.lines() {
             if exec.send(line.as_bytes()).is_err() {
                 return;
             }
         }
+    }
+    for line in pressed.into_iter().flat_map(|b| DeskInput::Up(b).lines()) {
+        if exec.send(line.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+/// Keep `pressed` as the mouse buttons held down after `cmd`.
+fn track_buttons(pressed: &mut Vec<Button>, cmd: &DeskInput) {
+    match cmd {
+        DeskInput::Down(b) if !pressed.contains(b) => pressed.push(*b),
+        DeskInput::Up(b) => pressed.retain(|p| p != b),
+        _ => {}
     }
 }

@@ -552,6 +552,7 @@ impl Hub {
             id: id.clone(),
             viewer,
             kind: Kind::Term,
+            queued: None,
         })
     }
 
@@ -884,6 +885,8 @@ pub struct Stream {
     id: AgentId,
     viewer: String,
     kind: Kind,
+    /// A desktop viewer's queued-message count, counted down as messages are taken.
+    queued: Option<Arc<AtomicUsize>>,
 }
 
 /// Which stream a viewer has.
@@ -898,7 +901,12 @@ impl Iterator for Stream {
 
     fn next(&mut self) -> Option<Vec<u8>> {
         match self.rx.recv_timeout(HEARTBEAT) {
-            Ok(msg) => Some(msg),
+            Ok(msg) => {
+                if let Some(q) = &self.queued {
+                    q.fetch_sub(1, Ordering::SeqCst);
+                }
+                Some(msg)
+            }
             Err(RecvTimeoutError::Timeout) => Some(screen::ping().into_bytes()),
             Err(RecvTimeoutError::Disconnected) => None,
         }

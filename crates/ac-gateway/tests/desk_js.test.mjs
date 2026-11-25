@@ -80,6 +80,9 @@ test('keys go out as X names, printable characters as text', async () => {
   assert.deepEqual(await fire('desk', 'keydown', { key: ' ' }), [true, [['keys', 'space']]]);
   assert.deepEqual(await fire('desk', 'keydown', { key: 'c', ctrlKey: true }), [true, [['keys', 'ctrl+c']]]);
   assert.deepEqual(await fire('desk', 'keydown', { key: 'F5' }), [true, [['keys', 'F5']]]);
+  assert.deepEqual(await fire('desk', 'keydown', { key: 'Tab', shiftKey: true }), [true, [['keys', 'shift+Tab']]]);
+  assert.deepEqual(await fire('desk', 'keydown', { key: 'A', shiftKey: true }), [true, [['text', 'A']]]);
+  assert.deepEqual(await fire('desk', 'keydown', { key: 'Shift', shiftKey: true }), [false, []]);
 });
 
 test('lone modifiers and unknown chords are left to the browser', async () => {

@@ -1351,6 +1351,10 @@ struct DeskWorld {
     /// Every line any input client received, quits included.
     input: Vec<String>,
     input_clients: usize,
+    /// For each `q` a frame client got: whether its stdout was still being read.
+    quit_with_stdout: Vec<bool>,
+    /// Bytes the frame clients' stdout handed the gateway.
+    frame_bytes: usize,
 }
 
 impl FakeDesk {
@@ -1371,6 +1375,62 @@ struct DeskIn {
     desk: FakeDesk,
     alive: Rc<Cell<bool>>,
     quit: &'static str,
+    /// The frame client's stdout, while open; `None` for the input loop.
+    out_open: Option<Rc<Cell<bool>>>,
+}
+
+/// A frame client's stdout: what the test pushes, then EOF once the client has quit.
+struct DeskOut {
+    desk: FakeDesk,
+    rx: Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+    alive: Rc<Cell<bool>>,
+    open: Rc<Cell<bool>>,
+}
+
+impl File for DeskOut {
+    fn read(&mut self, buf: &mut [u8]) -> platform::error::Result<usize> {
+        while self.pending.is_empty() {
+            if !self.alive.get() {
+                return Ok(0);
+            }
+            match self.rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(b) => self.pending = b,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.pending.len());
+        buf[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        self.desk.world().frame_bytes += n;
+        Ok(n)
+    }
+    fn write(&mut self, b: &[u8]) -> platform::error::Result<usize> {
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> platform::error::Result<()> {
+        Ok(())
+    }
+    fn sync_all(&mut self) -> platform::error::Result<()> {
+        Ok(())
+    }
+    fn try_clone(&self) -> platform::error::Result<Box<dyn File>> {
+        Err(PlatformError::new(
+            ErrorKind::Unsupported,
+            OsCode::None,
+            "clone",
+        ))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Drop for DeskOut {
+    fn drop(&mut self) {
+        self.open.set(false);
+    }
 }
 
 impl File for DeskIn {
@@ -1381,6 +1441,9 @@ impl File for DeskIn {
         for line in String::from_utf8_lossy(buf).lines() {
             if line == self.quit {
                 self.alive.set(false);
+                if let Some(open) = &self.out_open {
+                    self.desk.world().quit_with_stdout.push(open.get());
+                }
             }
             if self.quit == "quit" {
                 self.desk.world().input.push(line.to_owned());
@@ -1413,14 +1476,19 @@ impl Desktop for FakeDesk {
         let mut w = self.world();
         w.frames.push(tx);
         w.frame_clients += 1;
+        let open = Rc::new(Cell::new(true));
         let stdin = DeskIn {
             desk: self.clone(),
             alive: Rc::clone(&alive),
             quit: "q",
+            out_open: Some(Rc::clone(&open)),
         };
-        let out = FakeOut {
+        let out = DeskOut {
+            desk: self.clone(),
             rx,
             pending: Vec::new(),
+            alive: Rc::clone(&alive),
+            open,
         };
         let child = FakeChild {
             alive,
@@ -1440,6 +1508,7 @@ impl Desktop for FakeDesk {
             desk: self.clone(),
             alive: Rc::clone(&alive),
             quit: "quit",
+            out_open: None,
         };
         let child = FakeChild {
             alive,
@@ -1549,12 +1618,15 @@ fn a_desktop_is_watched_and_taken_over_on_the_terminals_lock() {
     // Neither stream's input reaches the other: tmux got nothing.
     assert!(fake.sent(true).is_empty());
 
-    // A forced terminal take-over ends the desktop's input client and makes it view-only.
+    // A forced terminal take-over ends the desktop's input client and makes it view-only; a
+    // button it held is let go first.
+    assert_eq!(d.post(addr, "pointer", "down 1").0, 200);
     assert_eq!(t.post(addr, "takeover?force=true", "").0, 200);
     d.until(&format!("\"owner\":\"{}\"", t.id));
     wait_for("input client quit", || {
         desk.input().last().map(String::as_str) == Some("quit")
     });
+    assert_eq!(desk.input()[4..], ["down 1", "up 1", "quit"]);
     assert_eq!(d.post(addr, "pointer", "move 1 1").0, 403);
     assert_eq!(t.post(addr, "text", "ls\n").0, 200);
     wait_for("terminal input", || fake.sent(true).len() == 1);
@@ -1585,6 +1657,52 @@ fn a_desktop_is_watched_and_taken_over_on_the_terminals_lock() {
         desk.push(&jpeg(b"tick"));
         desk.world().frames.is_empty()
     });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_desktop_viewer_behind_on_frames_keeps_take_over() {
+    let (fake, desk, dir) = (Fake::new(), FakeDesk::default(), tmp("desk-slow"));
+    let addr = serve_desk(&fake, &desk, &dir, owner_keys());
+    let mut d = Viewer::open_kind(addr, TOKEN, "a1", "desk").unwrap_or_else(|c| panic!("{c}"));
+    d.until("\"t\":\"mode\"");
+    wait_for("frame client", || desk.world().frame_clients == 1);
+    // More distinct 1 MiB frames than the socket buffers and the queue hold, unread.
+    let frames: Vec<Vec<u8>> = (0..32u8).map(|i| jpeg(&vec![i; 1 << 20])).collect();
+    for f in &frames {
+        desk.push(f);
+    }
+    let total: usize = frames.iter().map(Vec::len).sum();
+    wait_for("frames read", || desk.world().frame_bytes >= total);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(d.post(addr, "takeover", "").0, 200);
+    assert_eq!(
+        d.post(addr, "pointer", "move 1 1").0,
+        200,
+        "the viewer kept its seat and the lock"
+    );
+    d.until(&format!("\"owner\":\"{}\"", d.id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_desk_frame_client_is_quit_while_its_stdout_is_still_read() {
+    let (fake, desk, dir) = (Fake::new(), FakeDesk::default(), tmp("desk-quit"));
+    let addr = serve_desk(&fake, &desk, &dir, owner_keys());
+    let mut d = Viewer::open_kind(addr, TOKEN, "a1", "desk").unwrap_or_else(|c| panic!("{c}"));
+    d.until("\"t\":\"mode\"");
+    wait_for("frame client", || desk.world().frame_clients == 1);
+    drop(d);
+    let mut n = 0u32;
+    wait_for("frame client quit", || {
+        n += 1;
+        desk.push(&jpeg(&n.to_be_bytes()));
+        !desk.world().quit_with_stdout.is_empty()
+    });
+    assert!(
+        desk.world().quit_with_stdout.iter().all(|open| *open),
+        "q reached ffmpeg after its stdout was closed"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -21,6 +21,11 @@
   // The latest pointer position not yet sent: moves are coalesced, one request in flight.
   let move = null;
   let moving = false;
+  // Whether this connection has shown a frame: a stream that ends before one (no ffmpeg in the
+  // agent's image, say) is retried with a growing wait instead of every 2 s.
+  let framed = false;
+  const RETRY_MS = 2000;
+  const RETRY_MAX_MS = 60000;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const controlling = () => viewer !== null && owner === viewer;
@@ -36,8 +41,10 @@
 
   // [route, body] for a keydown, or null to leave it to the browser.
   function keyOf(e) {
-    const mods = [e.ctrlKey && 'ctrl', e.altKey && 'alt', e.metaKey && 'super'].filter(Boolean);
     let name = KEYS[e.key];
+    // Shift is already in a printed character; for a named key (Shift+Tab) it is a modifier.
+    const shift = e.shiftKey && name !== undefined;
+    const mods = [e.ctrlKey && 'ctrl', e.altKey && 'alt', e.metaKey && 'super', shift && 'shift'].filter(Boolean);
     if (!name && /^[A-Za-z0-9]$/.test(e.key)) name = e.key;
     if (mods.length) return name ? ['keys', [...mods, name].join('+')] : null;
     if (name && name.length > 1) return ['keys', name];
@@ -70,7 +77,10 @@
   function handle(m) {
     if (m.t === 'hello') viewer = m.viewer;
     else if (m.t === 'mode') owner = m.owner;
-    else if (m.t === 'frame') frame(m.jpeg).catch(() => {});
+    else if (m.t === 'frame') {
+      framed = true;
+      frame(m.jpeg).catch(() => {});
+    }
     else if (m.t === 'bye') note = `Stream ended: ${m.reason}`;
     show();
   }
@@ -103,15 +113,17 @@
     return `${x} ${y}`;
   }
 
-  async function flushMove() {
+  // Send the latest pointer position in the input order, one move in flight; moves made meanwhile
+  // are coalesced into the next.
+  function flushMove() {
     if (moving || move === null || !controlling()) return;
+    const xy = move;
+    move = null;
     moving = true;
-    while (move !== null) {
-      const xy = move;
-      move = null;
-      try { await post('pointer', `move ${xy}`); } catch { break; }
-    }
-    moving = false;
+    chain = chain.then(() => post('pointer', `move ${xy}`)).catch(() => {}).then(() => {
+      moving = false;
+      flushMove();
+    });
   }
 
   canvas.addEventListener('mousemove', (e) => {
@@ -123,6 +135,7 @@
     if (!controlling()) return;
     e.preventDefault();
     desk.focus();
+    move = null;
     enqueue('pointer', `move ${at(e)}`);
     enqueue('pointer', `down ${e.button + 1}`);
   });
@@ -154,6 +167,7 @@
   $('release').addEventListener('click', () => lock('release'));
 
   async function connect() {
+    let wait = RETRY_MS;
     for (;;) {
       if (!token) {
         token = window.prompt(`Gateway token for ${agent}`);
@@ -210,7 +224,9 @@
       viewer = null;
       owner = null;
       show();
-      await sleep(2000);
+      wait = framed ? RETRY_MS : Math.min(wait * 2, RETRY_MAX_MS);
+      framed = false;
+      await sleep(wait);
     }
   }
 

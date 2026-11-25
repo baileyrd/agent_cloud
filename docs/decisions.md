@@ -118,15 +118,18 @@ tailnet-only host. Chosen: the terminal's own pattern.
   `FF D9` after `FF D8` ends a frame). A frame over 8 MiB is dropped. Each frame goes to every viewer as an
   NDJSON `frame` message (base64) on the same `fetch`-streamed chunked GET as the terminal, `GET
   .../desk`. A frame identical to the last one (SHA-256) is not sent, so an idle desktop costs no
-  bandwidth. A joining viewer gets the latest frame at once. Each viewer queues 8 messages, and a frame
-  that finds a viewer's queue full is skipped for that viewer only. `q` on stdin stops ffmpeg, and the
-  `Exec` discipline (quit, signals, reap, then stdin) is unchanged. No port into the VM and no new host
-  process.
+  bandwidth. A joining viewer gets the latest frame at once. Each viewer queues 8 messages. Frames may
+  fill only 6 of them, and a frame past that is skipped for that viewer only, so a `mode` or `bye` always
+  reaches a viewer that is behind on frames (a slow viewer keeps a take-over). `q` on stdin stops ffmpeg
+  while the gateway still reads its stdout (up to 2 s): with stdout closed first, `ctr` would die of
+  SIGPIPE before passing on the quit and leave ffmpeg running in the guest. The `Exec` discipline (quit,
+  signals, reap, then stdin) is unchanged. No port into the VM and no new host process.
 - *One lock:* desktop and terminal viewers of an agent share one registry entry. There is one take-over
   lock between them (a desktop take-over is refused while a terminal viewer holds it, unless forced, and
   the reverse) and one per-agent cap. Every viewer of either stream gets the `mode` message. Each stream
   keeps its input client only while one of its own viewers holds the lock. A viewer id belongs to its
-  stream: a desktop viewer is 404 on the terminal routes and the reverse.
+  stream: a desktop viewer is 404 on the terminal routes and the reverse. When the lock leaves a
+  desktop viewer, its input client releases any mouse button it left down before it quits.
 - *Input:* view-only is the default, and input from a viewer without the lock gets 403 before anything
   is built. The take-over client is a constant `sh` loop in the guest that runs one `xdotool` per line.
   It is sent only lines rendered by `ac_viewer::desk::DeskInput`:
@@ -140,7 +143,9 @@ tailnet-only host. Chosen: the terminal's own pattern.
 - *Page:* `/ui/desk/<agent>` (about 200 lines of in-repo JS, CSP unchanged). It draws each frame on a
   canvas from a `Blob` through `createImageBitmap`, so no image URL is loaded and nothing is parsed as
   HTML. Pointer coordinates are scaled from the drawn size to screen pixels. Moves are coalesced, with one
-  request in flight. The terminal and desktop pages link to each other.
+  request in flight, and keep their order with button presses. A stream that ends before its first frame
+  (no ffmpeg in the image, say) is retried with a doubling wait, up to 60 s. The terminal and desktop
+  pages link to each other.
 - *Recording:* take-over and release events go to the agent's history as on the terminal. Frames are
   not recorded (a 1080p JPEG is about 150 to 300 KiB). Keystrokes are not recorded either.
 **Consequences:** about 4 frames a second at full resolution, enough to watch and to click, not
@@ -346,6 +351,8 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
   | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
+  | `GET .../{id}/desk` (desktop stream, ADR-006) | `viewer:read` |
+  | `POST .../{id}/desk/{viewer}/takeover` (`?force=true`), `release`, `pointer`, `keys`, `text` | `viewer:control` |
   | `GET /api/v1/egress/profiles`, `GET .../{id}/egress` (ADR-016) | `agents:read` |
   | `PUT .../{id}/egress` (set its profiles; also `egress_profiles` on create) | `egress:write` |
   | `GET .../{id}/checkpoints` (ADR-018) | `agents:read` |

@@ -3141,20 +3141,162 @@ fn events_need_jobs_read_for_the_agent() {
 }
 
 #[test]
-fn event_streams_are_capped() {
+fn event_streams_are_capped_in_all_and_per_agent() {
     let r = quick();
-    let id = r.ok("a1", "held open");
-    let streams: Vec<_> = (0..jobs::MAX_STREAMS)
-        .map(|_| Jobs::events(&r.jobs, &agent("a1"), &job_id(&id), "").map_err(|e| e.status))
+    let open =
+        |a: &str, id: &str| Jobs::events(&r.jobs, &agent(a), &job_id(id), "").map_err(|e| e.status);
+    let one = r.ok("a1", "held open");
+    let mine: Vec<_> = (0..jobs::MAX_STREAMS_PER_AGENT)
+        .map(|_| open("a1", &one))
         .collect();
-    assert!(streams.iter().all(Result::is_ok));
-    let over = Jobs::events(&r.jobs, &agent("a1"), &job_id(&id), "")
-        .map(drop)
-        .map_err(|e| e.status);
-    assert_eq!(over, Err(429));
-    drop(streams);
-    assert!(
-        Jobs::events(&r.jobs, &agent("a1"), &job_id(&id), "").is_ok(),
-        "seats come back"
+    assert!(mine.iter().all(Result::is_ok));
+    assert_eq!(
+        open("a1", &one).map(drop),
+        Err(429),
+        "one agent's seats are full"
     );
+    // Other agents still get seats, up to the overall cap.
+    let mut others = Vec::new();
+    for i in 0..jobs::MAX_STREAMS - jobs::MAX_STREAMS_PER_AGENT {
+        let a = format!("b{i}");
+        let _ = r.store.set_state(&agent(&a), State::Running);
+        let id = r.ok(&a, "held open");
+        others.push(open(&a, &id));
+    }
+    assert!(others.iter().all(Result::is_ok));
+    let _ = r.store.set_state(&agent("c1"), State::Running);
+    let last = r.ok("c1", "one too many");
+    assert_eq!(open("c1", &last).map(drop), Err(429), "all seats are full");
+    drop(mine);
+    assert_eq!(
+        r.jobs.streams_open(&agent("a1")),
+        (jobs::MAX_STREAMS - 2, 0)
+    );
+    assert!(open("a1", &one).is_ok(), "seats come back");
+}
+
+/// Open `path`'s event stream over HTTP as `token`, read until `seen` appears, and keep the
+/// connection open.
+fn open_stream(addr: SocketAddr, token: &str, path: &str, seen: &str) -> TcpStream {
+    let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n"
+    );
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&got).contains(seen) {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => panic!("stream ended early: {}", String::from_utf8_lossy(&got)),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    s
+}
+
+fn wait_until(what: &str, ok: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !ok() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_seat_comes_back_when_the_client_goes_away() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "watched");
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let client = open_stream(addr, TOKEN, &path, "STATE_SNAPSHOT");
+    assert_eq!(r.jobs.streams_open(&agent("a1")).1, 1);
+    drop(client);
+    // The next keep-alive fails to write, and the stream is dropped.
+    wait_until("the seat is free", || {
+        r.jobs.streams_open(&agent("a1")).1 == 0
+    });
+}
+
+#[test]
+fn a_revoked_token_ends_its_open_stream() {
+    let r = quick();
+    let t = scoped(&r.root);
+    let addr = serve_with(&r, t.keys.clone());
+    let id = r.ok("a1", "watched");
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let mut client = open_stream(addr, &t.jobs_a1, &path, "STATE_SNAPSHOT");
+    assert!(t.file.revoke("jobs-a1").is_ok());
+    reload(&t.file, &t.keys);
+    let mut rest = String::new();
+    let _ = client.read_to_string(&mut rest);
+    assert!(!rest.contains("RUN_FINISHED"), "{rest}");
+    wait_until("the seat is free", || {
+        r.jobs.streams_open(&agent("a1")).1 == 0
+    });
+}
+
+#[test]
+fn a_started_job_without_a_host_copy_ends_as_incomplete() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "cancelled while running");
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &id), "running");
+    let cancel = format!("/api/v1/agents/a1/jobs/{id}/cancel");
+    assert_eq!(request(addr, "POST", &cancel, "").0, 200);
+    let (_, _, body) = request(
+        addr,
+        "GET",
+        &format!("/api/v1/agents/a1/jobs/{id}/events"),
+        "",
+    );
+    let events = events_of(&body);
+    let t = types(&events);
+    assert_eq!(&t[t.len() - 2..], ["CUSTOM", "RUN_ERROR"], "{body}");
+    assert!(body.contains(r#""value":"no_copy""#), "{body}");
+    assert!(body.contains(r#""code":"cancelled""#), "{body}");
+}
+
+#[test]
+fn a_final_drain_past_its_budget_ends_as_incomplete_and_keeps_the_outcome() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "huge log");
+    r.jobs.tick();
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let reader = std::thread::spawn(move || request(addr, "GET", &path, ""));
+    std::thread::sleep(Duration::from_millis(100));
+    // Lines that make no events, past the 16 MiB the last drain may read, all at once as it ends.
+    let line = format!("{{\"type\":\"system\",\"pad\":\"{}\"}}\n", "x".repeat(1000));
+    let log = line.repeat(20 * 1024 * 1024 / line.len());
+    r.fake.w().logs.insert(id.clone(), log.into_bytes());
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (_, _, body) = reader.join().unwrap_or_else(|_| panic!("reader panicked"));
+    assert_eq!(r.state("a1", &id), "succeeded");
+    let events = events_of(&body);
+    let t = types(&events);
+    assert_eq!(&t[t.len() - 2..], ["CUSTOM", "RUN_FINISHED"], "{body}");
+    assert!(body.contains(r#""value":"read_limit""#), "{body}");
+}
+
+#[test]
+fn a_final_drain_that_ends_on_a_full_chunk_is_complete() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "exact");
+    r.jobs.tick();
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let reader = std::thread::spawn(move || request(addr, "GET", &path, ""));
+    std::thread::sleep(Duration::from_millis(100));
+    // Exactly one chunk: the read after it finds the end.
+    let mut log = vec![b'x'; jobs::EVENTS_CHUNK - 1];
+    log.push(b'\n');
+    r.fake.w().logs.insert(id.clone(), log);
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (_, _, body) = reader.join().unwrap_or_else(|_| panic!("reader panicked"));
+    assert!(!body.contains("log_incomplete"), "{body}");
+    assert_eq!(types(&events_of(&body)).last(), Some(&"RUN_FINISHED"));
 }

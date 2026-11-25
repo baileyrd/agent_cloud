@@ -276,13 +276,19 @@ CopilotKit or any AG-UI client renders the run live. It is not evidence: the wit
   the stream captures when it opens, because the registry forgets the credential when the job ends,
   before the last read. Served `nosniff` and `no-store`.
 - *Reading:* while the job runs, the stream polls every 2 s. It reads the registry, then up to 4 x 256 KiB
-  of the log from where it stopped, through one `dd` exec. Once the job ends it reads the rest and closes. If that
-  last read fails or runs out of its budget (16 MiB) before the log's end, a `CUSTOM` event named
+  of the log from where it stopped, through one `dd` exec. Once the job ends it drains the rest, 4 chunks per
+  step with no wait between steps, so frames still go out and the token is still checked between them. If
+  the drain fails or spends its budget (16 MiB) before the log's end, a `CUSTOM` event named
   `log_incomplete` (value `read_failed` or `read_limit`) goes out before the run's last event, which
-  still gives the job's own outcome.
-  A job that had already ended is replayed from the host's copy, which is its last 1 MiB. At most 8 streams
-  are open at once (429 beyond), because each one execs. Keep-alive comments go out between polls. The
-  stream ends within one poll of its token being revoked or expiring (ADR-022), like a viewer stream.
+  still gives the job's own outcome. A budget spent exactly at the end is checked with one more read.
+  A job that had already ended is replayed from the host's copy, which is its last 1 MiB. A started job
+  with no copy (cancelled, timed out, or the copy failed) gets `log_incomplete` with `no_copy`. At most 8
+  streams are open at once and 2 on one agent (429 beyond), because each one execs: one agent's token
+  cannot take every seat, and one agent sees at most 2 log execs per poll. The gateway does not stat the
+  log on the host to skip unchanged reads, because it never reads below a workspace root (the agent
+  controls it). Keep-alive comments go out between polls. The stream ends within one poll of its token
+  being revoked or expiring (ADR-022), like a viewer stream, and a client that goes away frees its seat
+  at the next write.
 - *Resuming:* each line's events carry the line number as their SSE `id`, on the last of them. A client
   that reconnects passes the last id it saw as `?after=N` and gets `RUN_STARTED`, the state, then the
   lines after N. Browsers cannot set `Authorization` on an `EventSource`, so clients use `fetch` and

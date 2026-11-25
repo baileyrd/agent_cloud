@@ -75,6 +75,11 @@ pub const EVENTS_CHUNK: usize = 256 * 1024;
 const EVENTS_READS: usize = 4;
 /// Event streams open at once, across all agents: each polls its job's log with an exec.
 pub const MAX_STREAMS: usize = 8;
+/// Event streams open at once on one agent, so one agent's token cannot take every seat, and one
+/// agent sees at most this many log execs per poll (the `PROBE` hazard).
+pub const MAX_STREAMS_PER_AGENT: usize = 2;
+/// Reads the last drain of a live-streamed job may take in all (16 MiB), [`EVENTS_READS`] per poll.
+const FINAL_READS: usize = STREAM_CAP.div_ceil(EVENTS_CHUNK) * 16;
 /// How often an event stream polls the registry and the log, by default.
 pub const EVENTS_POLL: Duration = Duration::from_secs(2);
 /// How often a running job is probed with an exec when it has not said it finished. Execs are
@@ -517,6 +522,8 @@ impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {
     }
 
     fn read_from(&self, agent: &AgentId, job: &JobId, offset: u64) -> Result<Vec<u8>, String> {
+        // GNU dd: `iflag=skip_bytes,count_bytes` makes skip and count bytes, not blocks. The agent
+        // images are Fedora (coreutils); a busybox base would need another reader.
         let input = format!("if=/workspace/.jobs/{job}/{}", Part::Stream.file());
         let skip = format!("skip={offset}");
         let count = format!("count={EVENTS_CHUNK}");
@@ -755,8 +762,8 @@ pub struct Jobs {
     queued: Condvar,
     /// Credentials of jobs not yet ended (by job id), in memory only (ADR-028).
     secrets: Mutex<HashMap<String, Credential>>,
-    /// Event streams open now ([`MAX_STREAMS`]).
-    streams: AtomicUsize,
+    /// Event streams open now, per agent ([`MAX_STREAMS`], [`MAX_STREAMS_PER_AGENT`]).
+    streams: Mutex<HashMap<AgentId, usize>>,
     /// How often each polls.
     events_poll: Duration,
 }
@@ -854,7 +861,7 @@ impl Jobs {
             diffs: Mutex::new(Diffs::default()),
             queued: Condvar::new(),
             secrets: Mutex::new(HashMap::new()),
-            streams: AtomicUsize::new(0),
+            streams: Mutex::new(HashMap::new()),
             events_poll: EVENTS_POLL,
         }
     }
@@ -869,7 +876,8 @@ impl Jobs {
     /// `after` skips the log's first N lines: each event from the log carries its line number as
     /// its SSE id, so a client that reconnects passes the last id it saw. An ended job whose host
     /// copy was capped has no such numbering: its replay carries no ids, and with `after` it ends at
-    /// once with `RUN_ERROR` code `replay_unavailable`. 429 past [`MAX_STREAMS`].
+    /// once with `RUN_ERROR` code `replay_unavailable`. 429 past [`MAX_STREAMS`] in all or
+    /// [`MAX_STREAMS_PER_AGENT`] on this agent.
     pub fn events(
         jobs: &Arc<Self>,
         agent: &AgentId,
@@ -882,10 +890,7 @@ impl Jobs {
             Some(Err(_)) => return Err(error(400, "after must be a line number")),
         };
         jobs.find(agent, id)?;
-        if jobs.streams.fetch_add(1, Ordering::SeqCst) >= MAX_STREAMS {
-            jobs.streams.fetch_sub(1, Ordering::SeqCst);
-            return Err(error(429, "too many event streams"));
-        }
+        jobs.take_seat(agent)?;
         Ok(EventStream {
             jobs: Arc::clone(jobs),
             agent: agent.clone(),
@@ -901,9 +906,40 @@ impl Jobs {
             ids: true,
             last: None,
             live: false,
+            final_reads: None,
             done: false,
             first: true,
         })
+    }
+
+    /// Take an event-stream seat on `agent`; 429 when all, or all of this agent's, are taken.
+    fn take_seat(&self, agent: &AgentId) -> Result<(), Reply> {
+        let mut seats = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        if seats.values().sum::<usize>() >= MAX_STREAMS {
+            return Err(error(429, "too many event streams"));
+        }
+        let mine = seats.entry(agent.clone()).or_insert(0);
+        if *mine >= MAX_STREAMS_PER_AGENT {
+            return Err(error(429, &format!("too many event streams on {agent}")));
+        }
+        *mine += 1;
+        Ok(())
+    }
+
+    fn free_seat(&self, agent: &AgentId) {
+        let mut seats = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = seats.get_mut(agent) {
+            *n -= 1;
+            if *n == 0 {
+                seats.remove(agent);
+            }
+        }
+    }
+
+    /// Event streams open now: in all, and on `agent`.
+    pub fn streams_open(&self, agent: &AgentId) -> (usize, usize) {
+        let seats = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        (seats.values().sum(), seats.get(agent).copied().unwrap_or(0))
     }
 
     /// Jobs that carry a credential reach the model at `url`, with the credential as their token
@@ -1724,6 +1760,8 @@ enum ReadEnd {
     Eof,
     /// A read failed (no log yet, or the agent stopped).
     Failed,
+    /// An ended job's host copy is missing or unreadable.
+    NoCopy,
     /// The read budget ran out with more to read.
     Limit,
 }
@@ -1734,6 +1772,7 @@ impl ReadEnd {
         match self {
             Self::Eof => None,
             Self::Failed => Some("read_failed"),
+            Self::NoCopy => Some("no_copy"),
             Self::Limit => Some("read_limit"),
         }
     }
@@ -1770,6 +1809,10 @@ pub struct EventStream {
     last: Option<String>,
     /// The log was read from the VM (the job ran while streamed).
     live: bool,
+    /// Once a live-streamed job has ended: the reads its last drain has left ([`FINAL_READS`]).
+    /// The drain takes [`EVENTS_READS`] per poll, so frames, keep-alives and the token check
+    /// carry on between them.
+    final_reads: Option<usize>,
     done: bool,
     first: bool,
 }
@@ -1785,7 +1828,8 @@ impl Iterator for EventStream {
             if self.done {
                 return None;
             }
-            if !self.first {
+            // A draining stream reads on at once: the log no longer grows.
+            if !self.first && self.final_reads.is_none() {
                 std::thread::sleep(self.jobs.events_poll);
             }
             self.poll();
@@ -1798,7 +1842,7 @@ impl Iterator for EventStream {
 
 impl Drop for EventStream {
     fn drop(&mut self) {
-        self.jobs.streams.fetch_sub(1, Ordering::SeqCst);
+        self.jobs.free_seat(&self.agent);
     }
 }
 
@@ -1823,43 +1867,78 @@ impl EventStream {
                 self.live = true;
                 self.read_live(EVENTS_READS);
             }
+            _ if self.live => self.drain(&j, &rendered),
             _ => {
-                let mut end = ReadEnd::Eof;
-                if self.live {
-                    // The whole rest of the log; it no longer grows.
-                    end = self.read_live(STREAM_CAP.div_ceil(EVENTS_CHUNK) * 16);
-                } else if !self.replay_copy(&j) {
-                    return;
+                if let Some(end) = self.replay_copy(&j) {
+                    self.finish(&j, &rendered, end);
                 }
-                self.feed(b"\n");
-                if let Some(why) = end.incomplete() {
-                    self.send(agui::log_incomplete(why), None);
-                }
-                if let Some(end) = agui::ended(&j, &rendered) {
-                    self.send(end, None);
-                }
-                self.done = true;
             }
         }
     }
 
-    /// Feed the host's copy of an ended job's log. A capped copy starts mid-log, so its line
-    /// numbers are not the live stream's: it is sent without ids, and a cursor into it is refused.
-    fn replay_copy(&mut self, j: &Job) -> bool {
+    /// One step of a live-streamed job's last drain: the rest of its log, [`EVENTS_READS`] at a
+    /// time, then the end. A budget spent exactly at the log's end is checked with one more read,
+    /// so it is not reported as incomplete.
+    fn drain(&mut self, j: &Job, rendered: &str) {
+        let left = *self.final_reads.get_or_insert(FINAL_READS);
+        let reads = left.min(EVENTS_READS);
+        let mut end = self.read_live(reads);
+        self.final_reads = Some(left - reads);
+        if end == ReadEnd::Limit && left > reads {
+            return;
+        }
+        if end == ReadEnd::Limit {
+            end = match self
+                .jobs
+                .runner
+                .read_from(&self.agent, &self.id, self.offset)
+            {
+                Ok(rest) if rest.is_empty() => ReadEnd::Eof,
+                _ => ReadEnd::Limit,
+            };
+        }
+        self.finish(j, rendered, end);
+    }
+
+    /// The run's end: the last partial line, `log_incomplete` if the log was not read to its end,
+    /// and `RUN_FINISHED` or `RUN_ERROR` with the job's own outcome.
+    fn finish(&mut self, j: &Job, rendered: &str, end: ReadEnd) {
+        self.feed(b"\n");
+        if let Some(why) = end.incomplete() {
+            self.send(agui::log_incomplete(why), None);
+        }
+        if let Some(last) = agui::ended(j, rendered) {
+            self.send(last, None);
+        }
+        self.done = true;
+    }
+
+    /// Feed the host's copy of an ended job's log, and say whether it was all there; `None` once
+    /// the stream has failed. A capped copy starts mid-log, so its line numbers are not the live
+    /// stream's: it is sent without ids, and a cursor into it is refused. A job that started but
+    /// ended without one (cancelled, timed out, or the copy failed) is reported as `no_copy`, not
+    /// as an empty log.
+    fn replay_copy(&mut self, j: &Job) -> Option<ReadEnd> {
         let dir = self.jobs.job_dir(j);
-        let copy = std::fs::read(dir.join(Part::Stream.file())).unwrap_or_default();
+        let Ok(copy) = std::fs::read(dir.join(Part::Stream.file())) else {
+            // A job that never started has no log to miss.
+            return Some(match j.started_ms {
+                Some(_) => ReadEnd::NoCopy,
+                None => ReadEnd::Eof,
+            });
+        };
         if !dir.join(STREAM_WHOLE).exists() {
             if self.skip > 0 {
                 self.fail(
                     "the job's log was capped when it ended; replay from this cursor is unavailable",
                     "replay_unavailable",
                 );
-                return false;
+                return None;
             }
             self.ids = false;
         }
         self.feed(&copy);
-        true
+        Some(ReadEnd::Eof)
     }
 
     /// Read up to `reads` chunks of the log from the VM, and say how the reading stopped.

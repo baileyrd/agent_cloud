@@ -214,13 +214,16 @@ impl Frames {
         Ok(text)
     }
 
-    /// `RUN_ERROR` with `message`, which the rules allow at any point of a started run.
+    /// `RUN_ERROR` with `message`, which the rules allow at any point of a started run; before
+    /// one it is sent without the check, so the client never gets an empty reply.
     pub fn error(&mut self, message: &str, code: &str) -> String {
         let kind = EventKind::RunError {
             message: message.to_owned(),
             code: Some(code.to_owned()),
         };
-        self.frame(kind, None).unwrap_or_default()
+        // Before RUN_STARTED the rules refuse it; the client still gets the error, unchecked.
+        self.frame(kind.clone(), None)
+            .unwrap_or_else(|_| rusty_agui::sse::encode(&Event::from(kind)))
     }
 }
 

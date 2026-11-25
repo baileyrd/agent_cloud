@@ -268,14 +268,16 @@ pub fn too_many_note(id: &JobId) -> String {
 
 /// The history note for the paths job `id` changed, leaving out the runner's own files (the
 /// `.jobs` directory and the root's `.job-*` names, see `START`). Paths are listed, space-separated,
-/// until [`CHANGE_NOTE_CAP`] bytes; the rest are counted.
+/// until [`CHANGE_NOTE_CAP`] bytes; the rest are counted. Claude Code's own files go last (see
+/// [`tool_churn`]), so they cannot push the job's real changes past the cap.
 pub fn change_note(id: &JobId, paths: &[String]) -> String {
     let ours = |p: &&String| {
         p.as_str() == ".jobs"
             || p.starts_with(".jobs/")
             || (p.starts_with(".job-") && !p.contains('/'))
     };
-    let paths: Vec<&String> = paths.iter().filter(|p| !ours(p)).collect();
+    let mut paths: Vec<&String> = paths.iter().filter(|p| !ours(p)).collect();
+    paths.sort_by_key(|p| tool_churn(p));
     let mut note = match paths.len() {
         0 => return format!("job {id} changed no paths"),
         1 => format!("job {id} changed 1 path:"),
@@ -297,6 +299,12 @@ pub fn change_note(id: &JobId, paths: &[String]) -> String {
         note.push_str(&format!(" (and {} more)", paths.len() - shown));
     }
     note
+}
+
+/// Whether `path` is under the root's `.claude`, where Claude Code keeps its sessions and settings:
+/// a job can write hundreds of these (#1624, 150 paths seen on 2026-11-24).
+fn tool_churn(path: &str) -> bool {
+    path == ".claude" || path.starts_with(".claude/")
 }
 
 impl<S: Spawner + Send + Sync + 'static> JobRunner for CtrRuntime<S> {

@@ -80,6 +80,8 @@ struct World {
     leftovers: Vec<(AgentId, JobId)>,
     /// Each job's stream-json log, when a test writes one (`read` of the stream then returns it).
     logs: HashMap<String, Vec<u8>>,
+    /// Every `read_from` fails (the agent stopped).
+    read_from_fails: bool,
 }
 
 #[derive(Clone, Default)]
@@ -182,6 +184,9 @@ impl JobRunner for Fake {
 
     fn read_from(&self, _: &AgentId, job: &JobId, offset: u64) -> Result<Vec<u8>, String> {
         let w = self.w();
+        if w.read_from_fails {
+            return Err("agent stopped".to_owned());
+        }
         let log = w.logs.get(job.as_str()).ok_or("no such file")?;
         let start = usize::try_from(offset)
             .map_err(|e| e.to_string())?
@@ -3042,6 +3047,31 @@ fn a_cursor_from_the_live_stream_is_not_replayed_against_a_capped_log() {
     assert!(
         all.contains("line 1200 ") && !all.contains("line 1 x"),
         "capped"
+    );
+}
+
+#[test]
+fn a_failed_final_read_is_reported_and_the_outcome_kept() {
+    let r = quick();
+    let addr = serve(&r);
+    let id = r.ok("a1", "cut");
+    r.jobs.tick();
+    let path = format!("/api/v1/agents/a1/jobs/{id}/events");
+    let reader = std::thread::spawn(move || request(addr, "GET", &path, ""));
+    std::thread::sleep(Duration::from_millis(100));
+    // The agent stops as the job ends: the last drain cannot read the log.
+    r.fake.w().read_from_fails = true;
+    r.fake.w().logs.insert(id.clone(), LOG.as_bytes().to_vec());
+    r.fake.set(&id, Probe::Exited(Some(0)));
+    r.tick();
+    let (_, _, body) = reader.join().unwrap_or_else(|_| panic!("reader panicked"));
+    assert_eq!(r.state("a1", &id), "succeeded");
+    let events = events_of(&body);
+    let t = types(&events);
+    assert_eq!(&t[t.len() - 2..], ["CUSTOM", "RUN_FINISHED"], "{body}");
+    assert!(
+        body.contains(r#""name":"log_incomplete""#) && body.contains(r#""value":"read_failed""#),
+        "{body}"
     );
 }
 

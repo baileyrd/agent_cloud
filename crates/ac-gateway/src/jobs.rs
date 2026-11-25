@@ -1717,6 +1717,28 @@ impl Jobs {
     }
 }
 
+/// How a read of the log from the VM stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadEnd {
+    /// A short read: the log's end as it stands.
+    Eof,
+    /// A read failed (no log yet, or the agent stopped).
+    Failed,
+    /// The read budget ran out with more to read.
+    Limit,
+}
+
+impl ReadEnd {
+    /// Why the log is incomplete, for [`agui::log_incomplete`]; `None` at its end.
+    fn incomplete(self) -> Option<&'static str> {
+        match self {
+            Self::Eof => None,
+            Self::Failed => Some("read_failed"),
+            Self::Limit => Some("read_limit"),
+        }
+    }
+}
+
 /// One job's AG-UI run as SSE text, one frame (or keep-alive) per item (#471). It starts with
 /// `RUN_STARTED` and the job's state, sends each new state, and turns each complete log line into
 /// events ([`agui::line`]) as it polls, then ends with `RUN_FINISHED` or `RUN_ERROR` once the
@@ -1802,13 +1824,17 @@ impl EventStream {
                 self.read_live(EVENTS_READS);
             }
             _ => {
+                let mut end = ReadEnd::Eof;
                 if self.live {
                     // The whole rest of the log; it no longer grows.
-                    self.read_live(STREAM_CAP.div_ceil(EVENTS_CHUNK) * 16);
+                    end = self.read_live(STREAM_CAP.div_ceil(EVENTS_CHUNK) * 16);
                 } else if !self.replay_copy(&j) {
                     return;
                 }
                 self.feed(b"\n");
+                if let Some(why) = end.incomplete() {
+                    self.send(agui::log_incomplete(why), None);
+                }
                 if let Some(end) = agui::ended(&j, &rendered) {
                     self.send(end, None);
                 }
@@ -1836,23 +1862,26 @@ impl EventStream {
         true
     }
 
-    /// Read up to `reads` chunks of the log from the VM; stop at its end or on an error (no log
-    /// yet, or the agent stopped).
-    fn read_live(&mut self, reads: usize) {
+    /// Read up to `reads` chunks of the log from the VM, and say how the reading stopped.
+    fn read_live(&mut self, reads: usize) -> ReadEnd {
         for _ in 0..reads {
             let Ok(bytes) = self
                 .jobs
                 .runner
                 .read_from(&self.agent, &self.id, self.offset)
             else {
-                return;
+                return ReadEnd::Failed;
             };
             self.offset += bytes.len() as u64;
             self.feed(&bytes);
-            if bytes.len() < EVENTS_CHUNK || self.done {
-                return;
+            if self.done {
+                return ReadEnd::Failed;
+            }
+            if bytes.len() < EVENTS_CHUNK {
+                return ReadEnd::Eof;
             }
         }
+        ReadEnd::Limit
     }
 
     /// Append log bytes and send the events of every line they complete.

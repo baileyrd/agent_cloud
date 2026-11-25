@@ -276,7 +276,10 @@ CopilotKit or any AG-UI client renders the run live. It is not evidence: the wit
   the stream captures when it opens, because the registry forgets the credential when the job ends,
   before the last read. Served `nosniff` and `no-store`.
 - *Reading:* while the job runs, the stream polls every 2 s. It reads the registry, then up to 4 x 256 KiB
-  of the log from where it stopped, through one `dd` exec. Once the job ends it reads the rest and closes.
+  of the log from where it stopped, through one `dd` exec. Once the job ends it reads the rest and closes. If that
+  last read fails or runs out of its budget (16 MiB) before the log's end, a `CUSTOM` event named
+  `log_incomplete` (value `read_failed` or `read_limit`) goes out before the run's last event, which
+  still gives the job's own outcome.
   A job that had already ended is replayed from the host's copy, which is its last 1 MiB. At most 8 streams
   are open at once (429 beyond), because each one execs. Keep-alive comments go out between polls. The
   stream ends within one poll of its token being revoked or expiring (ADR-022), like a viewer stream.

@@ -44,6 +44,15 @@ pub fn snapshot(rendered: &str) -> EventKind {
     }
 }
 
+/// `CUSTOM` `log_incomplete`, sent before the run's last event when the stream could not read
+/// the log to its end: `why` is `read_failed` or `read_limit`. The job's outcome is unchanged.
+pub fn log_incomplete(why: &str) -> EventKind {
+    EventKind::Custom {
+        name: "log_incomplete".to_owned(),
+        value: Value::String(why.to_owned()),
+    }
+}
+
 /// The run's last event, once `job` has ended; `None` while it is queued or running.
 pub fn ended(job: &Job, rendered: &str) -> Option<EventKind> {
     match job.state {

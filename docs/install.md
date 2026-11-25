@@ -83,8 +83,9 @@ The Xorg config is [images/agent-desktop/xorg.conf](../images/agent-desktop/xorg
 policy [images/agent-desktop/chromium-policy.json](../images/agent-desktop/chromium-policy.json), installed
 at `/etc/chromium/policies/managed/agent.json`. DevTools are off in it (decided; see the image's README).
 
-**Checkpoint:** `scripts/desktop-smoke.sh` passes: Xorg starts on `:0`, `xrandr` shows `DUMMY0`, and
-Chromium runs under the policy.
+**Checkpoint:** `scripts/desktop-smoke.sh` ends with `PASS`: `xrandr` shows `DUMMY0`; Xorg, xfce4-session and
+xfwm4 run as `agent`; chrome://policy shows the managed policies in effect; and guest used memory and the sandbox
+cgroup's `memory.current` are both at most 2 GiB at idle.
 
 ## Phase 5: Decide the pod shape
 

@@ -291,8 +291,8 @@ Origin and bind rules as the rest of the API; since ADR-011 a caller needs a tok
 - *Idempotency:* the same `idempotency_key` for the same agent returns the retained job with that key
   (200) instead of creating one, whatever its prompt or state. Keys expire with their job's record.
 - *Events:* queued, started, the outcome (with the exit code), cancelled and interrupted go to the
-  agent's `ac-history` log as `job <id> <state>`: ids and states only, timestamps from the log, no prompt
-  or output. `GET .../history` shows them.
+  agent's `ac-history` log as `job <id> <state>`: ids and states, timestamps from the log, no prompt
+  or output. ADR-019 later added one changed-paths line per job; its paths are agent-chosen, untrusted text. `GET .../history` shows them.
 **Consequences:** jobs run with the agent's own login and permissions; the permission list is a second
 layer and the VM, egress allowlist and isolation are the boundary. A job's outcome is what the agent's
 VM reports: a compromised agent can fake its own job's exit code and result, never another agent's, and

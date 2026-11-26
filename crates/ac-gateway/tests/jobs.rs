@@ -569,7 +569,7 @@ fn one_job_at_a_time_through_to_success_with_output_kept() {
 }
 
 #[test]
-fn history_notes_carry_ids_and_states_only() {
+fn history_notes_carry_states_and_changed_paths_never_the_prompt() {
     let r = rig();
     let id = r.ok("a1", "SECRET-PROMPT");
     r.jobs.tick();

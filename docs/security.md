@@ -14,7 +14,7 @@ may execute untrusted code or be steered by prompt injection from web content.
 | An agent's proxy credential leaks | It grants only that agent's profiles, from any agent VM, until its next pause or resume; it is never on a host command line, only in the VM's environment and containerd's root-only record (ADR-016) |
 | A token widens egress | `egress:write` attaches profiles root installed on the host; no API call defines hosts. Every change is audited (ADR-016) |
 | A fork leaks the source agent's secrets | A fork copies the workspace, so it holds the source's Claude Code login and Git credentials; forking needs `agents:write` for both agents. Egress profiles are not copied (ADR-018) |
-| Checkpoints keep data an agent deleted | Read-only snapshots in root-only `checkpoints/<agent>/` (0700), never mounted into a VM; capped per agent and deleted by purge (ADR-018) |
+| Checkpoints keep data an agent deleted | Read-only snapshots in root-only `checkpoints/<agent>/` (0700), never mounted into a VM; capped per agent and deleted by purge (ADR-018). Each job's start and end snapshots (ADR-019) sit there too, never listed or mounted, and are deleted once diffed or by purge |
 | Agent steals credentials | Control-plane secrets root-owned 0600; model logins confined to the agent's workspace volume |
 | Prompt injection via browsing | Policy-locked Chromium, egress allowlist, human takeover |
 | Agent attacks the viewer's browser | Only sanitised text and SGR colours reach the page; strict CSP; see [Viewer](#viewer) |
@@ -196,7 +196,9 @@ them as data from an untrusted source too (for example, never paste them into a 
 agent can fake its own job's result and exit code (it runs the job), never another agent's. The gateway
 (root) never writes, chowns or reads a path below the workspace root: the prompt goes in with
 `O_CREAT|O_EXCL` at the root of the bind mount, which follows no symlink, and output is read in the VM, as
-the agent user, by capped execs. Prompts are never in an argv; history records only job ids and states.
+the agent user, by capped execs. Prompts are never in an argv. History records job ids and states, plus one changed-paths line per job
+(ADR-019) whose file names the agent chose: escaped as btrfs prints them and capped at 2 KiB, but untrusted
+text to anyone reading history (`viewer:read`, the `get_history` tool).
 
 **Job credentials (ADR-028):** a submit may carry `credential`, an opaque string (1-4096 bytes of
 `A-Za-z0-9-._~+/=`), such as a short-lived token Let Em Loose mints for one claim. It is for the job's process only, so the VM

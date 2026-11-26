@@ -585,8 +585,8 @@ write refused past a temporary quota); `--enable-quota` enables quotas first whe
 guest a full quota is `Disk quota exceeded`; deleting files frees nothing a checkpoint still holds.
 
 **Backups** (ADR-021): `ac-ctl backup` writes each workspace as `btrfs send` stream files into a directory,
-best on another machine. Mount it at `/mnt/agent-backups` (another path: `sudo systemctl edit ac-backup.service`
-and override `ExecStart` and `RequiresMountsFor`). The share can be any filesystem; only the workspaces need btrfs,
+best on another machine. Mount it at `/mnt/agent-backups` (another path: set `AC_BACKUP_DEST` in `gateway.env`,
+then `sudo systemctl edit ac-backup.service` and override `RequiresMountsFor`). The share can be any filesystem; only the workspaces need btrfs,
 and they must be subvolumes (migrate plain ones first, as above). None of these commands opens the registry, so
 they work while the gateway runs. For example, an NFS share on Beast exported to this host only (on Beast:
 `/srv/agent-backups baileyserv(rw,sync,no_root_squash)` in `/etc/exports`; root must write it, since the streams
@@ -606,7 +606,17 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ac-backup.timer   # 
 An SMB share works the same way (`cifs` in fstab, with a root-only credentials file). Each run sends against the
 last backup, in full every 7th (`--full-every N`), keeps the newest 7 restorable backups per agent and the streams
 they need (`--keep N`), and exits 1 if any agent was not backed up; check with `systemctl status ac-backup` or
-`journalctl -u ac-backup`. To restore, pause the agent through the gateway, then:
+`journalctl -u ac-backup`.
+
+With `AC_BACKUP_DEST=/mnt/agent-backups` in `gateway.env` (and a gateway restart), an `admin` token for `*` can
+also list the backups and start a run over the API (ADR-031). A run is the unit's, so it is the same as the timer's:
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/backups      # streams, state, last run
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/backups   # 202, or 409 while running
+```
+
+To restore, pause the agent through the gateway, then:
 
 ```bash
 sudo ac-ctl restore-backup /mnt/agent-backups a1                   # the newest; or name one

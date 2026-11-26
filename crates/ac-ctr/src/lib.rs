@@ -619,8 +619,12 @@ impl<S: Spawner> CtrRuntime<S> {
             self.network_up(op, net, id)?;
         }
         self.start_container(op, id, dir, net, boot)
-            .and_then(|()| self.limit_cgroup(op, id))
-            .map_err(|e| with_cleanup(e, self.undo_start(op, id, net)))
+            .map_err(|e| with_cleanup(e, self.undo_start(op, id, net)))?;
+        // The VM runs now, so undo it the way `stop` does: containerd must drop the task too.
+        self.limit_cgroup(op, id).map_err(|e| {
+            let undo = [self.stop(op, id), self.remove_stale(op, id)];
+            with_cleanup(e, undo.into_iter().collect())
+        })
     }
 
     /// Stop the VM and remove its container, Kata leftovers and network; the workspace stays.
@@ -1195,13 +1199,17 @@ mod tests {
             }
             let err = rt.create(&id(), &Boot::default()).err();
             let cause = err.map(|e| e.cause).unwrap_or_default();
-            let want = procs.map_or("cgroup.procs", |_| "sandbox_cgroup_only = true");
-            assert!(cause.contains(want), "{cause}");
+            assert!(cause.contains("sandbox_cgroup_only = true"), "{cause}");
             assert!(!cg.join("cpu.max").exists());
-            // The VM that started is killed: pkill and container removal follow `ctr run`.
+            // The VM that started is stopped: its task force-deleted, then pkill, after `ctr run`.
+            let calls = argv(&log);
             let progs = programs(&log);
-            let run = argv(&log).iter().position(|a| a.iter().any(|x| x == "run"));
-            assert!(run.is_some_and(|r| progs[r + 1..].iter().any(|p| p == "pkill")));
+            let run = calls.iter().position(|a| a.iter().any(|x| x == "run"));
+            let after = run.map_or(0, |r| r + 1);
+            assert!(calls[after..]
+                .iter()
+                .any(|a| a.windows(2).any(|w| w == ["delete", "--force"])));
+            assert!(run.is_some() && progs[after..].iter().any(|p| p == "pkill"));
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -1226,6 +1234,28 @@ mod tests {
         assert_eq!(
             calls[quota.unwrap_or_default()],
             ["qgroup", "limit", "21474836480", ws.as_str()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_disk_limit_clears_an_old_quota_on_a_subvolume() {
+        let (mut rt, log, root) = rt(ExitStatus::Code(0));
+        rt.disk = snap::Disk {
+            btrfs: |_| Ok(true),
+            subvolume: |_| Ok(true),
+        };
+        let _ = std::fs::create_dir_all(root.join("a1"));
+        assert!(rt.create(&id(), &Boot::default()).is_ok());
+        let ws = root.join("a1").display().to_string();
+        assert!(
+            argv(&log).contains(
+                &["qgroup", "limit", "none", ws.as_str()]
+                    .map(String::from)
+                    .to_vec()
+            ),
+            "{:?}",
+            argv(&log)
         );
         let _ = std::fs::remove_dir_all(root);
     }

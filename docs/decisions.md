@@ -1607,7 +1607,9 @@ for the most trusted token only, and the gateway's existing code does the work.
     "the gateway and the CLI write it only through `TokenFile`". The reload picks up the change, so a revoked
     token's requests and open streams end as they do after the CLI's revoke.
   - *Lockout guard:* a revoke that would leave no live token with `admin` for `*` is refused (409). This
-    covers revoking the calling token when it is the last such token. The host's CLI can still do it.
+    covers revoking the calling token when it is the last such token. The check runs on the file's
+    contents *after* the revoke, inside the same locked read, check and rewrite as the write itself, so
+    two concurrent revokes cannot each see the other's token survive. The host's CLI can still do it.
   - *Audit:* the journal gets `audit token=<caller> action=token-create|token-revoke name=<name>
     [scopes=<s>] [agents=<a>] [expires=<unix>] status=<code>`. No agent history: these are not per agent.
 - *Backups:*
@@ -1625,8 +1627,12 @@ for the most trusted token only, and the gateway's existing code does the work.
   - `POST /api/v1/agents/{id}/restore-backup` takes `{"backup": "<id>"?}` (default the newest restorable)
     and runs ADR-021's restore in the gateway: `CtrRuntime::restore_backup` under `<data>/backup.lock`. It
     is refused (409) unless the agent is paused, with the same refusals as `ac-ctl restore-backup`. The
-    workspace there is kept as a checkpoint first, so the same checkpoint cap applies. The request lasts
-    as long as the receive. It is audited to the agent's history as `restore-backup backup=<id>`.
+    workspace there is kept as a checkpoint first, so the same checkpoint cap applies. Under the lifecycle
+    lock the gateway checks the agent is paused, has no job and has checkpoint room, settles its jobs'
+    end snapshots (as a checkpoint restore does), and reserves the agent as a booting create is reserved
+    (ADR-027). The reservation lasts from that check through the swap and cleanup, and every change to
+    the agent meanwhile (resume, destroy, purge, checkpoint, restore, fork, egress) is refused with 409.
+    The receive itself runs without the lifecycle lock. The request lasts as long as the receive. It is audited to the agent's history as `restore-backup backup=<id>`.
   - *Not over the API:* `restore-state` needs the gateway stopped, so it stays on the CLI. Deleting backups is
     left to retention. The destination is not changed from the page.
 - *Page:* `/ui/admin`, linked from the agents page only for an admin token for `*`. It is static, like

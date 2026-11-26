@@ -41,17 +41,39 @@ const IN_USE: u8 = 3;
 /// Where `ac-gateway.service` reads `AC_BIND` from.
 const GATEWAY_ENV: &str = "/etc/agent-cloud/gateway.env";
 
-/// The gateway's address: `AC_BIND`, else the last `AC_BIND=` line of `gateway_env` (the
-/// service's settings), else its default.
+/// The value of the last `key=` line of `gateway_env` (the service's settings).
+fn env_file_value(gateway_env: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    gateway_env
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
+        .map(str::to_owned)
+}
+
+/// A setting as the gateway sees it: `var(key)` (the process environment), else `gateway_env`.
+/// sudo clears the environment, so without the file fallback ac-ctl would boot agents with none
+/// of the service's limits (#27).
+fn setting(
+    key: &str,
+    var: impl Fn(&str) -> Option<String>,
+    gateway_env: Option<&str>,
+) -> Option<String> {
+    var(key).or_else(|| env_file_value(gateway_env?, key))
+}
+
+/// The gateway's address: `AC_BIND` from the environment or `gateway_env`, else its default.
 fn gateway_bind(var: Option<String>, gateway_env: Option<String>) -> String {
-    var.or_else(|| {
-        gateway_env?
-            .lines()
-            .rev()
-            .find_map(|l| l.trim().strip_prefix("AC_BIND="))
-            .map(str::to_owned)
-    })
-    .unwrap_or_else(|| "127.0.0.1:8780".to_owned())
+    setting("AC_BIND", |_| var.clone(), gateway_env.as_deref())
+        .unwrap_or_else(|| "127.0.0.1:8780".to_owned())
+}
+
+/// Whether the command boots a VM, so the agent limits must fit the guest.
+fn boots(job: &Job) -> bool {
+    matches!(
+        job,
+        Job::Agent(Action::Create | Action::Resume, _) | Job::Snap(Snap::Fork { .. })
+    )
 }
 
 /// An optional MiB figure from the environment.
@@ -87,8 +109,14 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         guest_mib: env_mib("AC_VM_MEMORY_MIB")?,
         shm_limit_mib: env_mib("AC_SHM_LIMIT_MIB")?,
     });
-    let limits = AgentLimits::from_lookup(|k| std::env::var(k).ok())?;
-    limits.check(capacity.guest()?.0)?;
+    let gateway_env = std::fs::read_to_string(GATEWAY_ENV).ok();
+    let limits = AgentLimits::from_lookup(|k| {
+        setting(k, |k| std::env::var(k).ok(), gateway_env.as_deref())
+    })?;
+    // Only booting needs the guest's size; recovery commands must work without a Kata config.
+    if boots(&cli.job) && limits.memory_mib.is_some() {
+        limits.check(capacity.guest()?.0)?;
+    }
     let cfg = CtrConfig {
         ctr_bin: cli.ctr.clone(),
         namespace: cli.namespace.clone(),
@@ -446,5 +474,37 @@ mod tests {
             "127.0.0.1:8780"
         );
         assert_eq!(gateway_bind(None, None), "127.0.0.1:8780");
+    }
+
+    #[test]
+    fn limits_fall_back_to_gateway_env_under_an_empty_environment() {
+        let file = "AC_AGENT_MEMORY_MIB=1024\nAC_AGENT_MEMORY_MIB=2560\nAC_AGENT_DISK_GIB=20\n";
+        let none = |_: &str| None;
+        let l = AgentLimits::from_lookup(|k| setting(k, none, Some(file)))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((l.memory_mib, l.disk_gib), (Some(2560), Some(20)));
+        let env = |k: &str| (k == "AC_AGENT_MEMORY_MIB").then(|| "4096".to_owned());
+        let l = AgentLimits::from_lookup(|k| setting(k, env, Some(file)))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(l.memory_mib, Some(4096), "the environment wins");
+        let l =
+            AgentLimits::from_lookup(|k| setting(k, none, None)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(l, AgentLimits::default());
+    }
+
+    #[test]
+    fn only_booting_commands_need_the_guest_size() {
+        let id = || ac_domain::AgentId::parse("a1").unwrap_or_else(|e| panic!("{e}"));
+        assert!(boots(&Job::Agent(Action::Create, id())));
+        assert!(boots(&Job::Agent(Action::Resume, id())));
+        for action in [
+            Action::Pause,
+            Action::Status,
+            Action::Destroy { purge: true },
+        ] {
+            assert!(!boots(&Job::Agent(action, id())), "{action:?}");
+        }
+        assert!(!boots(&Job::Reconcile));
+        assert!(!boots(&Job::Snap(Snap::List(id()))));
     }
 }

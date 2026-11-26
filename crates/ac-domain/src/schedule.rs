@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use crate::health::Pressure;
-use crate::{Job, JobId, JobState};
+use crate::{AgentId, Job, JobId, JobState};
 
 /// Host-wide limits on starting jobs.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,7 +61,7 @@ impl Limits {
 /// Why a queued job has not started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
-    /// Its agent runs a job, or has an older one queued.
+    /// Its agent runs a job, has an older one queued, or is sealing its last one.
     AgentBusy,
     /// [`Limits::max_running`] jobs run.
     SlotsFull,
@@ -96,7 +96,15 @@ pub struct Plan {
 
 /// Decide over `active` (queued and running jobs; others are ignored) at `now_ms`. `pressure` is
 /// `None` when it could not be read: the pressure gate is then skipped, the others still hold.
-pub fn plan(active: &[Job], pressure: Option<&Pressure>, now_ms: u64, limits: &Limits) -> Plan {
+/// Agents in `held` count as busy though no job of theirs runs: their last job's end snapshot is
+/// still being taken, so a new job's writes would show in that job's change note (#31).
+pub fn plan(
+    active: &[Job],
+    pressure: Option<&Pressure>,
+    now_ms: u64,
+    limits: &Limits,
+    held: &HashSet<AgentId>,
+) -> Plan {
     let running: Vec<&Job> = active
         .iter()
         .filter(|j| j.state == JobState::Running)
@@ -120,6 +128,7 @@ pub fn plan(active: &[Job], pressure: Option<&Pressure>, now_ms: u64, limits: &L
         }
     };
     let mut agents: HashSet<&str> = running.iter().map(|j| j.agent.as_str()).collect();
+    agents.extend(held.iter().map(AgentId::as_str));
     let mut plan = Plan::default();
     for j in queued {
         let wait = if !agents.insert(j.agent.as_str()) {
@@ -142,7 +151,12 @@ pub fn plan(active: &[Job], pressure: Option<&Pressure>, now_ms: u64, limits: &L
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentId, JobEvent};
+    use crate::JobEvent;
+
+    /// No agent held back.
+    fn none() -> HashSet<AgentId> {
+        HashSet::new()
+    }
 
     const IDLE: Pressure = Pressure {
         load1: 0.4,
@@ -180,7 +194,7 @@ mod tests {
             job("a1", 4, 300),
             job("a2", 2, 100),
         ];
-        let p = plan(&active, Some(&IDLE), 10_000, &limits);
+        let p = plan(&active, Some(&IDLE), 10_000, &limits, &none());
         assert_eq!(p.start, Some(id(2)));
         assert_eq!(
             waits(&p),
@@ -194,9 +208,18 @@ mod tests {
     }
 
     #[test]
+    fn a_held_agent_waits_as_if_busy_and_others_go() {
+        let active = [job("a1", 1, 10), job("a2", 2, 20)];
+        let held = HashSet::from([AgentId::parse("a1").unwrap_or_else(|e| panic!("{e}"))]);
+        let p = plan(&active, Some(&IDLE), 60_000, &Limits::for_cores(4), &held);
+        assert_eq!(p.start, Some(id(2)));
+        assert_eq!(waits(&p), [(id(1), "agent busy")]);
+    }
+
+    #[test]
     fn an_agent_with_a_running_job_waits_and_others_go() {
         let active = [running("a1", 1, 0), job("a1", 2, 10), job("a2", 3, 20)];
-        let p = plan(&active, Some(&IDLE), 60_000, &Limits::for_cores(4));
+        let p = plan(&active, Some(&IDLE), 60_000, &Limits::for_cores(4), &none());
         assert_eq!(p.start, Some(id(3)));
         assert_eq!(waits(&p), [(id(2), "agent busy")]);
     }
@@ -208,15 +231,15 @@ mod tests {
             ..Limits::for_cores(4)
         };
         let active = [running("a1", 1, 0), running("a2", 2, 0), job("a3", 3, 5)];
-        let p = plan(&active, Some(&IDLE), 60_000, &limits);
+        let p = plan(&active, Some(&IDLE), 60_000, &limits, &none());
         assert_eq!(p.start, None);
         assert_eq!(waits(&p), [(id(3), "job slots full")]);
         // One fewer running: it starts.
-        let p = plan(&active[1..], Some(&IDLE), 60_000, &limits);
+        let p = plan(&active[1..], Some(&IDLE), 60_000, &limits, &none());
         assert_eq!(p.start, Some(id(3)));
         // The job that fills the last slot leaves the next one "job slots full".
         let active = [running("a1", 1, 0), job("a2", 2, 5), job("a3", 3, 6)];
-        let p = plan(&active, Some(&IDLE), 60_000, &limits);
+        let p = plan(&active, Some(&IDLE), 60_000, &limits, &none());
         assert_eq!(p.start, Some(id(2)));
         assert_eq!(waits(&p), [(id(3), "job slots full")]);
     }
@@ -229,12 +252,12 @@ mod tests {
             cpu_some: 40.0,
             ..IDLE
         };
-        let p = plan(&active, Some(&cpu), 60_000, &limits);
+        let p = plan(&active, Some(&cpu), 60_000, &limits, &none());
         assert_eq!(p.start, None);
         assert_eq!(waits(&p), [(id(1), "host busy")]);
         assert_eq!(p.busy.as_deref(), Some("cpu PSI some 40.00 >= 40.00"));
         let load = Pressure { load1: 4.0, ..IDLE };
-        let p = plan(&active, Some(&load), 60_000, &limits);
+        let p = plan(&active, Some(&load), 60_000, &limits, &none());
         assert_eq!(p.busy.as_deref(), Some("load 4.00 >= 4.00"));
         assert_eq!(p.start, None);
         // A threshold of 0 shuts the gate even on an idle host.
@@ -250,21 +273,25 @@ mod tests {
             }),
             60_000,
             &shut,
+            &none(),
         );
         assert_eq!(waits(&p), [(id(1), "host busy")]);
         // Unreadable pressure skips this gate only.
-        assert_eq!(plan(&active, None, 60_000, &shut).start, Some(id(1)));
+        assert_eq!(
+            plan(&active, None, 60_000, &shut, &none()).start,
+            Some(id(1))
+        );
     }
 
     #[test]
     fn spacing_counts_from_the_last_start_host_wide() {
         let limits = Limits::for_cores(4);
         let active = [running("a1", 1, 50_000), job("a2", 2, 51_000)];
-        let p = plan(&active, Some(&IDLE), 64_999, &limits);
+        let p = plan(&active, Some(&IDLE), 64_999, &limits, &none());
         assert_eq!(p.start, None);
         assert_eq!(waits(&p), [(id(2), "start spacing")]);
         assert_eq!(
-            plan(&active, Some(&IDLE), 65_000, &limits).start,
+            plan(&active, Some(&IDLE), 65_000, &limits, &none()).start,
             Some(id(2))
         );
         // No spacing: everything eligible starts, one decision at a time.
@@ -272,7 +299,10 @@ mod tests {
             spacing_ms: 0,
             ..limits
         };
-        assert_eq!(plan(&active, Some(&IDLE), 50_001, &open).start, Some(id(2)));
+        assert_eq!(
+            plan(&active, Some(&IDLE), 50_001, &open, &none()).start,
+            Some(id(2))
+        );
     }
 
     #[test]
@@ -288,13 +318,13 @@ mod tests {
         };
         let active = [running("a1", 1, 59_000), job("a2", 2, 0)];
         assert_eq!(
-            waits(&plan(&active, Some(&hot), 60_000, &limits)),
+            waits(&plan(&active, Some(&hot), 60_000, &limits, &none())),
             [(id(2), "job slots full")]
         );
         // Busy and too soon: "host busy".
         let limits = Limits::for_cores(4);
         assert_eq!(
-            waits(&plan(&active, Some(&hot), 60_000, &limits)),
+            waits(&plan(&active, Some(&hot), 60_000, &limits, &none())),
             [(id(2), "host busy")]
         );
     }
@@ -312,7 +342,7 @@ mod tests {
             running("a2", 2, 30_000),
             job("a3", 3, 1),
         ];
-        let p = plan(&active, Some(&IDLE), 31_000, &limits);
+        let p = plan(&active, Some(&IDLE), 31_000, &limits, &none());
         assert_eq!(waits(&p), [(id(3), "job slots full")]);
     }
 
@@ -323,7 +353,7 @@ mod tests {
         let mut done = running("a2", 2, 0);
         let _ = done.apply(JobEvent::Exit(0), 5);
         let active = [cancelled, done, job("a3", 3, 9)];
-        let p = plan(&active, Some(&IDLE), 6, &Limits::for_cores(1));
+        let p = plan(&active, Some(&IDLE), 6, &Limits::for_cores(1), &none());
         assert_eq!(p.start, Some(id(3)));
         assert!(p.waits.is_empty());
     }
@@ -331,7 +361,7 @@ mod tests {
     #[test]
     fn open_limits_start_at_once() {
         let active = [running("a1", 1, 10), job("a2", 2, 0)];
-        let p = plan(&active, None, 10, &Limits::OPEN);
+        let p = plan(&active, None, 10, &Limits::OPEN, &none());
         assert_eq!(p.start, Some(id(2)));
     }
 }

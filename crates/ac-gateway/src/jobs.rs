@@ -803,6 +803,9 @@ struct Diffs {
     /// Agents being purged ([`Busy::hold`]): their compares wait, since the purge deletes the
     /// snapshots they read.
     held: HashSet<AgentId>,
+    /// Agents whose ended job's end snapshot is being taken, with how many: no job of theirs
+    /// starts ([`schedule::plan`]) and no purge begins ([`Busy::hold`]) until it exists (#31).
+    sealing: HashMap<AgentId, usize>,
 }
 
 impl Diffs {
@@ -1256,9 +1259,11 @@ impl Jobs {
         }
         let queued = active.iter().any(|j| j.state == JobState::Queued);
         let pressure = if queued { self.pressure() } else { None };
+        // Read after `active`: a job is marked sealing before its record says it ended.
+        let sealing: HashSet<AgentId> = self.queue().sealing.keys().cloned().collect();
         let plan = loop {
             let now = (self.clock)();
-            let plan = schedule::plan(&active, pressure.as_ref(), now, &self.limits);
+            let plan = schedule::plan(&active, pressure.as_ref(), now, &self.limits, &sealing);
             let Some(j) = plan
                 .start
                 .as_ref()
@@ -1493,6 +1498,7 @@ impl Jobs {
         let was = j.state;
         j.apply(event, (self.clock)())
             .map_err(|e| error(409, &e.to_string()))?;
+
         let ended = was == JobState::Running && j.state.is_terminal();
         if ended {
             // Before the record says so, so the sweep sees it running or sees it here.
@@ -1500,13 +1506,21 @@ impl Jobs {
             if !restart.swept {
                 restart.ended.insert((agent.clone(), id.clone()));
             }
+            // Likewise, so the tick never sees the agent free before its end snapshot exists.
+            if seal == Seal::Now && self.changes.is_some() {
+                *self.queue().sealing.entry(agent.clone()).or_default() += 1;
+            }
         }
         if let Some(r) = reason {
             j.reason = Some(r.to_owned());
         }
-        self.store
-            .put_job(&j)
-            .map_err(|e| error(500, &e.to_string()))?;
+        let marked = ended && seal == Seal::Now && self.changes.is_some();
+        if let Err(e) = self.store.put_job(&j) {
+            if marked {
+                self.unmark(agent);
+            }
+            return Err(error(500, &e.to_string()));
+        }
         let mut note = format!(
             "job {id} {}",
             match j.state {
@@ -1527,7 +1541,10 @@ impl Jobs {
         self.changed.notify_all();
         match (ended, seal) {
             (false, _) => {}
-            (true, Seal::Now) => self.seal(agent, id),
+            (true, Seal::Now) => {
+                self.seal(agent, id);
+                self.unmark(agent);
+            }
             (true, Seal::Later) => self
                 .unsealed
                 .lock()
@@ -1543,6 +1560,15 @@ impl Jobs {
         let Some(changes) = &self.changes else {
             return;
         };
+        let mut diffs = self.queue();
+        if diffs.held.contains(agent) {
+            // A purge is deleting the agent's job snapshots: creating one now would race it
+            // (#31). The compare waits behind the hold; the purge's forget drops it, and if the
+            // purge failed it deletes the start snapshot and notes the changes could not be listed.
+            diffs.queue.push_back((agent.clone(), id.clone()));
+            return;
+        }
+        drop(diffs);
         match changes.end(agent, id) {
             Ok(false) => return,
             Ok(true) => {}
@@ -1550,6 +1576,17 @@ impl Jobs {
         }
         self.queue().queue.push_back((agent.clone(), id.clone()));
         self.queued.notify_all();
+    }
+
+    /// One end snapshot of `agent` is taken (or its record failed): drop one sealing mark.
+    fn unmark(&self, agent: &AgentId) {
+        let mut diffs = self.queue();
+        if let Some(n) = diffs.sealing.get_mut(agent) {
+            *n -= 1;
+            if *n == 0 {
+                diffs.sealing.remove(agent);
+            }
+        }
     }
 
     fn restart(&self) -> MutexGuard<'_, Restart> {
@@ -2068,7 +2105,7 @@ impl Busy for Jobs {
 
     fn hold(&self, id: &AgentId) -> bool {
         let mut diffs = self.queue();
-        if diffs.listing.as_ref() == Some(id) {
+        if diffs.listing.as_ref() == Some(id) || diffs.sealing.contains_key(id) {
             return false;
         }
         diffs.held.insert(id.clone());

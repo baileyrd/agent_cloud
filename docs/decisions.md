@@ -291,8 +291,8 @@ Origin and bind rules as the rest of the API; since ADR-011 a caller needs a tok
 - *Idempotency:* the same `idempotency_key` for the same agent returns the retained job with that key
   (200) instead of creating one, whatever its prompt or state. Keys expire with their job's record.
 - *Events:* queued, started, the outcome (with the exit code), cancelled and interrupted go to the
-  agent's `ac-history` log as `job <id> <state>`: ids and states only, timestamps from the log, no prompt
-  or output. `GET .../history` shows them.
+  agent's `ac-history` log as `job <id> <state>`: ids and states, timestamps from the log, no prompt
+  or output. ADR-019 later added one changed-paths line per job; its paths are agent-chosen, untrusted text. `GET .../history` shows them.
 **Consequences:** jobs run with the agent's own login and permissions; the permission list is a second
 layer and the VM, egress allowlist and isolation are the boundary. A job's outcome is what the agent's
 VM reports: a compromised agent can fake its own job's exit code and result, never another agent's, and
@@ -1209,7 +1209,9 @@ memory in `/dev/shm`) is charged to `agents` as file pages. Workspaces sit on th
   migrate (ADR-018) put in place, with no hook in each. Simple quotas (`btrfs quota enable --simple`, kernel 6.7+)
   charge each extent to the subvolume that wrote it and skip the shared-extent walk that made full qgroups slow with
   many snapshots, the reason ADR-018 left quotas off. A disk limit on a plain-directory workspace, or with quotas
-  off, fails the boot with what to do.
+  off, fails the boot with what to do. With no disk limit, each boot runs `btrfs qgroup limit none` on a subvolume
+  workspace so a quota an earlier boot set does not outlive the setting; with quotas off that fails, is logged,
+  and the boot goes on (#29).
 - *Code.* `ac_domain::limits` is pure: parsing, the guest check and the cgroup values. `ac_ctr`'s `limits` module
   applies them inside `boot`, so create and resume (and therefore fork and restore) share one path. The gateway
   logs `per-agent limits: cpu 2 cores, memory 2560 MiB, disk 50 GiB` at startup.

@@ -620,9 +620,11 @@ impl<S: Spawner> CtrRuntime<S> {
         }
         self.start_container(op, id, dir, net, boot)
             .map_err(|e| with_cleanup(e, self.undo_start(op, id, net)))?;
-        // The VM runs now, so undo it the way `stop` does: containerd must drop the task too.
+        // The VM runs now, so containerd must drop the task too, as `stop` does; every step
+        // runs even if an earlier one fails, so a failed delete still kills the VM.
         self.limit_cgroup(op, id).map_err(|e| {
-            let undo = [self.stop(op, id), self.remove_stale(op, id)];
+            let task = self.ctr_gone_ok(op, &os(&["task", "delete", "--force", id.as_str()]));
+            let undo = [task, self.undo_start(op, id, net)];
             with_cleanup(e, undo.into_iter().collect())
         })
     }
@@ -1212,6 +1214,32 @@ mod tests {
             assert!(run.is_some() && progs[after..].iter().any(|p| p == "pkill"));
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// PR #58 review: a failed task delete must not skip killing the VM or its network.
+    #[test]
+    fn a_failed_task_delete_still_kills_a_started_vm_that_got_no_limits() {
+        let spawner = RunFails {
+            after: mock(ExitStatus::Code(1), ExitStatus::Code(0)),
+            ..run_fails(ExitStatus::Code(0), ExitStatus::Code(0))
+        };
+        let log = Arc::clone(&spawner.log);
+        let root = tmp();
+        let mut rt = CtrRuntime::new(spawner, cfg(&root));
+        rt.cfg.limits.memory_mib = Some(2560);
+        let err = rt.create(&id(), &Boot::default()).err();
+        let cause = err.map(|e| e.cause).unwrap_or_default();
+        assert!(cause.contains("cleanup also failed"), "{cause}");
+        let progs = programs(&log);
+        let run = argv(&log).iter().position(|a| a.iter().any(|x| x == "run"));
+        let after = run.map_or(usize::MAX, |r| r + 1);
+        assert!(
+            progs
+                .get(after..)
+                .is_some_and(|p| p.iter().any(|p| p == "pkill")),
+            "{progs:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

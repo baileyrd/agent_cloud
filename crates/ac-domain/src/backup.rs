@@ -19,6 +19,38 @@ pub const DEFAULT_KEEP: usize = 7;
 /// to replay is at most this long.
 pub const DEFAULT_FULL_EVERY: usize = 7;
 
+/// The file that marks a directory as a backup destination (ADR-031). A share that is not
+/// mounted leaves its empty mount point, which lacks it.
+pub const MARKER: &str = ".ac-backup-dest";
+
+/// What a directory is as a backup destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// It holds [`MARKER`].
+    Marked,
+    /// No marker, but earlier backups: set up before the marker existed. A backup may write the
+    /// marker and go ahead.
+    Unmarked,
+    /// Neither: an unmounted share's mount point, or a new share not yet marked. Refused.
+    Empty,
+}
+
+impl Destination {
+    /// From what the directory holds.
+    pub fn of(marked: bool, holds_backups: bool) -> Self {
+        match (marked, holds_backups) {
+            (true, _) => Self::Marked,
+            (false, true) => Self::Unmarked,
+            (false, false) => Self::Empty,
+        }
+    }
+
+    /// Whether backups may be read from or written to it.
+    pub fn usable(self) -> bool {
+        self != Self::Empty
+    }
+}
+
 /// The ending of every stream file.
 const SUFFIX: &str = ".btrfs";
 /// Between an incremental stream's id and its parent's.
@@ -185,6 +217,14 @@ pub fn pick<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_destination_needs_the_marker_or_earlier_backups() {
+        assert_eq!(Destination::of(true, false), Destination::Marked);
+        assert_eq!(Destination::of(false, true), Destination::Unmarked);
+        assert_eq!(Destination::of(false, false), Destination::Empty);
+        assert!(!Destination::Empty.usable() && Destination::Unmarked.usable());
+    }
 
     fn b(s: &str) -> BackupId {
         BackupId::parse(s).unwrap_or_else(|e| panic!("{e}"))

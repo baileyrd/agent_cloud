@@ -1592,23 +1592,30 @@ for the most trusted token only, and the gateway's existing code does the work.
 - *Scope:* every route here needs `admin`. There is no new scope: a token that can mint tokens can already
   grant itself anything, so a narrower `tokens:write` would only look narrower. A token restricted to some
   agents can still hold `admin`, but these routes act on the whole host, so they also require `agents *`.
-  Without it the answer is 404, so a restricted admin cannot tell the routes exist.
+  Without it the answer is 404, and a wrong method on these paths is 404 too (not ADR-011's 405), so a
+  restricted admin cannot tell the routes exist.
 - *Not over MCP:* none of these routes is offered as an MCP tool (ADR-017). A token secret in a tool result
   would land in a model's context and its logs.
 - *Tokens:*
-  - `GET /api/v1/tokens` lists name, scopes, agents, created, expires and whether it has expired. Never the
-    digest.
+  - `GET /api/v1/tokens` lists name, scopes, agents, created, expires and `live` (false once expired).
+    Never the digest.
   - `POST /api/v1/tokens/{name}` takes `{"scopes": [...], "agents": "*" | [...], "expires": "<n>m|h|d"?}` and
-    answers 201 with `{"name", "token"}`. The secret is shown once (`Cache-Control: no-store`), never logged,
+    answers 201 with `{"name", "token", "expires"}` (`expires` null or absent: never). The secret is shown once (`Cache-Control: no-store`), never logged,
     and never stored except as its digest. The names, scopes, agents and lifetime follow the CLI's rules,
     with the same parser.
   - `DELETE /api/v1/tokens/{name}` revokes it.
+  - *Lifetimes (ADR-022):* a token never outlives the token that made it. A create whose expiry is later
+    than the caller's (or never, for a caller that expires) is refused (403), and so is a revoke of a token
+    that outlives the caller. A stolen short-lived admin token can therefore neither mint a lasting one nor
+    revoke the owner's.
   - *Writer:* the gateway writes the tokens file with the CLI's own `TokenFile` code: under the `flock` on
     its directory, then an atomic 0600 rewrite. ADR-011's "the gateway never writes the tokens file" becomes
     "the gateway and the CLI write it only through `TokenFile`". The reload picks up the change, so a revoked
     token's requests and open streams end as they do after the CLI's revoke.
-  - *Lockout guard:* a revoke that would leave no live token with `admin` for `*` is refused (409). This
-    covers revoking the calling token when it is the last such token. The check runs on the file's
+  - *Lockout guard:* a host admin (`admin` for `*`) is revoked only while another live host admin lasts at
+    least as long (never-expiring counts as longest); otherwise 409. So the last never-expiring one stays,
+    and an expiring one cannot leave the API to lapse with it. A token name taken meanwhile is checked the
+    same way (409). The checks run on the file's
     contents *after* the revoke, inside the same locked read, check and rewrite as the write itself, so
     two concurrent revokes cannot each see the other's token survive. The host's CLI can still do it.
   - *Audit:* the journal gets `audit token=<caller> action=token-create|token-revoke name=<name>
@@ -1616,11 +1623,13 @@ for the most trusted token only, and the gateway's existing code does the work.
 - *Backups:*
   - *Where:* `AC_BACKUP_DEST` in `gateway.env`. `ac-backup.service` reads the same file and uses it for its
     destination, instead of a path fixed in `ExecStart`. While it is unset, the backup routes answer 404 with
-    "no backup destination". The destination must hold a file `.ac-backup-dest`, created once with the
-    share mounted. An unmounted share leaves its empty mount point, which lacks it: the gateway answers 503
-    and the unit's run fails (`ExecStartPre`), so neither writes to the host disk by mistake.
-  - `GET /api/v1/backups` lists, for each agent directory at the destination, its streams: id, full or
-    incremental, size, and whether it can be restored. It also lists the state copies (`_state`) and the
+    "no backup destination". An unmounted share leaves its empty mount point, so a destination counts only
+    when it holds the marker file `.ac-backup-dest` or earlier backups (agent directories or `_state`).
+    `ac-ctl backup` refuses any other with a clear reason (exit 1) and writes the marker on one that already
+    holds backups, so hosts set up before the marker keep backing up with no step. A new share needs
+    `touch .ac-backup-dest` once, mounted. The gateway applies the same test (503 otherwise) and only reads.
+  - `GET /api/v1/backups` lists, for each agent directory at the destination, its streams: id, `parent` (null for a
+    full one), size, and whether it can be restored. It also lists the state copies (`_state`) and the
     last run of `ac-backup.service` (active or not, its result, and when it last started and finished, from
     `systemctl show`). It only reads, through the same `ac_domain::backup` rules as `ac-ctl backups`.
   - `POST /api/v1/backups` starts `ac-backup.service` (`systemctl start --no-block`) and answers 202, or 409

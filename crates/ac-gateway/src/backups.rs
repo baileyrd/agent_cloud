@@ -7,6 +7,7 @@ use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ac_ctr::facts::{kata_sandboxes, HostRead};
 use ac_ctr::CtrRuntime;
 use ac_domain::backup::{self, BackupId, Stream};
 use ac_domain::{state, AgentId, CheckpointId};
@@ -22,10 +23,8 @@ const LOCK: &str = "backup.lock";
 /// The unit that runs backups.
 pub const UNIT: &str = "ac-backup.service";
 
-/// A file the operator puts at the destination once. A share that is not mounted leaves its empty
-/// mount point, which lacks it, so neither the unit nor the gateway mistakes the host disk for the
-/// share.
-pub const MARKER: &str = ".ac-backup-dest";
+/// The marker a destination holds (ADR-031): see [`ac_domain::backup::Destination`].
+pub use ac_domain::backup::MARKER;
 
 /// The unit as systemd knows it.
 pub trait Unit: Send + Sync {
@@ -135,23 +134,26 @@ pub trait Restorer: Send + Sync {
     ) -> Result<Option<CheckpointId>, RestoreError>;
 }
 
-/// [`Restorer`] through the runtime, under `<data>/backup.lock`.
-pub struct HostRestorer<S> {
+/// [`Restorer`] through the runtime, under `<data>/backup.lock`; `host` tells whether the
+/// agent's VM still runs (a sandbox left over after a pause, say).
+pub struct HostRestorer<S, H> {
     rt: CtrRuntime<S>,
+    host: H,
     data: PathBuf,
 }
 
-impl<S> HostRestorer<S> {
-    /// Restore with `rt`, locking in `data`.
-    pub fn new(rt: CtrRuntime<S>, data: impl Into<PathBuf>) -> Self {
+impl<S, H> HostRestorer<S, H> {
+    /// Restore with `rt`, read processes from `host`, lock in `data`.
+    pub fn new(rt: CtrRuntime<S>, host: H, data: impl Into<PathBuf>) -> Self {
         Self {
             rt,
+            host,
             data: data.into(),
         }
     }
 }
 
-impl<S: Spawner + Send + Sync> Restorer for HostRestorer<S> {
+impl<S: Spawner + Send + Sync, H: HostRead + Send + Sync> Restorer for HostRestorer<S, H> {
     fn restore(
         &self,
         dest: &Path,
@@ -159,11 +161,24 @@ impl<S: Spawner + Send + Sync> Restorer for HostRestorer<S> {
         b: &BackupId,
     ) -> Result<Option<CheckpointId>, RestoreError> {
         let _held = lock(&self.data)?;
+        // Picked before the lock: a run may have pruned it since.
+        let still = self
+            .rt
+            .backups(dest, id)
+            .map_err(|e| RestoreError::Failed(e.to_string()))?;
+        if !still.contains(b) {
+            return Err(RestoreError::Refused(format!(
+                "backup {b} of {id} is no longer restorable: list again"
+            )));
+        }
+        let running = kata_sandboxes(&self.host.cmdlines())
+            .iter()
+            .any(|s| s == id.as_str());
         let volume = self
             .rt
             .volume(id)
             .map_err(|e| RestoreError::Failed(e.to_string()))?;
-        backup::check_restore(id, false, volume)
+        backup::check_restore(id, running, volume)
             .map_err(|e| RestoreError::Refused(e.to_string()))?;
         self.rt
             .restore_backup(dest, id, b)
@@ -309,6 +324,9 @@ impl Backups {
         if let Err(reply) = self.present() {
             return reply;
         }
+        // Best effort: a run can start between `show` and `start`, or wait on its mount while
+        // still inactive. systemd merges the two start jobs, so the worst case is a 202 for a run
+        // already under way.
         match self.run() {
             Ok(run) if run.running() => return error(409, "a backup is already running"),
             Ok(_) => {}
@@ -327,18 +345,20 @@ impl Backups {
         self.unit.show().map(|text| Run::parse(&text))
     }
 
-    /// 503 unless the destination holds [`MARKER`] (the share may not be mounted).
-    fn present(&self) -> Result<(), Reply> {
-        match self.dest.join(MARKER).is_file() {
-            true => Ok(()),
-            false => Err(error(
+    /// 503 unless the destination holds [`MARKER`] or earlier backups: an unmounted share's empty
+    /// mount point does not count. The gateway only reads, so it never writes the marker.
+    pub fn present(&self) -> Result<(), Reply> {
+        match ac_ctr::backup::destination(&self.dest) {
+            Ok(d) if d.usable() => Ok(()),
+            Ok(_) => Err(error(
                 503,
                 &format!(
-                    "backup destination {} has no {MARKER}: is the share mounted? (create the file \
-                     there once it is)",
+                    "backup destination {} holds no backups and no {MARKER}: is the share \
+                     mounted? (if it is, create the file there)",
                     self.dest.display()
                 ),
             )),
+            Err(e) => Err(failed(&e.to_string())),
         }
     }
 }
@@ -352,7 +372,11 @@ fn names(dir: &Path, dirs: bool) -> Result<Vec<String>, String> {
     };
     Ok(entries
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() == dirs))
+        // Not followed: a symlink, FIFO or socket is neither.
+        .filter(|e| {
+            e.file_type()
+                .is_ok_and(|t| if dirs { t.is_dir() } else { t.is_file() })
+        })
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .collect())
 }
@@ -387,7 +411,7 @@ fn items(dir: &Path) -> Result<Vec<Item>, String> {
         .iter()
         .filter_map(|n| {
             let stream = Stream::parse(n)?;
-            let bytes = std::fs::metadata(dir.join(n)).map_or(0, |m| m.len());
+            let bytes = std::fs::symlink_metadata(dir.join(n)).map_or(0, |m| m.len());
             Some(Item { stream, bytes })
         })
         .collect();
@@ -674,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_is_shared_with_ac_ctl() {
+    fn a_second_lock_is_refused_until_the_first_is_dropped() {
         let dir = std::env::temp_dir().join(format!("ac-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
         let held = lock(&dir).unwrap_or_else(|e| panic!("{e:?}"));

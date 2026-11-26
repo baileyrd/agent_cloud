@@ -242,7 +242,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
         };
         let done = match call {
             Call::RestoreBackup(id) => self.restore_backup(admin, id, body),
-            call => admin.serve(call, body, tokens::unix_now()),
+            call => admin.serve(call, body, tokens::unix_now(), token),
         };
         if let Some(action) = rule.audit {
             let status = done.reply.status;
@@ -283,6 +283,10 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             Ok(b) => b,
             Err(reply) => return refused(reply),
         };
+        // Unmounted share: say so before the agent is held at all.
+        if let Err(reply) = backups.present() {
+            return refused(reply);
+        }
         let held = {
             let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
             api.hold_for_restore(&id)

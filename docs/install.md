@@ -609,9 +609,9 @@ last backup, in full every 7th (`--full-every N`), keeps the newest 7 restorable
 they need (`--keep N`), and exits 1 if any agent was not backed up; check with `systemctl status ac-backup` or
 `journalctl -u ac-backup`.
 
-`ac-ctl backup` refuses a destination that holds neither `.ac-backup-dest` nor earlier backups: that is
+`ac-ctl backup` refuses a destination that holds neither `.ac-backup-dest` nor a completed earlier backup: that is
 what an unmounted share looks like (its empty mount point, on the host disk). A destination that already
-holds backups but no marker (set up before the marker existed) is marked by the next run, so upgrading
+holds a completed backup (a full stream, or a state copy with its manifest) but no marker (set up before the marker existed) is marked by the next run, so upgrading
 needs no step. If you pointed backups elsewhere by overriding `ExecStart` with `systemctl edit`, that
 override keeps working; to let the gateway see the same path, move it into `AC_BACKUP_DEST` and drop the
 override.

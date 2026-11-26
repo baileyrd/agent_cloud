@@ -86,6 +86,7 @@ use ac_domain::tune::rules::drift;
 use ac_domain::tune::{recommend, Fact, Profile};
 use ac_domain::{AgentLimits, GuestMemory, State};
 use ac_fleet::Fleet;
+use ac_gateway::admin::Admin;
 use ac_gateway::egress::EgressStore;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::notify::{self, Notify};
@@ -274,6 +275,7 @@ fn watch(
     notify: Notify,
     stop: ShutdownHandle,
 ) {
+    let mut failing: Option<String> = None;
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let signal = signals.take();
@@ -283,14 +285,19 @@ fn watch(
             return stop.shutdown();
         }
         let force = signal == Some(SignalEvent::Hangup);
-        match file.reload(force) {
-            Ok(Some(tokens)) => {
-                let n = tokens.iter().count();
-                keys.set(tokens);
+        // Published only under the file's lock (see `TokenFile::publish`); a failure keeps the
+        // current set and is logged once until it changes, since it repeats every second.
+        match file.publish(&keys, force) {
+            Ok(Some(n)) => {
+                failing = None;
                 eprintln!("ac-gateway: tokens reloaded: {n} from the file");
             }
-            Ok(None) => {}
-            Err(e) => eprintln!("ac-gateway: tokens not reloaded, keeping the current ones: {e}"),
+            Ok(None) => failing = None,
+            Err(e) if failing.as_deref() == Some(e.as_str()) => {}
+            Err(e) => {
+                eprintln!("ac-gateway: tokens not reloaded, keeping the current ones: {e}");
+                failing = Some(e);
+            }
         }
     });
 }
@@ -541,6 +548,7 @@ fn run() -> Result<(), String> {
     }
     let app = App::new(api, hub.clone(), keys.clone())
         .with_jobs(Arc::clone(&jobs))
+        .with_admin(Admin::new(tokens_file()?, keys.clone()))
         .with_tailscale_logins(behind_serve);
     let app = Arc::new(app);
     let differ = Arc::clone(&jobs);

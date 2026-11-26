@@ -20,10 +20,13 @@ pub enum Need {
     Token,
     /// A token with this scope.
     Scope(Scope),
+    /// `admin` for every agent: the host-wide routes (ADR-031). Any other token gets 404, so it
+    /// cannot tell they exist.
+    Host,
 }
 
-/// One route: method, path pattern (`{id}` is the agent, `{job}`, `{viewer}` and `{cp}` any
-/// segment), what it needs, the action name it is audited under (`None`: not audited) and the
+/// One route: method, path pattern (`{id}` is the agent, `{job}`, `{viewer}`, `{cp}` and `{name}`
+/// any segment), what it needs, the action name it is audited under (`None`: not audited) and the
 /// MCP tool it is offered as, if any (ADR-017, ADR-020).
 #[derive(Debug)]
 pub struct Rule {
@@ -102,6 +105,9 @@ const A: &str = "/api/v1/agents/{id}";
 /// a create or fork that attaches some needs it too, which the handler checks. A fork's new agent
 /// is in its body, so the handler checks the token is for it too (ADR-018).
 pub const ROUTES: &[Rule] = &[
+    rule("GET", "/api/v1/tokens", Need::Host, None),
+    rule("POST", "/api/v1/tokens/{name}", Need::Host, Some("token-create")),
+    rule("DELETE", "/api/v1/tokens/{name}", Need::Host, Some("token-revoke")),
     offer(rule("GET", "/api/v1/whoami", Need::Token, None), Tool {
         name: "whoami",
         about: "The calling token's name, scopes, agents and expiry (Unix seconds, or null).",
@@ -472,7 +478,8 @@ pub fn find<'a>(method: &str, path: &'a str) -> Result<(&'static Rule, Option<&'
             if r.method == method {
                 return Ok((r, agent));
             }
-            other_method = true;
+            // A host route's other methods are 404 too, so its path shape tells nothing.
+            other_method |= r.need != Need::Host;
         }
     }
     Err(if other_method {
@@ -511,6 +518,7 @@ pub fn check(token: &Token, rule: &Rule, agent: Option<&str>) -> Result<(), Repl
             403,
             &format!("token {} lacks scope {}", token.name, s.name()),
         )),
+        Need::Host if !token.host_admin() => Err(error(404, "not found")),
         _ => Ok(()),
     }
 }
@@ -636,12 +644,15 @@ mod tests {
             ("POST", &format!("{desk}/pointer"), S(ViewerControl)),
             ("POST", &format!("{desk}/keys"), S(ViewerControl)),
             ("POST", &format!("{desk}/text"), S(ViewerControl)),
+            ("GET", "/api/v1/tokens", Need::Host),
+            ("POST", "/api/v1/tokens/ci", Need::Host),
+            ("DELETE", "/api/v1/tokens/ci", Need::Host),
         ] {
             assert_eq!(need(method, path), Some(want), "{method} {path}");
         }
         assert_eq!(
             ROUTES.len(),
-            39,
+            42,
             "a new route needs a row above and in ADR-011"
         );
     }
@@ -663,6 +674,8 @@ mod tests {
             ("POST", "/api/v1/agents", 405),
             ("GET", "/api/v1/agents/a1/term/v1/keys", 405),
             ("GET", "/api/v1/mcp", 405),
+            ("PUT", "/api/v1/tokens", 404),
+            ("GET", "/api/v1/tokens/x", 404),
         ] {
             assert_eq!(
                 find(method, path).err().map(|r| r.status),
@@ -719,6 +732,17 @@ mod tests {
         assert!(check(&t, who, None).is_ok());
         let admin = token("admin", "*");
         assert!(ROUTES.iter().all(|r| check(&admin, r, Some("any")).is_ok()));
+        let (tokens, _) = find("GET", "/api/v1/tokens").unwrap_or_else(|r| panic!("{r:?}"));
+        for other in [
+            token("admin", "a1"),
+            token("agents:write,egress:write", "*"),
+        ] {
+            assert_eq!(
+                check(&other, tokens, None).err().map(|r| r.status),
+                Some(404),
+                "host routes are hidden from {other:?}"
+            );
+        }
     }
 
     #[test]

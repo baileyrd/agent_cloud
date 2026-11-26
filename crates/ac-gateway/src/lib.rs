@@ -37,6 +37,7 @@
 //! 409 and changes nothing; without snapshots (no `with_snapshots`), 404.
 
 pub mod access;
+pub mod admin;
 pub mod agui;
 pub mod bind;
 pub mod egress;
@@ -783,7 +784,7 @@ fn checkpoint_json(cp: &CheckpointId, label: Option<&Label>) -> String {
 }
 
 /// The body as a JSON object with no member outside `allowed`; `None` for an empty body.
-fn members(body: &[u8], allowed: &[&str]) -> Result<Option<Value>, Reply> {
+pub(crate) fn members(body: &[u8], allowed: &[&str]) -> Result<Option<Value>, Reply> {
     let bad = |m: &str| error(400, m);
     if body.trim_ascii().is_empty() {
         return Ok(None);
@@ -1112,7 +1113,7 @@ mod tests {
                 && life.body != error(404, "not found").body
                 && !(life.status == 400 && empty);
             let own = (m == "GET" && p == web::WHOAMI) || (m == "POST" && p == mcp::PATH);
-            viewer || job || life || own
+            viewer || job || life || own || admin::route(m, p).is_some()
         };
         let mut checked = 0;
         for m in ["GET", "POST", "DELETE", "PUT"] {

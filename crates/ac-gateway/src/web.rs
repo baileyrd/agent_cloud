@@ -13,7 +13,8 @@ use ac_ports::{Runtime, SessionStore};
 use rusty_http::{HeaderMap, Method, StatusCode};
 use rusty_serve::{Request, Response, SharedHandler};
 
-use crate::access::{self, Failures, Rule, Verdict};
+use crate::access::{self, Failures, Need, Rule, Verdict};
+use crate::admin::{self, Admin};
 use crate::jobs::{self, Jobs, Route};
 use crate::mcp::{self, Message};
 use crate::tokens::{self, Keys, Presented, Scope, Token};
@@ -81,6 +82,7 @@ pub struct App<R, S> {
     failures: Failures,
     hub: Hub,
     jobs: Option<Arc<Jobs>>,
+    admin: Option<Admin>,
     /// Behind `tailscale serve`: [`TAILSCALE_LOGIN`] names the caller in failure logs.
     tailscale: bool,
 }
@@ -94,6 +96,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             failures: Failures::new(FAIL_WINDOW, FAIL_LIMIT, FAIL_SOURCES),
             hub,
             jobs: None,
+            admin: None,
             tailscale: false,
         }
     }
@@ -109,6 +112,12 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
     /// Serve the task API too.
     pub fn with_jobs(mut self, jobs: Arc<Jobs>) -> Self {
         self.jobs = Some(jobs);
+        self
+    }
+
+    /// Serve the host-wide admin routes too (ADR-031).
+    pub fn with_admin(mut self, admin: Admin) -> Self {
+        self.admin = Some(admin);
         self
     }
 
@@ -203,11 +212,30 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             );
             return json(reply);
         }
+        if rule.need == Need::Host {
+            return self.host(rule, method, path, body, token);
+        }
         let response = self.dispatch(method, path, target, body, token);
         if let Some(agent) = agent {
             self.audit(token, rule, agent, target, body, &response);
         }
         response
+    }
+
+    /// A host-wide admin route (ADR-031): never cached, and a change is audited in the journal
+    /// only, since it is not one agent's. 404 when the gateway serves none.
+    fn host(&self, rule: &Rule, method: &str, path: &str, body: &[u8], token: &Token) -> Response {
+        let (Some(admin), Some(call)) = (&self.admin, admin::route(method, path)) else {
+            return json(error(404, "not found"));
+        };
+        let done = admin.serve(call, body, tokens::unix_now(), token);
+        if let Some(action) = rule.audit {
+            eprintln!(
+                "ac-gateway: audit token={} action={action}{} status={}",
+                token.name, done.audit, done.reply.status
+            );
+        }
+        with(json(done.reply), &[("Cache-Control", "no-store")])
     }
 
     /// One MCP message (ADR-017). A tool call is served as its REST request, by [`Self::serve`].
@@ -410,38 +438,9 @@ impl<I: Iterator<Item = Vec<u8>>> Iterator for Revocable<I> {
 /// `{"name","scopes","agents","expires"}` of the caller's token; `expires` is Unix seconds or
 /// `null` (until revoked).
 fn whoami(token: &Token) -> Reply {
-    let quoted = |v: Vec<String>| {
-        v.iter()
-            .map(|s| format!(r#""{}""#, escape(s)))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let scopes = quoted(
-        token
-            .scopes
-            .names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-    );
-    let agents = match &token.agents {
-        crate::tokens::Agents::All => r#""*""#.to_owned(),
-        crate::tokens::Agents::Only(ids) => {
-            format!(
-                "[{}]",
-                quoted(ids.iter().map(ToString::to_string).collect())
-            )
-        }
-    };
     Reply {
         status: 200,
-        body: format!(
-            r#"{{"name":"{}","scopes":[{scopes}],"agents":{agents},"expires":{}}}"#,
-            escape(&token.name),
-            token
-                .expires
-                .map_or_else(|| "null".to_owned(), |e| e.to_string())
-        ),
+        body: format!("{{{}}}", admin::grants_json(token)),
     }
 }
 

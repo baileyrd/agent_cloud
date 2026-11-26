@@ -208,6 +208,16 @@ impl Token {
     pub fn live(&self, now: u64) -> bool {
         self.expires.is_none_or(|e| now < e)
     }
+
+    /// Its last second, to compare lifetimes: `u64::MAX` when it never expires.
+    pub fn end(&self) -> u64 {
+        self.expires.unwrap_or(u64::MAX)
+    }
+
+    /// Whether it is `admin` for every agent: what the host-wide routes need (ADR-031).
+    pub fn host_admin(&self) -> bool {
+        self.scopes.allows(Scope::Admin) && self.agents == Agents::All
+    }
 }
 
 /// What an `Authorization` header presented.
@@ -520,45 +530,78 @@ impl TokenFile {
         now: u64,
         lifetime: Option<u64>,
     ) -> Result<String, String> {
-        check_name(name)?;
-        let expires = match lifetime {
-            None => String::new(),
-            Some(l) => format!(" {}", now.checked_add(l).ok_or("lifetime too long")?),
-        };
-        let secret = random_hex()?;
-        let line = format!(
-            "{name} {scopes} {agents} {} {now}{expires}\n",
-            hex(&Sha256::digest(secret.as_bytes()))
-        );
-        self.edit(|text| {
-            let mut text = if text.is_empty() {
-                HEADER.to_owned()
-            } else {
-                text.to_owned()
-            };
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&line);
-            Ok(text)
-        })?;
+        let (secret, line) = new_line(name, scopes, &agents, now, lifetime)?;
+        self.edit(|text| Ok(appended(text, &line)))?;
         Ok(secret)
+    }
+
+    /// [`Self::create`] for the gateway (ADR-031): a taken name or a full file is refused with
+    /// its reason, checked under the same lock as the write.
+    pub fn create_new(
+        &self,
+        name: &str,
+        scopes: Scopes,
+        agents: Agents,
+        now: u64,
+        lifetime: Option<u64>,
+    ) -> Result<String, TokenError> {
+        let (secret, line) =
+            new_line(name, scopes, &agents, now, lifetime).map_err(TokenError::Invalid)?;
+        let mut why = None;
+        let done = self.edit(|text| {
+            if Tokens::parse(text).is_ok_and(|t| t.iter().any(|t| t.name == name)) {
+                why = Some(TokenError::Exists);
+                return Err(String::new());
+            }
+            let next = appended(text, &line);
+            if next.len() as u64 > MAX_BYTES {
+                why = Some(TokenError::Full);
+                return Err(String::new());
+            }
+            Ok(next)
+        });
+        settle(done, why).map(|()| secret)
     }
 
     /// Remove the token named `name`.
     pub fn revoke(&self, name: &str) -> Result<(), String> {
-        self.edit(|text| {
-            let kept: Vec<&str> = text
-                .lines()
-                .filter(|l| {
-                    l.split('#').next().unwrap_or("").split_whitespace().next() != Some(name)
-                })
-                .collect();
-            if kept.len() == text.lines().count() {
-                return Err(format!("no token named {name:?}"));
+        self.edit(|text| without(text, name).ok_or_else(|| format!("no token named {name:?}")))
+    }
+
+    /// Remove the token named `name` for a caller whose own token ends at `caller_end` ([`Token::end`])
+    /// (ADR-031), checked under the same lock as the write: not one that outlives the caller,
+    /// and not a host admin unless another live host admin lasts at least as long.
+    pub fn revoke_keeping_admin(
+        &self,
+        name: &str,
+        now: u64,
+        caller_end: u64,
+    ) -> Result<(), TokenError> {
+        let mut why = None;
+        let done = self.edit(|text| {
+            let refuse = |why: &mut Option<TokenError>, e| {
+                *why = Some(e);
+                Err(String::new())
+            };
+            let found = Tokens::parse(text)
+                .ok()
+                .and_then(|t| t.iter().find(|t| t.name == name).cloned());
+            let (Some(target), Some(next)) = (found, without(text, name)) else {
+                return refuse(&mut why, TokenError::Unknown);
+            };
+            if target.end() > caller_end {
+                return refuse(&mut why, TokenError::Outlives);
             }
-            Ok(kept.iter().map(|l| format!("{l}\n")).collect())
-        })
+            let covered = Tokens::parse(&next).is_ok_and(|rest| {
+                rest.iter()
+                    .any(|t| t.live(now) && t.host_admin() && t.end() >= target.end())
+            });
+            if target.host_admin() && !covered {
+                return refuse(&mut why, TokenError::LastAdmin);
+            }
+            Ok(next)
+        });
+        settle(done, why)
     }
 
     /// The tokens now in the file (none if it is missing).
@@ -568,14 +611,36 @@ impl TokenFile {
             .map(Option::unwrap_or_default)
     }
 
-    /// Rewrite the file through `change`, under an exclusive lock on its directory, so concurrent
-    /// edits do not lose each other. The current file must pass every check, and so must the
-    /// result; it replaces the file atomically (temp file, fsync, rename), mode 0600.
-    fn edit(&self, change: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
+    /// Hold the exclusive lock on the file's directory until the returned file is dropped. Edits
+    /// take it, and so must anything that reads the file to publish its tokens: publishing
+    /// under it means an older read can never replace a newer set (a revoked token coming back).
+    pub fn lock(&self) -> Result<std::fs::File, String> {
         let dir = self.path.parent().unwrap_or(Path::new("."));
         let lock = std::fs::File::open(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         lock.lock()
             .map_err(|e| format!("lock {}: {e}", dir.display()))?;
+        Ok(lock)
+    }
+
+    /// Re-read the file if it changed (or `force`) and put its tokens in force, both under
+    /// [`Self::lock`], as the admin routes publish: the number published, `Ok(None)` if it is
+    /// unchanged. Nothing is published without the lock: when it cannot be taken (no directory:
+    /// token storage not set up, so nothing can edit it either) the current set stays.
+    pub fn publish(&mut self, keys: &Keys, force: bool) -> Result<Option<usize>, String> {
+        let _held = self.lock()?;
+        let Some(tokens) = self.reload(force)? else {
+            return Ok(None);
+        };
+        let n = tokens.iter().count();
+        keys.set(tokens);
+        Ok(Some(n))
+    }
+
+    /// Rewrite the file through `change`, under an exclusive lock on its directory, so concurrent
+    /// edits do not lose each other. The current file must pass every check, and so must the
+    /// result; it replaces the file atomically (temp file, fsync, rename), mode 0600.
+    fn edit(&self, change: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
+        let _held = self.lock()?;
         let shown = self.path.display();
         let text = match std::fs::symlink_metadata(&self.path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -596,6 +661,79 @@ impl TokenFile {
         rusty_atomic_file::write_private(&self.path, next.as_bytes())
             .map_err(|e| format!("{shown}: {e}"))
     }
+}
+
+/// Why the gateway's [`TokenFile::create_new`] or [`TokenFile::revoke_keeping_admin`] did not
+/// write.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TokenError {
+    /// The name, scopes or lifetime are not valid.
+    Invalid(String),
+    /// A token has that name.
+    Exists,
+    /// The file would pass its size limit.
+    Full,
+    /// No token has that name.
+    Unknown,
+    /// The token outlives the caller's own.
+    Outlives,
+    /// It is a host admin, and no other live one lasts as long.
+    LastAdmin,
+    /// The file could not be read or written.
+    Failed(String),
+}
+
+/// An [`TokenFile::edit`]'s outcome, with the reason its change gave for refusing.
+fn settle(done: Result<(), String>, why: Option<TokenError>) -> Result<(), TokenError> {
+    match (done, why) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(why)) => Err(why),
+        (Err(e), None) => Err(TokenError::Failed(e)),
+    }
+}
+
+/// A new token's secret and its line in the file.
+fn new_line(
+    name: &str,
+    scopes: Scopes,
+    agents: &Agents,
+    now: u64,
+    lifetime: Option<u64>,
+) -> Result<(String, String), String> {
+    check_name(name)?;
+    let expires = match lifetime {
+        None => String::new(),
+        Some(l) => format!(" {}", now.checked_add(l).ok_or("lifetime too long")?),
+    };
+    let secret = random_hex()?;
+    let line = format!(
+        "{name} {scopes} {agents} {} {now}{expires}\n",
+        hex(&Sha256::digest(secret.as_bytes()))
+    );
+    Ok((secret, line))
+}
+
+/// `text` with `line` at the end (and the header, for a new file).
+fn appended(text: &str, line: &str) -> String {
+    let mut text = if text.is_empty() {
+        HEADER.to_owned()
+    } else {
+        text.to_owned()
+    };
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line);
+    text
+}
+
+/// `text` without the line of the token named `name`, or `None` if there is none.
+fn without(text: &str, name: &str) -> Option<String> {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| l.split('#').next().unwrap_or("").split_whitespace().next() != Some(name))
+        .collect();
+    (kept.len() != text.lines().count()).then(|| kept.iter().map(|l| format!("{l}\n")).collect())
 }
 
 /// 32 bytes from the kernel's random source, as hex. No fallback: a token must be unguessable.
@@ -793,6 +931,34 @@ mod tests {
         ));
         let huge = format!("Bearer {}", "x".repeat(100_000));
         assert!(matches!(t.find(Some(&huge)), Presented::Unknown(_)));
+    }
+
+    #[test]
+    fn publishing_needs_the_lock_and_keeps_the_set_without_it() {
+        let path = tmp();
+        let file = TokenFile::new(&path, me());
+        let one = Scopes::parse("jobs:read").unwrap_or_default();
+        let _ = file.create("ci", one, Agents::All, 1, None);
+        let keys = Keys::new(Tokens::default());
+        let mut watch = TokenFile::new(&path, me());
+        assert_eq!(watch.publish(&keys, false), Ok(Some(1)));
+        assert_eq!(watch.publish(&keys, false), Ok(None), "unchanged");
+        assert_eq!(keys.get().iter().count(), 1);
+
+        let gone = std::env::temp_dir().join(format!("ac-no-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gone);
+        let mut lost = TokenFile::new(gone.join("tokens"), me());
+        let err = lost.publish(&keys, true).err().unwrap_or_default();
+        assert!(
+            err.starts_with("ac-no-dir") || err.contains("ac-no-dir"),
+            "{err}"
+        );
+        assert_eq!(
+            keys.get().iter().count(),
+            1,
+            "a lock failure publishes nothing"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap_or(Path::new("/nonexistent")));
     }
 
     #[test]

@@ -154,6 +154,36 @@ impl<R> Drop for Creation<R> {
     }
 }
 
+/// A paused agent held outside the lifecycle lock for a long change, a restore from backup
+/// (ADR-031). Until it is dropped, other changes to the agent are refused as while a create boots.
+pub struct Hold {
+    id: AgentId,
+    booting: Booting,
+}
+
+impl Hold {
+    /// The agent held.
+    pub fn id(&self) -> &AgentId {
+        &self.id
+    }
+
+    /// A hold on `id` that guards nothing (tests).
+    #[cfg(test)]
+    pub(crate) fn detached(id: AgentId) -> Self {
+        Self {
+            id,
+            booting: Booting::default(),
+        }
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut set = self.booting.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.id);
+    }
+}
+
 /// The lifecycle API.
 pub struct Api<R, S> {
     fleet: Fleet<R, S>,
@@ -448,6 +478,42 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         self.done(creation.reserved.id(), committed, 201)
     }
 
+    /// Hold `id` for a restore from backup: it must be paused, with no job and room for the
+    /// checkpoint that keeps the workspace it replaces. The caller restores unlocked, then drops
+    /// the hold.
+    pub fn hold_for_restore(&self, id: &AgentId) -> Result<Hold, Reply> {
+        let mut set = self.booting.lock().unwrap_or_else(|e| e.into_inner());
+        if set.contains(id) {
+            return Err(booting(id));
+        }
+        match self.fleet.state(id).map_err(|e| map_error(&e))? {
+            Some(State::Paused) => {}
+            Some(state) => {
+                let state = ac_domain::state::state_name(state);
+                return Err(error(
+                    409,
+                    &format!("agent {id} is {state}: pause it first"),
+                ));
+            }
+            None => return Err(error(404, &format!("no agent {id}"))),
+        }
+        if self.jobs.busy(id) {
+            return Err(error(
+                409,
+                &format!("agent {id} has a queued or running job"),
+            ));
+        }
+        let (kept, max) = self.fleet.checkpoints(id).map_err(|e| map_error(&e))?;
+        ac_domain::checkpoint::check_room(id, kept.len(), max)
+            .map_err(|e| error(409, &e.to_string()))?;
+        self.jobs.settle(id);
+        set.insert(id.clone());
+        Ok(Hold {
+            id: id.clone(),
+            booting: Arc::clone(&self.booting),
+        })
+    }
+
     /// Whether `id`'s create is booting outside the lock.
     fn is_booting(&self, id: &AgentId) -> bool {
         let set = self.booting.lock().unwrap_or_else(|e| e.into_inner());
@@ -682,7 +748,7 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
 
 /// 409 for a change to an agent whose create is still booting.
 fn booting(id: &AgentId) -> Reply {
-    error(409, &format!("agent {id} is being created"))
+    error(409, &format!("agent {id} is being created or restored"))
 }
 
 /// A create through the lifecycle lock `api`, held only to reserve and to commit, so creates of
@@ -1843,6 +1909,39 @@ mod tests {
             send(&a, "POST", &restore, r#"{"checkpoint":"../x"}"#, false).0,
             400
         );
+    }
+
+    /// ADR-031: a restore from backup holds a paused agent with room for one more checkpoint;
+    /// while held, changes to it are refused and reads served; dropping the hold ends that.
+    #[test]
+    fn a_restore_hold_needs_a_paused_agent_and_blocks_changes() {
+        let a = snap_api();
+        let id = AgentId::parse("a1").unwrap_or_else(|e| panic!("{e}"));
+        let status = |r: Result<Hold, Reply>| r.err().map(|e| e.status);
+        assert_eq!(status(a.hold_for_restore(&id)), Some(404), "unknown");
+        let _ = call(&a, "POST", A1);
+        assert_eq!(status(a.hold_for_restore(&id)), Some(409), "running");
+        let _ = call(&a, "POST", &format!("{A1}/pause"));
+        let hold = a.hold_for_restore(&id).unwrap_or_else(|r| panic!("{r:?}"));
+        assert_eq!(status(a.hold_for_restore(&id)), Some(409), "held already");
+        let (code, body) = call(&a, "POST", &format!("{A1}/resume"));
+        assert_eq!(code, 409);
+        assert!(body.contains("being created or restored"), "{body}");
+        assert_eq!(call(&a, "GET", A1).0, 200, "reads are served");
+        drop(hold);
+        let cps = format!("{A1}/checkpoints");
+        let _ = send(&a, "POST", &cps, "", false);
+        let _ = send(&a, "POST", &cps, "", false);
+        let (code, body) = a
+            .hold_for_restore(&id)
+            .err()
+            .map(|r| (r.status, r.body))
+            .unwrap_or_default();
+        assert_eq!(code, 409, "no room for the kept workspace");
+        assert!(body.contains("delete one first"), "{body}");
+        let _ = call(&a, "DELETE", &format!("{cps}/20261028-130512"));
+        assert!(a.hold_for_restore(&id).is_ok());
+        assert_eq!(call(&a, "POST", &format!("{A1}/resume")).0, 200, "released");
     }
 
     #[test]

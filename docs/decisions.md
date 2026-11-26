@@ -397,7 +397,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `PUT .../{id}/egress` (set its profiles; also `egress_profiles` on create) | `egress:write` |
   | `GET .../{id}/checkpoints` (ADR-018) | `agents:read` |
   | `POST .../{id}/checkpoints`, `DELETE .../checkpoints/{cp}`, `POST .../{id}/restore`, `.../fork` (the token must also be for the fork's new agent) | `agents:write` |
-  | `GET /api/v1/tokens`, `POST /api/v1/tokens/{name}`, `DELETE /api/v1/tokens/{name}`, `GET /api/v1/backups`, `POST /api/v1/backups` (ADR-031; 404 for any other token) | `admin` for `*` |
+  | `GET /api/v1/tokens`, `POST /api/v1/tokens/{name}`, `DELETE /api/v1/tokens/{name}`, `GET /api/v1/backups`, `POST /api/v1/backups`, `POST .../{id}/restore-backup` (ADR-031; 404 for any other token) | `admin` for `*` |
 
 - *Agents:* a token restricted to some agents gets 404 for any other agent id, existing or not, before its scope
   is looked at, so it cannot probe for ids. (A wrong method is still 405; that depends on the path's shape only.)

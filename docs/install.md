@@ -631,6 +631,14 @@ sudo ac-ctl restore-backup /mnt/agent-backups a1                   # the newest;
 # a1 restored backup 20261028-130512; the workspace it replaced is checkpoint 20261029-091502
 ```
 
+Or over the API, with the agent paused and the same `admin` token (it answers when the receive is done):
+
+```bash
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -d '{"backup":"20261028-130512"}' \
+  http://127.0.0.1:8780/api/v1/agents/a1/restore-backup
+# {"id":"a1","restored":"20261028-130512","kept":"20261029-091502"}
+```
+
 then resume it. On a new host, or after a purge, the restore makes the workspace and `create` boots it.
 
 A run with no agent named also copies the control-plane state to `<dest>/_state/<id>/`: the agent list the

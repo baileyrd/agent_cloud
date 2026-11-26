@@ -190,7 +190,11 @@ fn a_failed_start_sends_no_ready() {
     let addr = free_port();
     let out = ok(gateway(&dir, addr, Some(&path.display().to_string())).wait_with_output());
     assert!(!out.status.success(), "{out:?}");
-    assert!(!listening(addr));
+    // Proven from the gateway's own output, not a TCP probe: another test's gateway may reuse
+    // `addr` once `free_port` released it (#43).
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("group/world accessible"), "{err}");
+    assert!(!err.contains("listening on"), "{err}");
     assert_eq!(recv(&sock, Duration::from_millis(500)), None);
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_dir_all(dir);

@@ -596,6 +596,7 @@ hold the agents' logins):
 sudo mkdir -p /mnt/agent-backups
 echo 'beast:/srv/agent-backups /mnt/agent-backups nfs4 _netdev,hard,noatime 0 0' | sudo tee -a /etc/fstab
 sudo mount /mnt/agent-backups
+sudo touch /mnt/agent-backups/.ac-backup-dest   # once, on the mounted share: runs refuse a destination without it
 sudo ac-ctl backup /mnt/agent-backups          # a1 backed up 20261028-130512 (full, 1.2 GiB)
 sudo ac-ctl backup /mnt/agent-backups a1       # a1 backed up ... (incremental from 20261028-130512, 3.1 MiB)
 sudo ac-ctl backups /mnt/agent-backups         # a1 20261028-130512 full / a1 ... incremental from ...

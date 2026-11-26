@@ -1616,7 +1616,9 @@ for the most trusted token only, and the gateway's existing code does the work.
 - *Backups:*
   - *Where:* `AC_BACKUP_DEST` in `gateway.env`. `ac-backup.service` reads the same file and uses it for its
     destination, instead of a path fixed in `ExecStart`. While it is unset, the backup routes answer 404 with
-    "no backup destination". If the directory is missing (the share is not mounted), the answer is 503.
+    "no backup destination". The destination must hold a file `.ac-backup-dest`, created once with the
+    share mounted. An unmounted share leaves its empty mount point, which lacks it: the gateway answers 503
+    and the unit's run fails (`ExecStartPre`), so neither writes to the host disk by mistake.
   - `GET /api/v1/backups` lists, for each agent directory at the destination, its streams: id, full or
     incremental, size, and whether it can be restored. It also lists the state copies (`_state`) and the
     last run of `ac-backup.service` (active or not, its result, and when it last started and finished, from

@@ -486,7 +486,8 @@ pub fn find<'a>(method: &str, path: &'a str) -> Result<(&'static Rule, Option<&'
             if r.method == method {
                 return Ok((r, agent));
             }
-            other_method = true;
+            // A host route's other methods are 404 too, so its path shape tells nothing.
+            other_method |= r.need != Need::Host;
         }
     }
     Err(if other_method {
@@ -684,6 +685,8 @@ mod tests {
             ("POST", "/api/v1/agents", 405),
             ("GET", "/api/v1/agents/a1/term/v1/keys", 405),
             ("GET", "/api/v1/mcp", 405),
+            ("PUT", "/api/v1/tokens", 404),
+            ("GET", "/api/v1/tokens/x", 404),
         ] {
             assert_eq!(
                 find(method, path).err().map(|r| r.status),

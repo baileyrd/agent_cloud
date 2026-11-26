@@ -231,7 +231,11 @@ fn euid() -> Result<u32, String> {
 
 /// The admin routes (ADR-031): tokens, and backups when `AC_BACKUP_DEST` names a destination,
 /// restored with `restorer`.
-fn admin(file: TokenFile, keys: Keys, restorer: HostRestorer<LinuxSpawner>) -> Admin {
+fn admin(
+    file: TokenFile,
+    keys: Keys,
+    restorer: HostRestorer<LinuxSpawner, LinuxHost<LinuxSpawner>>,
+) -> Admin {
     let admin = Admin::new(file, keys);
     match std::env::var_os("AC_BACKUP_DEST").filter(|d| !d.is_empty()) {
         Some(dest) => {
@@ -560,7 +564,11 @@ fn run() -> Result<(), String> {
         .with_admin(admin(
             tokens_file()?,
             keys.clone(),
-            HostRestorer::new(CtrRuntime::new(LinuxSpawner, cfg.clone()), &data),
+            HostRestorer::new(
+                CtrRuntime::new(LinuxSpawner, cfg.clone()),
+                LinuxHost::new(LinuxSpawner),
+                &data,
+            ),
         ))
         .with_tailscale_logins(behind_serve);
     let app = Arc::new(app);

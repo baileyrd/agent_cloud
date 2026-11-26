@@ -209,6 +209,11 @@ impl Token {
         self.expires.is_none_or(|e| now < e)
     }
 
+    /// Its last second, to compare lifetimes: `u64::MAX` when it never expires.
+    pub fn end(&self) -> u64 {
+        self.expires.unwrap_or(u64::MAX)
+    }
+
     /// Whether it is `admin` for every agent: what the host-wide routes need (ADR-031).
     pub fn host_admin(&self) -> bool {
         self.scopes.allows(Scope::Admin) && self.agents == Agents::All
@@ -270,12 +275,6 @@ impl Tokens {
     /// Whether there are none.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// Whether one of them is live at `now` and [`Token::host_admin`]: someone can still manage
-    /// the host over the API.
-    pub fn has_host_admin(&self, now: u64) -> bool {
-        self.0.iter().any(|t| t.live(now) && t.host_admin())
     }
 
     /// Whether `token` (name, scopes, agents and digest) is still one of them.
@@ -531,29 +530,37 @@ impl TokenFile {
         now: u64,
         lifetime: Option<u64>,
     ) -> Result<String, String> {
-        check_name(name)?;
-        let expires = match lifetime {
-            None => String::new(),
-            Some(l) => format!(" {}", now.checked_add(l).ok_or("lifetime too long")?),
-        };
-        let secret = random_hex()?;
-        let line = format!(
-            "{name} {scopes} {agents} {} {now}{expires}\n",
-            hex(&Sha256::digest(secret.as_bytes()))
-        );
-        self.edit(|text| {
-            let mut text = if text.is_empty() {
-                HEADER.to_owned()
-            } else {
-                text.to_owned()
-            };
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&line);
-            Ok(text)
-        })?;
+        let (secret, line) = new_line(name, scopes, &agents, now, lifetime)?;
+        self.edit(|text| Ok(appended(text, &line)))?;
         Ok(secret)
+    }
+
+    /// [`Self::create`] for the gateway (ADR-031): a taken name or a full file is refused with
+    /// its reason, checked under the same lock as the write.
+    pub fn create_new(
+        &self,
+        name: &str,
+        scopes: Scopes,
+        agents: Agents,
+        now: u64,
+        lifetime: Option<u64>,
+    ) -> Result<String, TokenError> {
+        let (secret, line) =
+            new_line(name, scopes, &agents, now, lifetime).map_err(TokenError::Invalid)?;
+        let mut why = None;
+        let done = self.edit(|text| {
+            if Tokens::parse(text).is_ok_and(|t| t.iter().any(|t| t.name == name)) {
+                why = Some(TokenError::Exists);
+                return Err(String::new());
+            }
+            let next = appended(text, &line);
+            if next.len() as u64 > MAX_BYTES {
+                why = Some(TokenError::Full);
+                return Err(String::new());
+            }
+            Ok(next)
+        });
+        settle(done, why).map(|()| secret)
     }
 
     /// Remove the token named `name`.
@@ -561,26 +568,40 @@ impl TokenFile {
         self.edit(|text| without(text, name).ok_or_else(|| format!("no token named {name:?}")))
     }
 
-    /// Remove the token named `name` unless that leaves no live host admin at `now` (ADR-031's
-    /// lockout guard), checked under the same lock as the write.
-    pub fn revoke_keeping_admin(&self, name: &str, now: u64) -> Result<(), RevokeError> {
+    /// Remove the token named `name` for a caller whose own token ends at `caller_end` ([`Token::end`])
+    /// (ADR-031), checked under the same lock as the write: not one that outlives the caller,
+    /// and not a host admin unless another live host admin lasts at least as long.
+    pub fn revoke_keeping_admin(
+        &self,
+        name: &str,
+        now: u64,
+        caller_end: u64,
+    ) -> Result<(), TokenError> {
         let mut why = None;
         let done = self.edit(|text| {
-            let Some(next) = without(text, name) else {
-                why = Some(RevokeError::Unknown);
-                return Err(String::new());
+            let refuse = |why: &mut Option<TokenError>, e| {
+                *why = Some(e);
+                Err(String::new())
             };
-            if !Tokens::parse(&next).is_ok_and(|t| t.has_host_admin(now)) {
-                why = Some(RevokeError::LastAdmin);
-                return Err(String::new());
+            let found = Tokens::parse(text)
+                .ok()
+                .and_then(|t| t.iter().find(|t| t.name == name).cloned());
+            let (Some(target), Some(next)) = (found, without(text, name)) else {
+                return refuse(&mut why, TokenError::Unknown);
+            };
+            if target.end() > caller_end {
+                return refuse(&mut why, TokenError::Outlives);
+            }
+            let covered = Tokens::parse(&next).is_ok_and(|rest| {
+                rest.iter()
+                    .any(|t| t.live(now) && t.host_admin() && t.end() >= target.end())
+            });
+            if target.host_admin() && !covered {
+                return refuse(&mut why, TokenError::LastAdmin);
             }
             Ok(next)
         });
-        match (done, why) {
-            (Ok(()), _) => Ok(()),
-            (Err(_), Some(why)) => Err(why),
-            (Err(e), None) => Err(RevokeError::Failed(e)),
-        }
+        settle(done, why)
     }
 
     /// The tokens now in the file (none if it is missing).
@@ -620,15 +641,68 @@ impl TokenFile {
     }
 }
 
-/// Why [`TokenFile::revoke_keeping_admin`] did not revoke.
+/// Why the gateway's [`TokenFile::create_new`] or [`TokenFile::revoke_keeping_admin`] did not
+/// write.
 #[derive(Debug, PartialEq, Eq)]
-pub enum RevokeError {
+pub enum TokenError {
+    /// The name, scopes or lifetime are not valid.
+    Invalid(String),
+    /// A token has that name.
+    Exists,
+    /// The file would pass its size limit.
+    Full,
     /// No token has that name.
     Unknown,
-    /// It would leave no live host admin.
+    /// The token outlives the caller's own.
+    Outlives,
+    /// It is a host admin, and no other live one lasts as long.
     LastAdmin,
     /// The file could not be read or written.
     Failed(String),
+}
+
+/// An [`TokenFile::edit`]'s outcome, with the reason its change gave for refusing.
+fn settle(done: Result<(), String>, why: Option<TokenError>) -> Result<(), TokenError> {
+    match (done, why) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(why)) => Err(why),
+        (Err(e), None) => Err(TokenError::Failed(e)),
+    }
+}
+
+/// A new token's secret and its line in the file.
+fn new_line(
+    name: &str,
+    scopes: Scopes,
+    agents: &Agents,
+    now: u64,
+    lifetime: Option<u64>,
+) -> Result<(String, String), String> {
+    check_name(name)?;
+    let expires = match lifetime {
+        None => String::new(),
+        Some(l) => format!(" {}", now.checked_add(l).ok_or("lifetime too long")?),
+    };
+    let secret = random_hex()?;
+    let line = format!(
+        "{name} {scopes} {agents} {} {now}{expires}\n",
+        hex(&Sha256::digest(secret.as_bytes()))
+    );
+    Ok((secret, line))
+}
+
+/// `text` with `line` at the end (and the header, for a new file).
+fn appended(text: &str, line: &str) -> String {
+    let mut text = if text.is_empty() {
+        HEADER.to_owned()
+    } else {
+        text.to_owned()
+    };
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line);
+    text
 }
 
 /// `text` without the line of the token named `name`, or `None` if there is none.

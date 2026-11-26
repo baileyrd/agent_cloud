@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ac_ctr::facts::{kata_sandboxes, HostRead, LinuxHost};
 use ac_ctr::{CtrConfig, CtrRuntime};
-use ac_domain::backup::{self, BackupId};
+use ac_domain::backup::{self, BackupId, Destination};
 use ac_domain::{checkpoint, AgentId, Volume};
 use ac_ports::Snapshots;
 use platform_linux::LinuxSpawner;
@@ -61,6 +61,7 @@ pub fn run(b: &Backup, max_checkpoints: usize) -> Result<u8, String> {
             full_every,
         } => {
             let _held = lock(&b.data)?;
+            check_destination(&b.dest)?;
             let sent = send(&rt, &b.dest, agents, *keep, *full_every)?;
             match agents.is_empty() {
                 true => Ok(sent.max(save_state(b, *keep))),
@@ -78,6 +79,28 @@ pub fn run(b: &Backup, max_checkpoints: usize) -> Result<u8, String> {
             let _held = lock(&b.data)?;
             restore(&rt, &b.dest, id, wanted.as_ref(), max_checkpoints)
         }
+    }
+}
+
+/// Refuse a destination that is neither marked nor holds earlier backups (ADR-031): most likely
+/// a share that is not mounted, whose empty mount point is on the host disk. One that holds
+/// backups but no marker was set up before the marker existed: mark it and go ahead.
+fn check_destination(dest: &Path) -> Result<(), String> {
+    let marker = dest.join(backup::MARKER);
+    match ac_ctr::backup::destination(dest).map_err(|e| e.to_string())? {
+        Destination::Marked => Ok(()),
+        Destination::Unmarked => {
+            std::fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))?;
+            println!("marked {} as a backup destination", dest.display());
+            Ok(())
+        }
+        Destination::Empty => Err(format!(
+            "{} holds no backups and no {}: is the share mounted? If it is, create the marker \
+             once with `touch {}`",
+            dest.display(),
+            backup::MARKER,
+            marker.display()
+        )),
     }
 }
 

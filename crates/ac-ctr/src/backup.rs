@@ -38,6 +38,18 @@ pub struct Sent {
     pub pruned: Vec<BackupId>,
 }
 
+/// What `dest` is as a backup destination: marked, holding earlier backups (an agent directory
+/// or the state copies), or neither. A missing directory is empty.
+pub fn destination(dest: &Path) -> Result<backup::Destination, PortError> {
+    let op = "backup destination";
+    let marker = dest.join(backup::MARKER);
+    let marked = std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file());
+    let holds = names_in(op, dest, true)?
+        .iter()
+        .any(|n| n == ac_domain::state::DIR || AgentId::parse(n).is_ok());
+    Ok(backup::Destination::of(marked, holds))
+}
+
 /// Subvolume ids in `dir` that parse as backup ids, oldest first; nothing there is fine.
 fn ids_in(op: &'static str, dir: &Path) -> Result<Vec<BackupId>, PortError> {
     let mut ids: Vec<BackupId> = names_in(op, dir, true)?
@@ -293,6 +305,21 @@ mod tests {
     use super::*;
     use crate::snap::tests::{agent, ok, Host};
     use ac_ports::Snapshots;
+
+    #[test]
+    fn a_destination_is_marked_holds_backups_or_is_empty() {
+        let dir = std::env::temp_dir().join(format!("ac-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let is = |d: &Path| destination(d).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(is(&dir), backup::Destination::Empty, "missing");
+        let _ = std::fs::create_dir_all(dir.join("not an agent"));
+        assert_eq!(is(&dir), backup::Destination::Empty, "a mount point");
+        let _ = std::fs::create_dir_all(dir.join("a1"));
+        assert_eq!(is(&dir), backup::Destination::Unmarked);
+        let _ = std::fs::write(dir.join(backup::MARKER), b"");
+        assert_eq!(is(&dir), backup::Destination::Marked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn dest(h: &Host) -> PathBuf {
         let d = h.root.join("dest");

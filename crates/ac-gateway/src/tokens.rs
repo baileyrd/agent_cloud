@@ -611,14 +611,22 @@ impl TokenFile {
             .map(Option::unwrap_or_default)
     }
 
-    /// Rewrite the file through `change`, under an exclusive lock on its directory, so concurrent
-    /// edits do not lose each other. The current file must pass every check, and so must the
-    /// result; it replaces the file atomically (temp file, fsync, rename), mode 0600.
-    fn edit(&self, change: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
+    /// Hold the exclusive lock on the file's directory until the returned file is dropped. Edits
+    /// take it, and so must anything that reads the file to publish its tokens: publishing
+    /// under it means an older read can never replace a newer set (a revoked token coming back).
+    pub fn lock(&self) -> Result<std::fs::File, String> {
         let dir = self.path.parent().unwrap_or(Path::new("."));
         let lock = std::fs::File::open(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         lock.lock()
             .map_err(|e| format!("lock {}: {e}", dir.display()))?;
+        Ok(lock)
+    }
+
+    /// Rewrite the file through `change`, under an exclusive lock on its directory, so concurrent
+    /// edits do not lose each other. The current file must pass every check, and so must the
+    /// result; it replaces the file atomically (temp file, fsync, rename), mode 0600.
+    fn edit(&self, change: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
+        let _held = self.lock()?;
         let shown = self.path.display();
         let text = match std::fs::symlink_metadata(&self.path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

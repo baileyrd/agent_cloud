@@ -541,9 +541,19 @@ took ~10 s against ~4 s warm. A boot while six agents were busy failed.
 ## Desktop image
 
 `images/agent-desktop` (agent-shell plus Xorg dummy, Xfce and Chromium) targets Kata's default 2048 MiB.
-**Not measured yet:** the image size (`scripts/build-images.sh desktop` prints it), the guest's used memory and
-the sandbox's `memory.current` at idle with the desktop up, and with Chromium open on a page
-(`scripts/desktop-smoke.sh` prints the idle figures). Record them here with the date.
+Measured on BaileyServ 2026-11-26 (main e1822aa plus the #472 fixes), agent d1, 2 vCPU / 2560 MiB, `--network`:
+
+| | Value |
+|---|---|
+| Image size (podman) | 2.3 GB (agent-shell 1.09 GB); 2.1 GiB in containerd |
+| Idle, desktop up, 60 s after boot: guest used / sandbox `memory.current` | 441 MiB / 1119 MiB |
+| Chromium open on chrome://policy: guest used / sandbox `memory.current` | 831 MiB / 1411 MiB |
+| Desktop stream, changing screen (a clock in a terminal) | 4.0 frames/s, about 470 KiB/s |
+| Desktop stream, unchanged screen | no frames sent |
+| ffmpeg CPU in the guest while streaming (`ps -o %cpu`, lifetime average) | 15 % of one vCPU |
+| ffmpeg after the viewer tab closes | gone within 5 s |
+
+Both memory figures stay under the 2048 MiB target with Chromium open.
 
 ## Not measured
 

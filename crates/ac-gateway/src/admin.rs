@@ -1,9 +1,11 @@
-//! Host-wide admin routes (ADR-031): API tokens, written through the CLI's own [`TokenFile`]. The
+//! Host-wide admin routes (ADR-031): API tokens, written through the CLI's own [`TokenFile`], and
+//! backups ([`Backups`]). The
 //! caller is a host admin by now ([`crate::access::Need::Host`]); this module only parses, writes
 //! and answers. Nothing here is offered over MCP, so a secret never lands in a tool result.
 
 use rusty_json::Value;
 
+use crate::backups::Backups;
 use crate::tokens::{self, Agents, Keys, Scopes, Token, TokenError, TokenFile, Tokens};
 use crate::{error, escape, members, Reply};
 
@@ -11,18 +13,27 @@ use crate::{error, escape, members, Reply};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Call<'a> {
     /// `GET /api/v1/tokens`.
-    List,
+    Tokens,
     /// `POST /api/v1/tokens/{name}`.
     Create(&'a str),
     /// `DELETE /api/v1/tokens/{name}`.
     Revoke(&'a str),
+    /// `GET /api/v1/backups`.
+    Backups,
+    /// `POST /api/v1/backups`.
+    BackUp,
 }
 
 /// The call `method` and `path` name, if any.
 pub fn route<'a>(method: &str, path: &'a str) -> Option<Call<'a>> {
+    match (method, path) {
+        ("GET", "/api/v1/backups") => return Some(Call::Backups),
+        ("POST", "/api/v1/backups") => return Some(Call::BackUp),
+        _ => {}
+    }
     let rest = path.strip_prefix("/api/v1/tokens")?;
     if rest.is_empty() {
-        return (method == "GET").then_some(Call::List);
+        return (method == "GET").then_some(Call::Tokens);
     }
     let name = rest
         .strip_prefix('/')
@@ -44,30 +55,50 @@ pub struct Done {
 }
 
 /// The tokens file and the set in force, which a write refreshes at once rather than at the next
-/// one-second reload.
+/// one-second reload; the backups, if a destination is set.
 pub struct Admin {
     file: TokenFile,
     keys: Keys,
+    backups: Option<Backups>,
 }
 
 impl Admin {
     /// Write `file` and refresh `keys` after each change.
     pub fn new(file: TokenFile, keys: Keys) -> Self {
-        Self { file, keys }
+        Self {
+            file,
+            keys,
+            backups: None,
+        }
+    }
+
+    /// Serve the backup routes from `backups`; without it they answer 404.
+    pub fn with_backups(mut self, backups: Backups) -> Self {
+        self.backups = Some(backups);
+        self
     }
 
     /// Serve `call` from `caller` with `body` at `now` (Unix seconds). A caller only creates or
     /// revokes tokens that do not outlive its own (ADR-031), so a short-lived admin token cannot
     /// mint a lasting one or revoke the owner's.
     pub fn serve(&self, call: Call<'_>, body: &[u8], now: u64, caller: &Token) -> Done {
+        let read = |reply| Done {
+            reply,
+            audit: String::new(),
+        };
         match call {
-            Call::List => Done {
-                reply: self.list(now),
-                audit: String::new(),
-            },
+            Call::Tokens => read(self.list(now)),
             Call::Create(name) => self.create(name, body, now, caller),
             Call::Revoke(name) => self.revoke(name, now, caller),
+            Call::Backups => read(self.backups().map_or_else(|r| r, Backups::list)),
+            Call::BackUp => read(self.backups().map_or_else(|r| r, Backups::start)),
         }
+    }
+
+    fn backups(&self) -> Result<&Backups, Reply> {
+        self.backups
+            .as_ref()
+            .ok_or_else(|| error(404, "no backup destination (set AC_BACKUP_DEST)"))
     }
 
     fn list(&self, now: u64) -> Reply {
@@ -358,7 +389,7 @@ mod tests {
 
     #[test]
     fn routes() {
-        assert_eq!(route("GET", "/api/v1/tokens"), Some(Call::List));
+        assert_eq!(route("GET", "/api/v1/tokens"), Some(Call::Tokens));
         assert_eq!(route("POST", "/api/v1/tokens/ci"), Some(Call::Create("ci")));
         assert_eq!(
             route("DELETE", "/api/v1/tokens/ci"),
@@ -369,6 +400,9 @@ mod tests {
         assert_eq!(route("GET", "/api/v1/tokensx"), None);
         assert_eq!(route("POST", "/api/v1/tokens/"), None);
         assert_eq!(route("POST", "/api/v1/tokens/a/b"), None);
+        assert_eq!(route("GET", "/api/v1/backups"), Some(Call::Backups));
+        assert_eq!(route("POST", "/api/v1/backups"), Some(Call::BackUp));
+        assert_eq!(route("DELETE", "/api/v1/backups"), None);
     }
 
     #[test]
@@ -394,7 +428,7 @@ mod tests {
         assert_eq!(secret.len(), 64);
         assert!(!d.audit.contains(secret), "no secret in the audit");
         assert_eq!(keys.get().iter().count(), 2, "in force at once");
-        let (s, list) = status(&a, Call::List, "");
+        let (s, list) = status(&a, Call::Tokens, "");
         assert_eq!(s, 200);
         assert!(list.contains(r#""name":"ci","scopes":["jobs:read","jobs:write"],"agents":["a1"]"#));
         assert!(list.contains(r#""created":200,"live":true"#));
@@ -409,6 +443,14 @@ mod tests {
             201,
             "null: never"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backups_without_a_destination_are_404() {
+        let (a, _, dir) = admin();
+        assert_eq!(status(&a, Call::Backups, "").0, 404);
+        assert_eq!(status(&a, Call::BackUp, "").0, 404);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -563,7 +605,7 @@ mod tests {
             .collect();
         assert!(made.contains(&507), "{made:?}");
         std::fs::write(&path, "not a token line\n").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(a.serve(Call::List, b"", 200, &owner).reply.status, 500);
+        assert_eq!(a.serve(Call::Tokens, b"", 200, &owner).reply.status, 500);
         assert_eq!(
             a.serve(Call::Revoke("owner"), b"", 200, &owner)
                 .reply

@@ -397,7 +397,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `PUT .../{id}/egress` (set its profiles; also `egress_profiles` on create) | `egress:write` |
   | `GET .../{id}/checkpoints` (ADR-018) | `agents:read` |
   | `POST .../{id}/checkpoints`, `DELETE .../checkpoints/{cp}`, `POST .../{id}/restore`, `.../fork` (the token must also be for the fork's new agent) | `agents:write` |
-  | `GET /api/v1/tokens`, `POST /api/v1/tokens/{name}`, `DELETE /api/v1/tokens/{name}` (ADR-031; 404 for any other token) | `admin` for `*` |
+  | `GET /api/v1/tokens`, `POST /api/v1/tokens/{name}`, `DELETE /api/v1/tokens/{name}`, `GET /api/v1/backups`, `POST /api/v1/backups` (ADR-031; 404 for any other token) | `admin` for `*` |
 
 - *Agents:* a token restricted to some agents gets 404 for any other agent id, existing or not, before its scope
   is looked at, so it cannot probe for ids. (A wrong method is still 405; that depends on the path's shape only.)
@@ -1625,7 +1625,12 @@ for the most trusted token only, and the gateway's existing code does the work.
 - *Backups:*
   - *Where:* `AC_BACKUP_DEST` in `gateway.env`. `ac-backup.service` reads the same file and uses it for its
     destination, instead of a path fixed in `ExecStart`. While it is unset, the backup routes answer 404 with
-    "no backup destination". If the directory is missing (the share is not mounted), the answer is 503.
+    "no backup destination". An unmounted share leaves its empty mount point, so a destination counts only
+    when it holds the marker file `.ac-backup-dest` or a completed earlier backup: an agent's restorable
+    full stream, or a state copy with its `MANIFEST` (empty or `.part` directories do not count).
+    `ac-ctl backup` refuses any other with a clear reason (exit 1) and writes the marker on one that already
+    holds backups, so hosts set up before the marker keep backing up with no step. A new share needs
+    `touch .ac-backup-dest` once, mounted. The gateway applies the same test (503 otherwise) and only reads.
   - `GET /api/v1/backups` lists, for each agent directory at the destination, its streams: id, `parent` (null for a
     full one), size, and whether it can be restored. It also lists the state copies (`_state`) and the
     last run of `ac-backup.service` (active or not, its result, and when it last started and finished, from
@@ -1634,6 +1639,7 @@ for the most trusted token only, and the gateway's existing code does the work.
     while a run is active. The gateway does not send streams itself, so a run from the page is the same as
     the timer's: nice 19, idle I/O, the unit's sandbox, one run at a time, and a failure shown by the unit.
     It backs up every agent. That is the unit's job, and a per-agent run would need a second unit.
+    The start is audited in the journal as `action=backup-run`.
   - `POST /api/v1/agents/{id}/restore-backup` takes `{"backup": "<id>"?}` (default the newest restorable)
     and runs ADR-021's restore in the gateway: `CtrRuntime::restore_backup` under `<data>/backup.lock`. It
     is refused (409) unless the agent is paused, with the same refusals as `ac-ctl restore-backup`. The

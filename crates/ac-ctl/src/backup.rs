@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ac_ctr::facts::{kata_sandboxes, HostRead, LinuxHost};
 use ac_ctr::{CtrConfig, CtrRuntime};
-use ac_domain::backup::{self, BackupId};
+use ac_domain::backup::{self, BackupId, Destination};
 use ac_domain::{checkpoint, AgentId, Volume};
 use ac_ports::Snapshots;
 use platform_linux::LinuxSpawner;
@@ -61,6 +61,7 @@ pub fn run(b: &Backup, max_checkpoints: usize) -> Result<u8, String> {
             full_every,
         } => {
             let _held = lock(&b.data)?;
+            check_destination(&b.dest)?;
             let sent = send(&rt, &b.dest, agents, *keep, *full_every)?;
             match agents.is_empty() {
                 true => Ok(sent.max(save_state(b, *keep))),
@@ -78,6 +79,28 @@ pub fn run(b: &Backup, max_checkpoints: usize) -> Result<u8, String> {
             let _held = lock(&b.data)?;
             restore(&rt, &b.dest, id, wanted.as_ref(), max_checkpoints)
         }
+    }
+}
+
+/// Refuse a destination that is neither marked nor holds earlier backups (ADR-031): most likely
+/// a share that is not mounted, whose empty mount point is on the host disk. One that holds
+/// backups but no marker was set up before the marker existed: mark it and go ahead.
+fn check_destination(dest: &Path) -> Result<(), String> {
+    let marker = dest.join(backup::MARKER);
+    match ac_ctr::backup::destination(dest).map_err(|e| e.to_string())? {
+        Destination::Marked => Ok(()),
+        Destination::Unmarked => {
+            std::fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))?;
+            println!("marked {} as a backup destination", dest.display());
+            Ok(())
+        }
+        Destination::Empty => Err(format!(
+            "{} holds no backups and no {}: is the share mounted? If it is, create the marker \
+             once with `touch {}`",
+            dest.display(),
+            backup::MARKER,
+            marker.display()
+        )),
     }
 }
 
@@ -236,4 +259,52 @@ fn restore(
         ),
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ac-ctl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("a1"));
+        let _ = std::fs::create_dir_all(dir.join("_state"));
+        dir
+    }
+
+    #[test]
+    fn empty_agent_and_state_directories_are_refused_and_left_unmarked() {
+        let dir = fresh("empty");
+        let refused = check_destination(&dir).err().unwrap_or_default();
+        assert!(refused.contains("is the share mounted?"), "{refused}");
+        assert!(
+            !dir.join(backup::MARKER).exists(),
+            "no marker on a bare mount point"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_completed_legacy_destination_is_marked_once() {
+        let dir = fresh("legacy");
+        let _ = std::fs::write(dir.join("a1/20261125-033000.full.btrfs"), b"stream");
+        assert_eq!(check_destination(&dir), Ok(()));
+        assert!(dir.join(backup::MARKER).is_file());
+        assert_eq!(check_destination(&dir), Ok(()), "marked now");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_fresh_destination_needs_the_marker_set_up() {
+        let dir = std::env::temp_dir().join(format!("ac-ctl-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(check_destination(&dir).is_err());
+        let _ = std::fs::write(dir.join(backup::MARKER), b"");
+        assert_eq!(check_destination(&dir), Ok(()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

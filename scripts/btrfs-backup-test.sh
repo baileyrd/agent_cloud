@@ -48,6 +48,9 @@ btrfs -q subvolume create "$ws"
 dd if=/dev/urandom of="$ws/blob" bs=1M count=16 status=none
 chown -R 1000:1000 "$ws"
 
+# An empty destination (an unmounted share, most likely) is refused until it is marked (ADR-031).
+expect 'holds no backups and no .ac-backup-dest' ac backup "$dest" a1
+touch "$dest/.ac-backup-dest"
 back one | grep -q '^a1 backed up .* (full, 16\.[0-9] MiB)$' || fail "first backup is full"
 out=$(back two)
 echo "$out" | grep -Eq '\(incremental from .*, [0-9.]+ (B|KiB)\)$' || fail "second is a small increment: $out"
@@ -102,6 +105,11 @@ fi
 mkdir "$data/workspaces/plain"
 expect 'plain directory' ac backup "$dest" plain
 expect 'no such backup' ac restore-backup "$dest" a1 20000101-000000
-expect 'is not a directory' ac backup "$tmp/nowhere" a1
+expect 'holds no backups' ac backup "$tmp/nowhere" a1
 expect 'no such backup of agent b9' ac restore-backup "$dest" b9
+# A destination set up before the marker, holding a completed backup, is marked on its next run.
+ac --full-every 1 backup "$dest" a1 >/dev/null
+rm "$dest/.ac-backup-dest"
+ac backup "$dest" a1 | grep -q '^marked .* as a backup destination$' || fail "an unmarked destination with backups is marked"
+[ -f "$dest/.ac-backup-dest" ] || fail "the marker is written"
 echo "ok: btrfs backups and restores on $(uname -r), $(btrfs --version), streams on ext4"

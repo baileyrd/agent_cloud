@@ -71,7 +71,7 @@
 
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,6 +87,7 @@ use ac_domain::tune::{recommend, Fact, Profile};
 use ac_domain::{AgentLimits, GuestMemory, State};
 use ac_fleet::Fleet;
 use ac_gateway::admin::Admin;
+use ac_gateway::backups::{self, Backups, Systemd};
 use ac_gateway::egress::EgressStore;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::notify::{self, Notify};
@@ -226,6 +227,18 @@ fn euid() -> Result<u32, String> {
     std::fs::metadata("/proc/self")
         .map(|m| m.uid())
         .map_err(|e| format!("/proc/self: {e}"))
+}
+
+/// The admin routes (ADR-031): tokens, and backups when `AC_BACKUP_DEST` names a destination.
+fn admin(file: TokenFile, keys: Keys) -> Admin {
+    let admin = Admin::new(file, keys);
+    match std::env::var_os("AC_BACKUP_DEST").filter(|d| !d.is_empty()) {
+        Some(dest) => {
+            eprintln!("ac-gateway: backups: {}", Path::new(&dest).display());
+            admin.with_backups(Backups::new(dest, Box::new(Systemd(backups::UNIT))))
+        }
+        None => admin,
+    }
 }
 
 fn tokens_file() -> Result<TokenFile, String> {
@@ -548,7 +561,7 @@ fn run() -> Result<(), String> {
     }
     let app = App::new(api, hub.clone(), keys.clone())
         .with_jobs(Arc::clone(&jobs))
-        .with_admin(Admin::new(tokens_file()?, keys.clone()))
+        .with_admin(admin(tokens_file()?, keys.clone()))
         .with_tailscale_logins(behind_serve);
     let app = Arc::new(app);
     let differ = Arc::clone(&jobs);

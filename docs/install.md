@@ -585,8 +585,8 @@ write refused past a temporary quota); `--enable-quota` enables quotas first whe
 guest a full quota is `Disk quota exceeded`; deleting files frees nothing a checkpoint still holds.
 
 **Backups** (ADR-021): `ac-ctl backup` writes each workspace as `btrfs send` stream files into a directory,
-best on another machine. Mount it at `/mnt/agent-backups` (another path: `sudo systemctl edit ac-backup.service`
-and override `ExecStart` and `RequiresMountsFor`). The share can be any filesystem; only the workspaces need btrfs,
+best on another machine. Mount it at `/mnt/agent-backups` (another path: set `AC_BACKUP_DEST` in `gateway.env`,
+then `sudo systemctl edit ac-backup.service` and override `RequiresMountsFor`). The share can be any filesystem; only the workspaces need btrfs,
 and they must be subvolumes (migrate plain ones first, as above). None of these commands opens the registry, so
 they work while the gateway runs. For example, an NFS share on Beast exported to this host only (on Beast:
 `/srv/agent-backups baileyserv(rw,sync,no_root_squash)` in `/etc/exports`; root must write it, since the streams
@@ -596,6 +596,7 @@ hold the agents' logins):
 sudo mkdir -p /mnt/agent-backups
 echo 'beast:/srv/agent-backups /mnt/agent-backups nfs4 _netdev,hard,noatime 0 0' | sudo tee -a /etc/fstab
 sudo mount /mnt/agent-backups
+sudo touch /mnt/agent-backups/.ac-backup-dest   # once, on the mounted share (see below)
 sudo ac-ctl backup /mnt/agent-backups          # a1 backed up 20261028-130512 (full, 1.2 GiB)
 sudo ac-ctl backup /mnt/agent-backups a1       # a1 backed up ... (incremental from 20261028-130512, 3.1 MiB)
 sudo ac-ctl backups /mnt/agent-backups         # a1 20261028-130512 full / a1 ... incremental from ...
@@ -606,7 +607,24 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ac-backup.timer   # 
 An SMB share works the same way (`cifs` in fstab, with a root-only credentials file). Each run sends against the
 last backup, in full every 7th (`--full-every N`), keeps the newest 7 restorable backups per agent and the streams
 they need (`--keep N`), and exits 1 if any agent was not backed up; check with `systemctl status ac-backup` or
-`journalctl -u ac-backup`. To restore, pause the agent through the gateway, then:
+`journalctl -u ac-backup`.
+
+`ac-ctl backup` refuses a destination that holds neither `.ac-backup-dest` nor a completed earlier backup: that is
+what an unmounted share looks like (its empty mount point, on the host disk). A destination that already
+holds a completed backup (a full stream, or a state copy with its manifest) but no marker (set up before the marker existed) is marked by the next run, so upgrading
+needs no step. If you pointed backups elsewhere by overriding `ExecStart` with `systemctl edit`, that
+override keeps working; to let the gateway see the same path, move it into `AC_BACKUP_DEST` and drop the
+override.
+
+With `AC_BACKUP_DEST=/mnt/agent-backups` in `gateway.env` (and a gateway restart), an `admin` token for `*` can
+also list the backups and start a run over the API (ADR-031). A run is the unit's, so it is the same as the timer's:
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/backups      # streams, state, last run
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8780/api/v1/backups   # 202, or 409 while running
+```
+
+To restore, pause the agent through the gateway, then:
 
 ```bash
 sudo ac-ctl restore-backup /mnt/agent-backups a1                   # the newest; or name one

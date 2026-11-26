@@ -39,6 +39,7 @@
 pub mod access;
 pub mod admin;
 pub mod agui;
+pub mod backups;
 pub mod bind;
 pub mod egress;
 pub mod jobs;

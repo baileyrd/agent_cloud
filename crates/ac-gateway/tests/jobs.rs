@@ -85,7 +85,8 @@ struct World {
 }
 
 #[derive(Clone, Default)]
-struct Fake(Arc<Mutex<World>>, Arc<Gate>);
+/// The world, the gate on change listings, and the gate on end snapshots.
+struct Fake(Arc<Mutex<World>>, Arc<Gate>, Arc<Gate>);
 
 /// Holds the fake's change listing until released, standing in for a `btrfs send` and dump of a
 /// job that made millions of files. Bounded, so a test that never releases it cannot hang.
@@ -117,6 +118,9 @@ impl Fake {
     }
     fn gate(&self) -> &Gate {
         &self.1
+    }
+    fn seal_gate(&self) -> &Gate {
+        &self.2
     }
     fn set(&self, job: &str, p: Probe) {
         self.w().status.insert(job.to_owned(), p);
@@ -212,6 +216,7 @@ impl Changes for Fake {
         Ok(())
     }
     fn end(&self, _: &AgentId, job: &JobId) -> Result<bool, String> {
+        self.seal_gate().pass();
         let mut w = self.w();
         w.sealed.push(job.to_string());
         Ok(w.snapshots.contains_key(job.as_str()))
@@ -969,6 +974,60 @@ fn a_purge_waits_for_no_listing_and_holds_the_agents_queue() {
     r.jobs.release(&agent("a1"));
     r.diff_all();
     assert_eq!(r.fake.w().ended, [first, other, held]);
+}
+
+/// Issue #31: a cancel takes the end snapshot on its own thread after the job's record says it
+/// ended. Until that snapshot exists the agent's next job must not start (its writes would land
+/// in the cancelled job's note) and a purge must not begin (it would delete the snapshot as it is
+/// made). Red when only the record decides, as on e1822aa.
+#[test]
+fn a_cancel_still_sealing_keeps_the_agents_next_job_and_purge_waiting() {
+    let r = Arc::new(rig());
+    let first = r.ok("a1", "x");
+    let next = r.ok("a1", "y");
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &first), "running");
+    r.fake.seal_gate().hold();
+    let canceller = {
+        let r = Arc::clone(&r);
+        let first = first.clone();
+        std::thread::spawn(move || r.json(Route::Cancel(agent("a1"), job_id(&first)), ""))
+    };
+    assert!(within_5s(|| r.state("a1", &first) == "cancelled"));
+    r.advance(60_000);
+    r.jobs.tick();
+    let waiting = r.state("a1", &next);
+    let held = r.jobs.hold(&agent("a1"));
+    r.fake.seal_gate().release();
+    let _ = canceller.join();
+    assert_eq!(waiting, "queued", "started before the end snapshot existed");
+    assert!(
+        !held,
+        "a purge began while the end snapshot was being taken"
+    );
+    r.jobs.tick();
+    assert_eq!(r.state("a1", &next), "running", "starts once sealed");
+}
+
+/// Issue #31: a job that ends while its agent is held for a purge takes no end snapshot, which
+/// the purge would race; its compare waits behind the hold instead.
+#[test]
+fn a_job_ending_during_a_purge_takes_no_end_snapshot() {
+    let r = rig();
+    let id = r.ok("a1", "x");
+    r.jobs.tick();
+    assert!(r.jobs.hold(&agent("a1")));
+    r.jobs.interrupt(&agent("a1"));
+    assert_eq!(r.state("a1", &id), "interrupted");
+    assert!(
+        r.fake.w().sealed.is_empty(),
+        "end snapshot taken under a purge"
+    );
+    r.diff_all();
+    assert!(r.fake.w().ended.is_empty(), "compare ran during the purge");
+    r.jobs.release(&agent("a1"));
+    r.diff_all();
+    assert_eq!(r.fake.w().ended, [id]);
 }
 
 /// Issue #26 follow-up: change listings take turns per agent, so an agent with many large

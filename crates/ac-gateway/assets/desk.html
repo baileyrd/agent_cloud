@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Agent desktop</title>
+<link rel="stylesheet" href="/ui/viewer.css">
+</head>
+<body>
+<header>
+  <strong id="agent"></strong>
+  <span id="status">Connecting…</span>
+  <span id="who"></span>
+  <a id="other" href="#">Terminal</a>
+  <span class="actions">
+    <button id="take" type="button">Take over</button>
+    <button id="force" type="button">Force take over</button>
+    <button id="release" type="button">Release</button>
+  </span>
+</header>
+<main id="desk" tabindex="0"><canvas id="frame"></canvas></main>
+<script src="/ui/desk.js"></script>
+</body>
+</html>

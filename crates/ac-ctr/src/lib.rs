@@ -1216,7 +1216,8 @@ mod tests {
         }
     }
 
-    /// PR #58 review: a failed task delete must not skip killing the VM or its network.
+    /// PR #58 review: a failed task delete must not skip killing the VM or detaching its network;
+    /// each is observed on its own after `ctr run`.
     #[test]
     fn a_failed_task_delete_still_kills_a_started_vm_that_got_no_limits() {
         let spawner = RunFails {
@@ -1225,7 +1226,11 @@ mod tests {
         };
         let log = Arc::clone(&spawner.log);
         let root = tmp();
-        let mut rt = CtrRuntime::new(spawner, cfg(&root));
+        let mut cfg = cfg(&root);
+        with_network(&mut cfg, &root);
+        // The namespace a started VM holds (the mocked `ip netns add` makes none).
+        let _ = std::fs::write(root.join("netns/ac-a1"), "");
+        let mut rt = CtrRuntime::new(spawner, cfg);
         rt.cfg.limits.memory_mib = Some(2560);
         let err = rt.create(&id(), &Boot::default()).err();
         let cause = err.map(|e| e.cause).unwrap_or_default();
@@ -1237,8 +1242,16 @@ mod tests {
             progs
                 .get(after..)
                 .is_some_and(|p| p.iter().any(|p| p == "pkill")),
-            "{progs:?}"
+            "VM not killed: {progs:?}"
         );
+        let del =
+            (after..progs.len()).any(|i| env_of(&log, i, "CNI_COMMAND").as_deref() == Some("DEL"));
+        assert!(del, "network not detached: {progs:?}");
+        let ns_del = argv(&log).get(after..).is_some_and(|a| {
+            a.iter()
+                .any(|a| a.windows(2).any(|w| w == ["netns", "del"]))
+        });
+        assert!(ns_del, "namespace not deleted: {:?}", argv(&log));
         let _ = std::fs::remove_dir_all(root);
     }
 

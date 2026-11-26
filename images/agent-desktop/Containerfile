@@ -13,11 +13,17 @@ RUN env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
         adwaita-icon-theme dejavu-sans-fonts dejavu-sans-mono-fonts liberation-fonts \
         chromium \
         ffmpeg-free xdotool \
-    && dnf clean all
+    && dnf clean all \
+    && rm -rf /home/agent/.cache
+# (dnf runs as root with HOME=/home/agent and leaves a root-owned ~/.cache, where Chromium then cannot
+# create its profile cache.)
 
 # Xorg runs as the agent (Fedora's Xorg is not setuid; the dummy driver needs no devices). The X socket
 # directory must exist, sticky and root-owned, before an unprivileged server starts.
 RUN install -d -m 1777 /tmp/.X11-unix
+# Fedora's chromium package installs only /usr/bin/chromium-browser; jobs, docs and the smoke test call
+# `chromium`.
+RUN ln -s chromium-browser /usr/bin/chromium
 COPY xorg.conf /etc/agent-desktop/xorg.conf
 # Chromium reads every file in this directory; root-owned, so the agent cannot loosen it.
 COPY chromium-policy.json /etc/chromium/policies/managed/agent.json

@@ -106,7 +106,8 @@ pub trait Busy: Send + Sync {
     fn settle(&self, _: &AgentId) {}
     /// The agent is about to be purged, which deletes its job snapshots: hold its jobs' change
     /// compares (ADR-019) until [`Busy::release`]. `false`, holding nothing, while one of them
-    /// runs, since deleting a snapshot that `btrfs send` reads fails.
+    /// runs, since deleting a snapshot that `btrfs send` reads fails, or while a job's end
+    /// snapshot is being taken (#31).
     fn hold(&self, _: &AgentId) -> bool {
         true
     }

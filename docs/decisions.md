@@ -1567,3 +1567,9 @@ the workspace now or a picked checkpoint. Forking with egress profiles is left t
 **Addendum (2026-11-25, slice 4):** capacity is one line above the agents list, read with the list: room for
 more agents, running agents, `/dev/shm` free and total, guest size, and job slots when the job runner is on.
 It is hidden when the call fails. A job's own queued reason shows on the jobs page (slice 2).
+
+**Addendum (2026-11-25, slice 5):** the agent page's egress section lists the operator's profiles (`GET
+/api/v1/egress/profiles`) as checkboxes, ticked where attached, with each one's host count, `exclusive`, or its
+load error (such a profile cannot be picked). It shows the agent's effective host count and any attached
+profile that no longer exists. With `egress:write`, **Save profiles** sends `PUT .../egress` with the ticked
+names. Profiles are edited on the host, not here: the API has no route to change one (ADR-016).

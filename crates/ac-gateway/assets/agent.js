@@ -1,6 +1,8 @@
 // One agent's page (ADR-030 slice 3, #516): its state, and its workspace checkpoints (ADR-018):
 // make one, delete one, restore one onto the paused agent, and fork a new agent from the workspace
-// now or from a checkpoint. Controls the token's scopes cannot use are hidden.
+// now or from a checkpoint; with slice 5, its egress profiles (ADR-016): which are attached, how
+// many hosts that lets it reach, and (with egress:write) replacing them. Controls the token's
+// scopes cannot use are hidden or disabled.
 (() => {
   'use strict';
 
@@ -11,6 +13,8 @@
 
   // The agent as last read: restore needs it paused.
   let state = '';
+  // The egress checkboxes as last drawn.
+  let boxes = [];
 
   function note(text, bad = false) {
     $('note').textContent = text;
@@ -72,6 +76,48 @@
     $('count').textContent = `${r.data.checkpoints.length} of ${r.data.max}`;
     $('from').replaceChildren(...choices(r.data.checkpoints));
     $('restore-hint').hidden = state === 'paused' || !may('agents:write');
+    await egress();
+  }
+
+  // One checkbox per operator profile, ticked if attached. A profile that failed to load is shown
+  // with its error and cannot be picked.
+  function profileBox(p, attached) {
+    const box = el('input', undefined, {
+      type: 'checkbox',
+      value: p.name,
+      checked: attached.includes(p.name),
+      disabled: !may('egress:write') || p.error !== undefined,
+    });
+    const detail = p.error !== undefined
+      ? `error: ${p.error}`
+      : `${p.hosts} host${p.hosts === 1 ? '' : 's'}${p.exclusive ? ', exclusive' : ''}`;
+    boxes.push(box);
+    const label = el('label');
+    label.append(box, el('span', ` ${p.name} (${detail})`));
+    return label;
+  }
+
+  async function egress() {
+    const mine = await api('GET', '/api/v1/agents/{id}/egress', ids);
+    const all = await api('GET', '/api/v1/egress/profiles');
+    if (!mine.ok || !all.ok) {
+      $('egress-state').textContent = `Egress: ${errorText(mine.ok ? all : mine)}`;
+      $('profiles').replaceChildren();
+      $('egress').hidden = true;
+      return;
+    }
+    const missing = mine.data.missing?.length ? ` · missing: ${mine.data.missing.join(', ')}` : '';
+    $('egress-state').textContent = `Reaches ${mine.data.effective_hosts} hosts${missing}`;
+    boxes = [];
+    $('profiles').replaceChildren(...all.data.profiles.map((p) => profileBox(p, mine.data.profiles)));
+    $('egress').hidden = false;
+    $('save-egress').hidden = !may('egress:write');
+  }
+
+  async function saveEgress(event) {
+    event.preventDefault();
+    const profiles = boxes.filter((b) => b.checked).map((b) => b.value);
+    await change('Egress', () => api('PUT', '/api/v1/agents/{id}/egress', ids, { body: { profiles } }));
   }
 
   async function checkpoint(event) {
@@ -106,6 +152,7 @@
     for (const id of ['checkpoint', 'fork']) $(id).hidden = !may('agents:write');
     $('checkpoint').addEventListener('submit', checkpoint);
     $('fork').addEventListener('submit', fork);
+    $('egress').addEventListener('submit', saveEgress);
     $('refresh').addEventListener('click', refresh);
     await refresh();
   }

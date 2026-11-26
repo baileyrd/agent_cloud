@@ -4,7 +4,8 @@
 Chromium under a managed policy. Everything runs as `agent` (uid 1000, no sudo); `tini` stays PID 1. Its main
 process, `desktop-session`, keeps Xorg and Xfce running and restarts either one if it exits. `DISPLAY=:0` is
 in the image's environment, so a job or the terminal viewer's tmux can start `chromium` and it opens on the
-desktop. Watching the desktop from a browser is #473 (ADR-006, open part).
+desktop. The gateway's desktop stream (ADR-006, desktop addendum) uses the image's `ffmpeg` (frames) and
+`xdotool` (take-over input): open `https://<gateway>/ui/desk/<agent>`.
 
 ## Build and load (on the host)
 

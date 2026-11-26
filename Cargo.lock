@@ -73,6 +73,7 @@ dependencies = [
  "platform-mock",
  "rusty_agui",
  "rusty_atomic_file",
+ "rusty_base64",
  "rusty_crypto_key",
  "rusty_http",
  "rusty_json",

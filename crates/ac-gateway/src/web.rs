@@ -1,6 +1,6 @@
-//! The whole HTTP surface, in order: the Origin check (every request), the viewer page and its
-//! script and style (no data in them, so no token: a browser cannot send a header when it
-//! navigates), then under `/api/`: the token, the route's scope and agents ([`access`]), and the
+//! The whole HTTP surface, in order: the Origin check (every request), the viewer pages (terminal
+//! and desktop) and their scripts and style (no data in them, so no token: a browser cannot send a
+//! header when it navigates), then under `/api/`: the token, the route's scope and agents ([`access`]), and the
 //! viewer, job, lifecycle or MCP handler; an MCP tool call goes through the same checks as the
 //! route it names ([`mcp`]). State-changing calls are audited: one line in the gateway's
 //! log and one event in the agent's history, with the token's name, never the token.
@@ -40,6 +40,8 @@ const LOGIN_MAX: usize = 256;
 const PAGE: &str = include_str!("../assets/viewer.html");
 const SCRIPT: &str = include_str!("../assets/viewer.js");
 const STYLE: &str = include_str!("../assets/viewer.css");
+const DESK_PAGE: &str = include_str!("../assets/desk.html");
+const DESK_SCRIPT: &str = include_str!("../assets/desk.js");
 /// The management pages (ADR-030): shared script and style, then one page per slice.
 const UI_SCRIPT: &str = include_str!("../assets/ui.js");
 const UI_STYLE: &str = include_str!("../assets/ui.css");
@@ -521,11 +523,18 @@ fn asset(method: &str, path: &str) -> Option<Response> {
         "ui.js" => (UI_SCRIPT, JS),
         "ui.css" => (UI_STYLE, CSS),
         "agents.js" => (AGENTS_SCRIPT, JS),
+        "desk.js" => (DESK_SCRIPT, JS),
         "jobs.js" => (JOBS_SCRIPT, JS),
         "agent.js" => (AGENT_SCRIPT, JS),
         page if agent_page(page, "jobs/") => (JOBS_PAGE, "text/html; charset=utf-8"),
         page if agent_page(page, "agent/") => (AGENT_PAGE, "text/html; charset=utf-8"),
         id if ac_domain::AgentId::parse(id).is_ok() => (PAGE, "text/html; charset=utf-8"),
+        desk if desk
+            .strip_prefix("desk/")
+            .is_some_and(|id| ac_domain::AgentId::parse(id).is_ok()) =>
+        {
+            (DESK_PAGE, "text/html; charset=utf-8")
+        }
         _ => return Some(json(error(404, "not found"))),
     };
     Some(with(

@@ -1,4 +1,5 @@
-# Desktop agent image: agent-shell plus an Xorg dummy display, Xfce and policy-locked Chromium.
+# Desktop agent image: agent-shell plus an Xorg dummy display, Xfce and policy-locked Chromium, and
+# ffmpeg and xdotool for the gateway's desktop stream (ADR-006, desktop addendum).
 # Build agent-shell first (scripts/build-images.sh does both and imports them into containerd).
 ARG BASE=localhost/agent-shell:dev
 FROM ${BASE}
@@ -11,6 +12,7 @@ RUN env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
         xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-settings xfce4-terminal dbus-x11 \
         adwaita-icon-theme dejavu-sans-fonts dejavu-sans-mono-fonts liberation-fonts \
         chromium \
+        ffmpeg-free xdotool \
     && dnf clean all
 
 # Xorg runs as the agent (Fedora's Xorg is not setuid; the dummy driver needs no devices). The X socket

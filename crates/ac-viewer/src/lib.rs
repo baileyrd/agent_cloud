@@ -1,9 +1,11 @@
 //! The terminal viewer without I/O (ADR-006): parsing tmux control mode, turning `capture-pane`
 //! output into sanitised styled runs (SGR only; every other escape is dropped here, before
 //! anything reaches a browser), diffing snapshots, building tmux input commands, the viewer
-//! registry with its take-over lock, the window list, and the recording format.
+//! registry with its take-over lock, the window list, and the recording format; the desktop
+//! viewer's frame splitter and input commands ([`desk`]).
 
 pub mod control;
+pub mod desk;
 pub mod input;
 pub mod json;
 pub mod record;

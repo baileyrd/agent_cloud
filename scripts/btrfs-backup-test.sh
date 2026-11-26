@@ -107,7 +107,8 @@ expect 'plain directory' ac backup "$dest" plain
 expect 'no such backup' ac restore-backup "$dest" a1 20000101-000000
 expect 'holds no backups' ac backup "$tmp/nowhere" a1
 expect 'no such backup of agent b9' ac restore-backup "$dest" b9
-# A destination set up before the marker, holding backups, is marked on its next run.
+# A destination set up before the marker, holding a completed backup, is marked on its next run.
+ac --full-every 1 backup "$dest" a1 >/dev/null
 rm "$dest/.ac-backup-dest"
 ac backup "$dest" a1 | grep -q '^marked .* as a backup destination$' || fail "an unmarked destination with backups is marked"
 [ -f "$dest/.ac-backup-dest" ] || fail "the marker is written"

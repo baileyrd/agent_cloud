@@ -14,9 +14,11 @@ RUN env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
         chromium \
         ffmpeg-free xdotool \
     && dnf clean all \
-    && rm -rf /home/agent/.cache
+    && rm -rf /home/agent/.cache \
+    && rm -f /etc/xdg/autostart/xfce-polkit.desktop
 # (dnf runs as root with HOME=/home/agent and leaves a root-owned ~/.cache, where Chromium then cannot
-# create its profile cache.)
+# create its profile cache.) xfce-polkit's autostart is removed: the guest has no system D-Bus, so it
+# only fails and leaves an error dialog on the desktop.
 
 # Xorg runs as the agent (Fedora's Xorg is not setuid; the dummy driver needs no devices). The X socket
 # directory must exist, sticky and root-owned, before an unprivileged server starts.

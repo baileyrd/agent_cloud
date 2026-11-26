@@ -1,11 +1,13 @@
 // The admin page (ADR-031, #516): API tokens and backups, for a token with admin for every agent.
 // Any other token is told so and sees nothing: the gateway answers 404 to it on these routes anyway.
-// A new token's secret is shown once and dropped from the page at the next action.
+// A new token's secret is shown once and dropped from the page at the next action that goes ahead
+// (a cancelled confirm keeps it).
 (() => {
   'use strict';
 
   const { api, signIn, may, el, errorText } = window.UI;
   const $ = (id) => document.getElementById(id);
+  let me = ''; // the signed-in token's name
   const SCOPES = [
     'agents:read', 'agents:write', 'jobs:read', 'jobs:write',
     'viewer:read', 'viewer:control', 'egress:write', 'admin',
@@ -58,6 +60,7 @@
   async function tokens() {
     const r = await api('GET', '/api/v1/tokens');
     if (!r.ok) {
+      $('tokens').replaceChildren();
       note(`Tokens: ${errorText(r)}`, true);
       return;
     }
@@ -65,8 +68,9 @@
   }
 
   async function revoke(name) {
+    const own = name === me ? ' It is the token this page signed in with: the page stops working too.' : '';
+    if (!window.confirm(`Revoke token ${name}? Anything using it stops working at once.${own}`)) return;
     forget();
-    if (!window.confirm(`Revoke token ${name}? Anything using it stops working at once.`)) return;
     const r = await api('DELETE', '/api/v1/tokens/{name}', { name });
     note(r.ok ? `Revoked ${name}.` : `Revoke ${name}: ${errorText(r)}`, !r.ok);
     await tokens();
@@ -143,6 +147,7 @@
       return;
     }
     const states = await api('GET', '/api/v1/agents');
+    if (!states.ok) note(`Agents: ${errorText(states)}: no restore is offered until they list.`, true);
     const paused = new Set((states.ok ? states.data.agents : [])
       .filter((a) => a.state === 'paused').map((a) => a.id));
     $('run').textContent = runText(r.data.run);
@@ -161,9 +166,9 @@
   }
 
   async function restore(id, backup) {
-    forget();
     const ask = `Restore ${id} from backup ${backup}? Its workspace is kept as a checkpoint first.`;
     if (!window.confirm(ask)) return;
+    forget();
     note(`Restoring ${id} from ${backup}: this takes as long as the transfer…`);
     const r = await api('POST', '/api/v1/agents/{id}/restore-backup', { id }, { body: { backup } });
     const kept = r.ok && r.data.kept ? ` The old workspace is checkpoint ${r.data.kept}.` : '';
@@ -191,6 +196,7 @@
       note('No token. Reload to try again.', true);
       return;
     }
+    me = who.name;
     $('who').textContent = `${who.name} (${who.scopes.join(', ')})`;
     if (!may('admin') || who.agents !== '*') {
       note('This page needs a token with admin for every agent.', true);
@@ -198,6 +204,7 @@
     }
     $('scopes').replaceChildren(...scopeBoxes());
     $('admin').hidden = false;
+    $('refresh').hidden = false;
     $('create').addEventListener('submit', create);
     $('copy').addEventListener('click', copy);
     $('back-up').addEventListener('click', backUp);

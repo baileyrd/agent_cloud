@@ -216,3 +216,76 @@ test('restore is confirmed and names the backup', async () => {
   assert.deepEqual(JSON.parse(sent[0].body), { backup: '20261126-033000' });
   assert.equal(els.note.textContent, 'Restored a1 from 20261126-033000. The old workspace is checkpoint 20261126-120000.');
 });
+
+// A created secret, shown; `els` and `sent` of a page that has one.
+async function withSecret(opts = {}) {
+  const page = await load({
+    ...opts,
+    answers: { 'POST /api/v1/tokens/x': [[201, { name: 'x', token: SECRET }]], ...opts.answers },
+  });
+  page.els['new-name'].value = 'x';
+  page.els['new-agents'].value = '*';
+  page.els['scope-admin'].checked = true;
+  await submit(page.els);
+  assert.equal(page.els['secret-text'].textContent, SECRET);
+  return page;
+}
+
+test('cancelling revoke or restore keeps a new secret; going ahead drops it', async () => {
+  let answer = false;
+  const { els, sent } = await withSecret({ confirm: () => answer });
+  sent.length = 0;
+  await els.tokens.children[0].children[5].children[0].onclick();
+  await els.streams.children[0].children[4].children[0].onclick();
+  assert.deepEqual(sent, []);
+  assert.equal(els.secret.hidden, false);
+  assert.equal(els['secret-text'].textContent, SECRET, 'still there to copy');
+  answer = true;
+  await els.tokens.children[0].children[5].children[0].onclick();
+  assert.equal(els['secret-text'].textContent, '');
+});
+
+test('revoking the signed-in token says so in the confirm', async () => {
+  const asked = [];
+  const { els } = await load({
+    confirm: (q) => { asked.push(q); return false; },
+    answers: { 'GET /api/v1/tokens': [[200, { tokens: [{ ...TOKENS.tokens[0], name: 'ops' }, TOKENS.tokens[1]] }]] },
+  });
+  await els.tokens.children[0].children[5].children[0].onclick();
+  await els.tokens.children[1].children[5].children[0].onclick();
+  assert.match(asked[0], /this page signed in with/);
+  assert.doesNotMatch(asked[1], /this page signed in with/);
+});
+
+test('a refused create or restore is shown and sends nothing more', async () => {
+  const { els } = await load({
+    answers: {
+      'POST /api/v1/tokens/x': [[403, { error: 'token ops expires at 1764201600: a token it creates must expire no later' }]],
+      'POST /api/v1/agents/a1/restore-backup': [[409, { error: 'agent a1 has a running VM' }]],
+    },
+  });
+  els['new-name'].value = 'x';
+  els['new-agents'].value = '*';
+  els['scope-admin'].checked = true;
+  await submit(els);
+  assert.match(els.note.textContent, /must expire no later/);
+  assert.equal(els.secret.hidden, true);
+  await els.streams.children[0].children[4].children[0].onclick();
+  assert.match(els.note.textContent, /^Restore a1: .*running VM/);
+  assert.equal(els.note.className, 'bad');
+});
+
+test('a failed token list clears the table; a failed agent list offers no restore and says why', async () => {
+  const { els } = await load({
+    answers: {
+      'GET /api/v1/tokens': [[200, TOKENS], [500, { error: 'tokens file unreadable' }]],
+      'GET /api/v1/agents': [[200, AGENTS], [503, { error: 'store down' }]],
+    },
+  });
+  assert.equal(els.tokens.children.length, 2);
+  assert.equal(els.refresh.hidden, false);
+  await els.refresh.handlers.click();
+  assert.equal(els.tokens.children.length, 0);
+  assert.match(els.note.textContent, /^Agents: .*no restore/);
+  assert.deepEqual(rows(els.streams).map((r) => r[4]), ['', '', 'chain broken']);
+});

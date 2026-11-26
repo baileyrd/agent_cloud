@@ -22,6 +22,11 @@ const LOCK: &str = "backup.lock";
 /// The unit that runs backups.
 pub const UNIT: &str = "ac-backup.service";
 
+/// A file the operator puts at the destination once. A share that is not mounted leaves its empty
+/// mount point, which lacks it, so neither the unit nor the gateway mistakes the host disk for the
+/// share.
+pub const MARKER: &str = ".ac-backup-dest";
+
 /// The unit as systemd knows it.
 pub trait Unit: Send + Sync {
     /// `Key=value` lines of `systemctl show`, timestamps as `@<unix seconds>`.
@@ -322,14 +327,15 @@ impl Backups {
         self.unit.show().map(|text| Run::parse(&text))
     }
 
-    /// 503 unless the destination is a directory (the share may not be mounted).
+    /// 503 unless the destination holds [`MARKER`] (the share may not be mounted).
     fn present(&self) -> Result<(), Reply> {
-        match self.dest.is_dir() {
+        match self.dest.join(MARKER).is_file() {
             true => Ok(()),
             false => Err(error(
                 503,
                 &format!(
-                    "backup destination {} is not there (is the share mounted?)",
+                    "backup destination {} has no {MARKER}: is the share mounted? (create the file \
+                     there once it is)",
                     self.dest.display()
                 ),
             )),
@@ -509,6 +515,11 @@ mod tests {
         std::fs::write(path, vec![0u8; bytes]).unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// The destination, mounted: the directory and its marker.
+    fn mount(dest: &Path) {
+        touch(&dest.join(MARKER), 0);
+    }
+
     #[test]
     fn run_from_systemctl_show() {
         let run = Run::parse(IDLE);
@@ -531,6 +542,7 @@ mod tests {
     #[test]
     fn lists_streams_state_and_the_last_run() {
         let (b, _, dest) = backups(IDLE);
+        mount(&dest);
         let a1 = dest.join("a1");
         touch(&a1.join("20261124-033000.full.btrfs"), 5);
         touch(&a1.join("20261125-033000.after-20261124-033000.btrfs"), 2);
@@ -563,10 +575,12 @@ mod tests {
     fn start_unless_running() {
         let (b, starts, dest) = backups(IDLE);
         std::fs::create_dir_all(&dest).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(b.start().status, 503, "an empty mount point");
+        mount(&dest);
         assert_eq!(b.start().status, 202);
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         let (busy, starts, dest2) = backups("ActiveState=activating\n");
-        std::fs::create_dir_all(&dest2).unwrap_or_else(|e| panic!("{e}"));
+        mount(&dest2);
         assert_eq!(busy.start().status, 409);
         assert_eq!(starts.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(dest);
@@ -580,6 +594,7 @@ mod tests {
     #[test]
     fn restore_picks_the_newest_restorable_or_the_one_named() {
         let ((b, _, dest), asked) = backups_with(IDLE, kept);
+        mount(&dest);
         let a1 = dest.join("a1");
         touch(&a1.join("20261124-033000.full.btrfs"), 1);
         touch(&a1.join("20261125-033000.after-20261124-033000.btrfs"), 1);
@@ -621,12 +636,14 @@ mod tests {
             503,
             "no destination"
         );
+        mount(&dest);
         touch(&dest.join("a1/20261124-033000.full.btrfs"), 1);
         let d = b.restore(&agent("a1"), None);
         assert_eq!(d.reply.status, 409, "{}", d.reply.body);
         assert_eq!(d.audit, " backup=20261124-033000");
         let failed = || Err(RestoreError::Failed("btrfs receive: no space".into()));
         let ((b, _, dest2), _) = backups_with(IDLE, failed);
+        mount(&dest2);
         touch(&dest2.join("a1/20261124-033000.full.btrfs"), 1);
         assert_eq!(b.restore(&agent("a1"), None).reply.status, 500);
         let _ = std::fs::remove_dir_all(dest);

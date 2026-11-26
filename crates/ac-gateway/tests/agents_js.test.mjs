@@ -61,7 +61,8 @@ const AGENTS = {
     { id: 'c3', state: 'destroyed' },
   ],
 };
-const cells = (els) => els.rows.children.map((tr) => tr.children.map((td) => td.textContent));
+const text = (td) => td.textContent || td.children.map((c) => c.textContent).join('');
+const cells = (els) => els.rows.children.map((tr) => tr.children.map(text));
 const buttons = (els, row) => els.rows.children[row].children[3].children;
 const labels = (els) => els.rows.children.map((_, i) => buttons(els, i).map((b) => b.textContent));
 
@@ -75,6 +76,7 @@ test('lists the agents with the actions each state allows', async () => {
   assert.deepEqual(labels(els), [['Pause', 'Destroy', 'Purge'], ['Resume', 'Destroy', 'Purge'], ['Purge']]);
   assert.equal(els.create.hidden, false);
   assert.equal(els.empty.hidden, true);
+  assert.equal(els.rows.children[0].children[0].children[0].href, '/ui/jobs/a1');
 });
 
 test('a read-only token sees the list without any controls', async () => {

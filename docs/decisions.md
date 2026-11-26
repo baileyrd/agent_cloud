@@ -1651,7 +1651,8 @@ for the most trusted token only, and the gateway's existing code does the work.
     The receive itself runs without the lifecycle lock. The request lasts as long as the receive. It is audited to the agent's history as `restore-backup backup=<id>`.
   - *Not over the API:* `restore-state` needs the gateway stopped, so it stays on the CLI. Deleting backups is
     left to retention. The destination is not changed from the page.
-- *Page:* `/ui/admin`, linked from the agents page only for an admin token for `*`. It is static, like
+- *Page:* `/ui/admin/` (with the slash: `/ui/<segment>` is an agent's viewer, and `admin` is a valid agent id),
+  linked from the agents page only for an admin token for `*`. It is static, like
   ADR-030's pages, and covered by the same catalog test.
   - *Tokens:* a table with **Revoke** (confirmed first) and a create form (name, scope checkboxes, agents,
     lifetime). The page suggests a 30-day lifetime and lets you clear it. The new secret is shown once, in a

@@ -170,3 +170,10 @@ test('create sends the id URL-encoded and shows the gateway refusal', async () =
   assert.equal(els.note.textContent, 'Create a/b: invalid agent id');
   assert.equal(els.note.className, 'bad');
 });
+
+test('the admin link shows only for admin on every agent', async () => {
+  const admin = await load({ scopes: ['admin'], answers: { 'GET /api/v1/agents': [[200, AGENTS]] } });
+  assert.equal(admin.els.admin.hidden, false);
+  const reader = await load({ scopes: ['agents:read'], answers: { 'GET /api/v1/agents': [[200, AGENTS]] } });
+  assert.equal(reader.els.admin.hidden, true);
+});

@@ -110,6 +110,12 @@ pub const ROUTES: &[Rule] = &[
     rule("DELETE", "/api/v1/tokens/{name}", Need::Host, Some("token-revoke")),
     rule("GET", "/api/v1/backups", Need::Host, None),
     rule("POST", "/api/v1/backups", Need::Host, Some("backup-run")),
+    rule(
+        "POST",
+        "/api/v1/agents/{id}/restore-backup",
+        Need::Host,
+        Some("restore-backup"),
+    ),
     offer(rule("GET", "/api/v1/whoami", Need::Token, None), Tool {
         name: "whoami",
         about: "The calling token's name, scopes, agents and expiry (Unix seconds, or null).",
@@ -650,12 +656,13 @@ mod tests {
             ("DELETE", "/api/v1/tokens/ci", Need::Host),
             ("GET", "/api/v1/backups", Need::Host),
             ("POST", "/api/v1/backups", Need::Host),
+            ("POST", "/api/v1/agents/a1/restore-backup", Need::Host),
         ] {
             assert_eq!(need(method, path), Some(want), "{method} {path}");
         }
         assert_eq!(
             ROUTES.len(),
-            44,
+            45,
             "a new route needs a row above and in ADR-011"
         );
     }

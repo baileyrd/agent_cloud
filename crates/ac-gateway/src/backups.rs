@@ -1,15 +1,23 @@
-//! Backups over the API (ADR-031): what is at the destination and the backup unit's last run, and
-//! a run started through the unit. The gateway only reads the destination; a run is always
+//! Backups over the API (ADR-031): what is at the destination and the backup unit's last run, a
+//! run started through the unit, and a paused agent restored from one. A run is always
 //! `ac-backup.service`'s (its nice, I/O class, sandbox and one run at a time), never a send of
-//! the gateway's own.
+//! the gateway's own; a restore is ADR-021's, under the same `backup.lock` as `ac-ctl`.
 
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ac_ctr::CtrRuntime;
 use ac_domain::backup::{self, BackupId, Stream};
-use ac_domain::{state, AgentId};
+use ac_domain::{state, AgentId, CheckpointId};
+use ac_ports::Snapshots;
+use platform::process::Spawner;
 
-use crate::{error, escape, Reply};
+use crate::admin::Done;
+use crate::{error, escape, members, Hold, Reply};
+
+/// The lock a backup and a restore hold against each other, in the data directory (`ac-ctl`'s).
+const LOCK: &str = "backup.lock";
 
 /// The unit that runs backups.
 pub const UNIT: &str = "ac-backup.service";
@@ -101,6 +109,103 @@ impl Run {
     }
 }
 
+/// Why a restore did not happen.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreError {
+    /// Refused as it stands (a run holds the lock, a plain-directory workspace): 409.
+    Refused(String),
+    /// It failed: 500.
+    Failed(String),
+}
+
+/// Puts a backup in place of a held agent's workspace.
+pub trait Restorer: Send + Sync {
+    /// Restore backup `b` of `id` from `dest`; the checkpoint that keeps the replaced workspace,
+    /// `None` if there was none.
+    fn restore(
+        &self,
+        dest: &Path,
+        id: &AgentId,
+        b: &BackupId,
+    ) -> Result<Option<CheckpointId>, RestoreError>;
+}
+
+/// [`Restorer`] through the runtime, under `<data>/backup.lock`.
+pub struct HostRestorer<S> {
+    rt: CtrRuntime<S>,
+    data: PathBuf,
+}
+
+impl<S> HostRestorer<S> {
+    /// Restore with `rt`, locking in `data`.
+    pub fn new(rt: CtrRuntime<S>, data: impl Into<PathBuf>) -> Self {
+        Self {
+            rt,
+            data: data.into(),
+        }
+    }
+}
+
+impl<S: Spawner + Send + Sync> Restorer for HostRestorer<S> {
+    fn restore(
+        &self,
+        dest: &Path,
+        id: &AgentId,
+        b: &BackupId,
+    ) -> Result<Option<CheckpointId>, RestoreError> {
+        let _held = lock(&self.data)?;
+        let volume = self
+            .rt
+            .volume(id)
+            .map_err(|e| RestoreError::Failed(e.to_string()))?;
+        backup::check_restore(id, false, volume)
+            .map_err(|e| RestoreError::Refused(e.to_string()))?;
+        self.rt
+            .restore_backup(dest, id, b)
+            .map_err(|e| RestoreError::Failed(e.to_string()))
+    }
+}
+
+/// `ac-ctl`'s lock: an OS file lock on `<data>/backup.lock`, released when the file closes.
+fn lock(data: &Path) -> Result<File, RestoreError> {
+    let path = data.join(LOCK);
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| RestoreError::Failed(format!("{}: {e}", path.display())))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(RestoreError::Refused(
+            "a backup or another restore is running".into(),
+        )),
+        Err(TryLockError::Error(e)) => Err(RestoreError::Failed(format!(
+            "lock {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// The backup a restore body names: `{"backup": "<id>"}`, or `None` (empty body or no member)
+/// for the newest restorable.
+pub fn wanted(body: &[u8]) -> Result<Option<BackupId>, Reply> {
+    let Some(value) = members(body, &["backup"])? else {
+        return Ok(None);
+    };
+    match value.get("backup") {
+        None => Ok(None),
+        Some(v) => {
+            let text = v
+                .as_str()
+                .ok_or_else(|| error(400, "backup must be a string"))?;
+            BackupId::parse(text)
+                .map(Some)
+                .map_err(|e| error(400, &format!("backup: {e}")))
+        }
+    }
+}
+
 /// One stream file at the destination.
 #[derive(Debug, PartialEq, Eq)]
 struct Item {
@@ -112,15 +217,49 @@ struct Item {
 pub struct Backups {
     dest: PathBuf,
     unit: Box<dyn Unit>,
+    restorer: Box<dyn Restorer>,
 }
 
 impl Backups {
-    /// Read `dest`; start runs through `unit`.
-    pub fn new(dest: impl Into<PathBuf>, unit: Box<dyn Unit>) -> Self {
+    /// Read `dest`; start runs through `unit`; restore through `restorer`.
+    pub fn new(dest: impl Into<PathBuf>, unit: Box<dyn Unit>, restorer: Box<dyn Restorer>) -> Self {
         Self {
             dest: dest.into(),
             unit,
+            restorer,
         }
+    }
+
+    /// Restore the held agent from backup `wanted`, or its newest restorable: 200
+    /// `{"id","restored","kept"}`; 404 without such a backup, 409 refused, 503 without the
+    /// destination. The audit adds ` backup=<id>` once one is picked.
+    pub fn restore(&self, hold: &Hold, wanted: Option<&BackupId>) -> Done {
+        let id = hold.id();
+        let done = |reply, audit: String| Done { reply, audit };
+        if let Err(reply) = self.present() {
+            return done(reply, String::new());
+        }
+        let streams: Vec<Stream> = match items(&self.dest.join(id.as_str())) {
+            Ok(items) => items.into_iter().map(|i| i.stream).collect(),
+            Err(e) => return done(failed(&e), String::new()),
+        };
+        let all = backup::restorable(&streams);
+        let b = match backup::pick(id, &all, wanted) {
+            Ok(b) => b,
+            Err(e) => return done(error(404, &e.to_string()), String::new()),
+        };
+        let reply = match self.restorer.restore(&self.dest, id, b) {
+            Ok(kept) => Reply {
+                status: 200,
+                body: format!(
+                    r#"{{"id":"{id}","restored":"{b}","kept":{}}}"#,
+                    kept.map_or_else(|| "null".to_owned(), |k| format!(r#""{k}""#))
+                ),
+            },
+            Err(RestoreError::Refused(e)) => error(409, &e),
+            Err(RestoreError::Failed(e)) => failed(&e),
+        };
+        done(reply, format!(" backup={b}"))
     }
 
     /// The destination.
@@ -309,7 +448,42 @@ mod tests {
     const IDLE: &str = "ActiveState=inactive\nResult=success\n\
         ExecMainStartTimestamp=@1764127800\nExecMainExitTimestamp=@1764127860\n";
 
+    /// Restores nothing; records what it was asked, and answers `answer`.
+    struct FakeRestorer {
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+        answer: fn() -> Result<Option<CheckpointId>, RestoreError>,
+    }
+
+    impl Restorer for FakeRestorer {
+        fn restore(
+            &self,
+            _: &Path,
+            id: &AgentId,
+            b: &BackupId,
+        ) -> Result<Option<CheckpointId>, RestoreError> {
+            if let Ok(mut asked) = self.asked.lock() {
+                asked.push(format!("{id} {b}"));
+            }
+            (self.answer)()
+        }
+    }
+
+    fn kept() -> Result<Option<CheckpointId>, RestoreError> {
+        Ok(CheckpointId::parse("20261126-120000").ok())
+    }
+
     fn backups(show: &'static str) -> (Backups, Arc<AtomicUsize>, PathBuf) {
+        backups_with(show, kept).0
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn backups_with(
+        show: &'static str,
+        answer: fn() -> Result<Option<CheckpointId>, RestoreError>,
+    ) -> (
+        (Backups, Arc<AtomicUsize>, PathBuf),
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let dest = std::env::temp_dir().join(format!(
             "ac-backups-{}-{}",
             std::process::id(),
@@ -320,7 +494,12 @@ mod tests {
             show,
             starts: Arc::clone(&starts),
         });
-        (Backups::new(&dest, unit), starts, dest)
+        let asked = Arc::default();
+        let restorer = Box::new(FakeRestorer {
+            asked: Arc::clone(&asked),
+            answer,
+        });
+        ((Backups::new(&dest, unit, restorer), starts, dest), asked)
     }
 
     fn touch(path: &Path, bytes: usize) {
@@ -392,5 +571,99 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(dest);
         let _ = std::fs::remove_dir_all(dest2);
+    }
+
+    fn agent(id: &str) -> Hold {
+        Hold::detached(AgentId::parse(id).unwrap_or_else(|e| panic!("{e}")))
+    }
+
+    #[test]
+    fn restore_picks_the_newest_restorable_or_the_one_named() {
+        let ((b, _, dest), asked) = backups_with(IDLE, kept);
+        let a1 = dest.join("a1");
+        touch(&a1.join("20261124-033000.full.btrfs"), 1);
+        touch(&a1.join("20261125-033000.after-20261124-033000.btrfs"), 1);
+        touch(&a1.join("20261126-033000.after-20261120-033000.btrfs"), 1);
+        let d = b.restore(&agent("a1"), None);
+        assert_eq!(
+            (d.reply.status, d.reply.body.as_str(), d.audit.as_str()),
+            (
+                200,
+                r#"{"id":"a1","restored":"20261125-033000","kept":"20261126-120000"}"#,
+                " backup=20261125-033000"
+            ),
+            "the broken chain is skipped"
+        );
+        let first = BackupId::parse("20261124-033000").ok();
+        assert_eq!(b.restore(&agent("a1"), first.as_ref()).reply.status, 200);
+        let broken = BackupId::parse("20261126-033000").ok();
+        assert_eq!(b.restore(&agent("a1"), broken.as_ref()).reply.status, 404);
+        assert_eq!(
+            b.restore(&agent("a2"), None).reply.status,
+            404,
+            "no backups"
+        );
+        let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
+        assert_eq!(asked, ["a1 20261125-033000", "a1 20261124-033000"]);
+        let _ = std::fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn restore_refusals_and_failures() {
+        let refused = || {
+            Err(RestoreError::Refused(
+                "a backup or another restore is running".into(),
+            ))
+        };
+        let ((b, _, dest), _) = backups_with(IDLE, refused);
+        assert_eq!(
+            b.restore(&agent("a1"), None).reply.status,
+            503,
+            "no destination"
+        );
+        touch(&dest.join("a1/20261124-033000.full.btrfs"), 1);
+        let d = b.restore(&agent("a1"), None);
+        assert_eq!(d.reply.status, 409, "{}", d.reply.body);
+        assert_eq!(d.audit, " backup=20261124-033000");
+        let failed = || Err(RestoreError::Failed("btrfs receive: no space".into()));
+        let ((b, _, dest2), _) = backups_with(IDLE, failed);
+        touch(&dest2.join("a1/20261124-033000.full.btrfs"), 1);
+        assert_eq!(b.restore(&agent("a1"), None).reply.status, 500);
+        let _ = std::fs::remove_dir_all(dest);
+        let _ = std::fs::remove_dir_all(dest2);
+    }
+
+    #[test]
+    fn restore_bodies() {
+        assert_eq!(wanted(b""), Ok(None));
+        assert_eq!(wanted(b"{}"), Ok(None));
+        assert_eq!(
+            wanted(br#"{"backup":"20261124-033000"}"#),
+            Ok(BackupId::parse("20261124-033000").ok())
+        );
+        for bad in [
+            &br#"{"backup":"../x"}"#[..],
+            br#"{"backup":1}"#,
+            br#"{"id":"a1"}"#,
+            b"[]",
+        ] {
+            assert_eq!(
+                wanted(bad).err().map(|r| r.status),
+                Some(400),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn the_lock_is_shared_with_ac_ctl() {
+        let dir = std::env::temp_dir().join(format!("ac-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let held = lock(&dir).unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(matches!(lock(&dir), Err(RestoreError::Refused(_))));
+        drop(held);
+        assert!(lock(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

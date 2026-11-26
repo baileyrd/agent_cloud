@@ -22,6 +22,9 @@ pub enum Call<'a> {
     Backups,
     /// `POST /api/v1/backups`.
     BackUp,
+    /// `POST /api/v1/agents/{id}/restore-backup`: needs the lifecycle lock, so the transport
+    /// serves it ([`crate::web`]).
+    RestoreBackup(&'a str),
 }
 
 /// The call `method` and `path` name, if any.
@@ -30,6 +33,13 @@ pub fn route<'a>(method: &str, path: &'a str) -> Option<Call<'a>> {
         ("GET", "/api/v1/backups") => return Some(Call::Backups),
         ("POST", "/api/v1/backups") => return Some(Call::BackUp),
         _ => {}
+    }
+    let agent = path
+        .strip_prefix("/api/v1/agents/")
+        .and_then(|p| p.strip_suffix("/restore-backup"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    if let Some(id) = agent {
+        return (method == "POST").then_some(Call::RestoreBackup(id));
     }
     let rest = path.strip_prefix("/api/v1/tokens")?;
     if rest.is_empty() {
@@ -90,10 +100,12 @@ impl Admin {
             Call::Revoke(name) => self.revoke(name, now),
             Call::Backups => read(self.backups().map_or_else(|r| r, Backups::list)),
             Call::BackUp => read(self.backups().map_or_else(|r| r, Backups::start)),
+            Call::RestoreBackup(_) => read(error(404, "not found")),
         }
     }
 
-    fn backups(&self) -> Result<&Backups, Reply> {
+    /// The backups, or 404 without a destination.
+    pub fn backups(&self) -> Result<&Backups, Reply> {
         self.backups
             .as_ref()
             .ok_or_else(|| error(404, "no backup destination (set AC_BACKUP_DEST)"))
@@ -366,6 +378,11 @@ mod tests {
         assert_eq!(route("GET", "/api/v1/backups"), Some(Call::Backups));
         assert_eq!(route("POST", "/api/v1/backups"), Some(Call::BackUp));
         assert_eq!(route("DELETE", "/api/v1/backups"), None);
+        let restore = "/api/v1/agents/a1/restore-backup";
+        assert_eq!(route("POST", restore), Some(Call::RestoreBackup("a1")));
+        assert_eq!(route("GET", restore), None);
+        assert_eq!(route("POST", "/api/v1/agents//restore-backup"), None);
+        assert_eq!(route("POST", "/api/v1/agents/a/b/restore-backup"), None);
     }
 
     #[test]

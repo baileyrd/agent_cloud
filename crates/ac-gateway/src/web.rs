@@ -14,7 +14,8 @@ use rusty_http::{HeaderMap, Method, StatusCode};
 use rusty_serve::{Request, Response, SharedHandler};
 
 use crate::access::{self, Failures, Need, Rule, Verdict};
-use crate::admin::{self, Admin};
+use crate::admin::{self, Admin, Call, Done};
+use crate::backups;
 use crate::jobs::{self, Jobs, Route};
 use crate::mcp::{self, Message};
 use crate::tokens::{self, Keys, Presented, Scope, Token};
@@ -213,7 +214,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             return json(reply);
         }
         if rule.need == Need::Host {
-            return self.host(rule, method, path, body, token);
+            return self.host(rule, agent, method, path, body, token);
         }
         let response = self.dispatch(method, path, target, body, token);
         if let Some(agent) = agent {
@@ -222,20 +223,71 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
         response
     }
 
-    /// A host-wide admin route (ADR-031): never cached, and a change is audited in the journal
-    /// only, since it is not one agent's. 404 when the gateway serves none.
-    fn host(&self, rule: &Rule, method: &str, path: &str, body: &[u8], token: &Token) -> Response {
+    /// A host-wide admin route (ADR-031): never cached, and a change audited in the journal, and
+    /// in the agent's history when it is one agent's. 404 when the gateway serves none.
+    fn host(
+        &self,
+        rule: &Rule,
+        agent: Option<&str>,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        token: &Token,
+    ) -> Response {
         let (Some(admin), Some(call)) = (&self.admin, admin::route(method, path)) else {
             return json(error(404, "not found"));
         };
-        let done = admin.serve(call, body, tokens::unix_now());
+        let done = match call {
+            Call::RestoreBackup(id) => self.restore_backup(admin, id, body),
+            call => admin.serve(call, body, tokens::unix_now()),
+        };
         if let Some(action) = rule.audit {
-            eprintln!(
-                "ac-gateway: audit token={} action={action}{} status={}",
-                token.name, done.audit, done.reply.status
+            let status = done.reply.status;
+            let line = format!(
+                "audit token={} action={action}{} status={status}",
+                token.name, done.audit
             );
+            match agent {
+                None => eprintln!("ac-gateway: {line}"),
+                Some(agent) => {
+                    eprintln!("ac-gateway: {line} agent={}", shown(agent));
+                    let known = !matches!(status, 400 | 404);
+                    if let (true, Ok(id)) = (known, AgentId::parse(agent)) {
+                        self.hub.note(&id, &line);
+                    }
+                }
+            }
         }
         with(json(done.reply), &[("Cache-Control", "no-store")])
+    }
+
+    /// A restore from backup: the agent is held under the lifecycle lock, then restored without
+    /// it, since a receive takes as long as it takes.
+    fn restore_backup(&self, admin: &Admin, id: &str, body: &[u8]) -> Done {
+        let refused = |reply| Done {
+            reply,
+            audit: String::new(),
+        };
+        let id = match AgentId::parse(id) {
+            Ok(id) => id,
+            Err(e) => return refused(error(400, &format!("agent id: {e}"))),
+        };
+        let wanted = match backups::wanted(body) {
+            Ok(w) => w,
+            Err(reply) => return refused(reply),
+        };
+        let backups = match admin.backups() {
+            Ok(b) => b,
+            Err(reply) => return refused(reply),
+        };
+        let held = {
+            let api = self.api.lock().unwrap_or_else(|e| e.into_inner());
+            api.hold_for_restore(&id)
+        };
+        match held {
+            Ok(hold) => backups.restore(&hold, wanted.as_ref()),
+            Err(reply) => refused(reply),
+        }
     }
 
     /// One MCP message (ADR-017). A tool call is served as its REST request, by [`Self::serve`].

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Agent</title>
+<link rel="stylesheet" href="/ui/ui.css">
+</head>
+<body>
+<header>
+  <a href="/ui/">Agents</a>
+  <strong id="agent"></strong>
+  <span id="state"></span>
+  <a id="jobs">Jobs</a>
+  <span id="who"></span>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<main>
+  <p id="note" role="status"></p>
+  <h2>Checkpoints <span id="count"></span></h2>
+  <form id="checkpoint" hidden>
+    <label for="label">Label (optional)</label>
+    <input id="label" autocomplete="off" maxlength="80">
+    <button type="submit">Checkpoint now</button>
+  </form>
+  <p id="restore-hint" hidden>Pause the agent to restore a checkpoint.</p>
+  <table>
+    <thead><tr><th>Checkpoint</th><th>Label</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <h2>Fork</h2>
+  <form id="fork" hidden>
+    <label for="fork-id">New agent</label>
+    <input id="fork-id" autocomplete="off" spellcheck="false" placeholder="id">
+    <label for="from">from</label>
+    <select id="from"></select>
+    <button type="submit">Fork</button>
+  </form>
+</main>
+<script src="/ui/ui.js"></script>
+<script src="/ui/agent.js"></script>
+</body>
+</html>

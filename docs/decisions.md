@@ -1558,3 +1558,8 @@ The picked job is followed with `GET .../jobs/{job}?wait=25` (a reply sooner tha
 pause, so an immediate answer never becomes a tight loop); once it ends the page reads its output as text and
 its witness. The page polls rather than using the AG-UI stream (#471): it shows state and the final output,
 not a live transcript, and long-polls need no stream slot (`MAX_STREAMS`).
+
+**Addendum (2026-11-25, slice 3):** each agent has a page, `/ui/agent/<agent>`, which the agents page links
+to and which later slices extend (egress, viewer links). It lists checkpoints with the cap, makes and deletes
+them, offers **Restore** only while the agent is paused (the gateway refuses it otherwise), and forks from
+the workspace now or a picked checkpoint. Forking with egress profiles is left to slice 5.

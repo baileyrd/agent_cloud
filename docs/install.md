@@ -444,7 +444,10 @@ token once, keeps it in memory only, and lists the agents that token is for, wit
 `agents:write` it can create, pause, resume, destroy and purge them. Destroy and purge are confirmed first, and a
 pause or destroy refused because the agent has a job offers to retry with `force=true`, which interrupts the job.
 Without `agents:write` the page is read-only (and the gateway refuses the calls anyway). Each agent's id links
-to its **jobs page**, `/ui/jobs/<agent-id>`: submit a prompt (with an optional timeout), the job list, and for the
+to its **agent page**, `/ui/agent/<agent-id>`: its state, its checkpoints (make one with an optional label,
+delete one, and restore one once the agent is paused, which keeps the workspace it replaces as a new
+checkpoint), and **Fork** to a new agent from the workspace now or from a checkpoint (the token needs both
+agents). From there **Jobs** opens its **jobs page**, `/ui/jobs/<agent-id>`: submit a prompt (with an optional timeout), the job list, and for the
 job you pick its live state (long-polled), **Cancel**, and once it ends its output and witness record (ADR-029)
 with the SHA-256. Job output is agent-written and is shown as plain text only. It needs `jobs:read`; submit and
 cancel need `jobs:write`.

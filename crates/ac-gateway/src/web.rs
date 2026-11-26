@@ -49,9 +49,12 @@ const AGENTS_PAGE: &str = include_str!("../assets/agents.html");
 const AGENTS_SCRIPT: &str = include_str!("../assets/agents.js");
 const JOBS_PAGE: &str = include_str!("../assets/jobs.html");
 const JOBS_SCRIPT: &str = include_str!("../assets/jobs.js");
+const AGENT_PAGE: &str = include_str!("../assets/agent.html");
+const AGENT_SCRIPT: &str = include_str!("../assets/agent.js");
 /// The management pages' scripts, whose API calls must all be in the catalog.
 #[cfg(test)]
-const UI_SCRIPTS: [(&str, &str); 3] = [
+const UI_SCRIPTS: [(&str, &str); 4] = [
+    ("agent.js", AGENT_SCRIPT),
     ("ui.js", UI_SCRIPT),
     ("agents.js", AGENTS_SCRIPT),
     ("jobs.js", JOBS_SCRIPT),
@@ -500,6 +503,12 @@ pub fn same_origin(headers: &HeaderMap) -> bool {
     origin == format!("http://{host}") || origin == format!("https://{host}")
 }
 
+/// Whether `name` is `prefix` followed by a valid agent id: a per-agent page.
+fn agent_page(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|id| ac_domain::AgentId::parse(id).is_ok())
+}
+
 fn asset(method: &str, path: &str) -> Option<Response> {
     let name = path.strip_prefix("/ui/")?;
     if method != "GET" {
@@ -516,12 +525,9 @@ fn asset(method: &str, path: &str) -> Option<Response> {
         "agents.js" => (AGENTS_SCRIPT, JS),
         "desk.js" => (DESK_SCRIPT, JS),
         "jobs.js" => (JOBS_SCRIPT, JS),
-        jobs if jobs
-            .strip_prefix("jobs/")
-            .is_some_and(|id| ac_domain::AgentId::parse(id).is_ok()) =>
-        {
-            (JOBS_PAGE, "text/html; charset=utf-8")
-        }
+        "agent.js" => (AGENT_SCRIPT, JS),
+        page if agent_page(page, "jobs/") => (JOBS_PAGE, "text/html; charset=utf-8"),
+        page if agent_page(page, "agent/") => (AGENT_PAGE, "text/html; charset=utf-8"),
         id if ac_domain::AgentId::parse(id).is_ok() => (PAGE, "text/html; charset=utf-8"),
         desk if desk
             .strip_prefix("desk/")
@@ -648,7 +654,9 @@ mod tests {
                 && r.headers.get("content-type") == Some("text/html; charset=utf-8"))
         );
         assert!(asset("GET", "/ui/jobs/..").is_some_and(|r| r.status == StatusCode::from_u16(404)));
-        for js in ["/ui/ui.js", "/ui/agents.js", "/ui/jobs.js"] {
+        assert!(asset("GET", "/ui/agent/a1").is_some_and(|r| r.status == StatusCode::OK));
+        assert!(asset("GET", "/ui/agent/").is_some_and(|r| r.status == StatusCode::from_u16(404)));
+        for js in ["/ui/ui.js", "/ui/agents.js", "/ui/jobs.js", "/ui/agent.js"] {
             assert!(asset("GET", js).is_some_and(
                 |r| r.headers.get("content-type") == Some("text/javascript; charset=utf-8")
             ));
@@ -723,6 +731,8 @@ mod tests {
             ("agents.js", AGENTS_SCRIPT),
             ("jobs.html", JOBS_PAGE),
             ("jobs.js", JOBS_SCRIPT),
+            ("agent.html", AGENT_PAGE),
+            ("agent.js", AGENT_SCRIPT),
         ] {
             for banned in [
                 "http://",
@@ -738,7 +748,7 @@ mod tests {
                 assert!(!text.contains(banned), "{name} contains {banned}");
             }
         }
-        for page in [PAGE, AGENTS_PAGE, JOBS_PAGE] {
+        for page in [PAGE, AGENTS_PAGE, JOBS_PAGE, AGENT_PAGE] {
             assert!(
                 !page.contains("<script>") && !page.contains("style="),
                 "no inline script or style"

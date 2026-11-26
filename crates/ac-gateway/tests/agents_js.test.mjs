@@ -76,7 +76,7 @@ test('lists the agents with the actions each state allows', async () => {
   assert.deepEqual(labels(els), [['Pause', 'Destroy', 'Purge'], ['Resume', 'Destroy', 'Purge'], ['Purge']]);
   assert.equal(els.create.hidden, false);
   assert.equal(els.empty.hidden, true);
-  assert.equal(els.rows.children[0].children[0].children[0].href, '/ui/jobs/a1');
+  assert.equal(els.rows.children[0].children[0].children[0].href, '/ui/agent/a1');
 });
 
 test('a read-only token sees the list without any controls', async () => {

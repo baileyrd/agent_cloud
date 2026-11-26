@@ -14,10 +14,8 @@ use crate::{error, escape, Reply};
 /// The unit that runs backups.
 pub const UNIT: &str = "ac-backup.service";
 
-/// A file the operator puts at the destination once. A share that is not mounted leaves its empty
-/// mount point, which lacks it, so neither the unit nor the gateway mistakes the host disk for the
-/// share.
-pub const MARKER: &str = ".ac-backup-dest";
+/// The marker a destination holds (ADR-031): see [`ac_domain::backup::Destination`].
+pub use ac_domain::backup::MARKER;
 
 /// The unit as systemd knows it.
 pub trait Unit: Send + Sync {
@@ -170,6 +168,9 @@ impl Backups {
         if let Err(reply) = self.present() {
             return reply;
         }
+        // Best effort: a run can start between `show` and `start`, or wait on its mount while
+        // still inactive. systemd merges the two start jobs, so the worst case is a 202 for a run
+        // already under way.
         match self.run() {
             Ok(run) if run.running() => return error(409, "a backup is already running"),
             Ok(_) => {}
@@ -188,18 +189,20 @@ impl Backups {
         self.unit.show().map(|text| Run::parse(&text))
     }
 
-    /// 503 unless the destination holds [`MARKER`] (the share may not be mounted).
-    fn present(&self) -> Result<(), Reply> {
-        match self.dest.join(MARKER).is_file() {
-            true => Ok(()),
-            false => Err(error(
+    /// 503 unless the destination holds [`MARKER`] or earlier backups: an unmounted share's empty
+    /// mount point does not count. The gateway only reads, so it never writes the marker.
+    pub fn present(&self) -> Result<(), Reply> {
+        match ac_ctr::backup::destination(&self.dest) {
+            Ok(d) if d.usable() => Ok(()),
+            Ok(_) => Err(error(
                 503,
                 &format!(
-                    "backup destination {} has no {MARKER}: is the share mounted? (create the file \
-                     there once it is)",
+                    "backup destination {} holds no backups and no {MARKER}: is the share \
+                     mounted? (if it is, create the file there)",
                     self.dest.display()
                 ),
             )),
+            Err(e) => Err(failed(&e.to_string())),
         }
     }
 }
@@ -213,7 +216,11 @@ fn names(dir: &Path, dirs: bool) -> Result<Vec<String>, String> {
     };
     Ok(entries
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() == dirs))
+        // Not followed: a symlink, FIFO or socket is neither.
+        .filter(|e| {
+            e.file_type()
+                .is_ok_and(|t| if dirs { t.is_dir() } else { t.is_file() })
+        })
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .collect())
 }
@@ -248,7 +255,7 @@ fn items(dir: &Path) -> Result<Vec<Item>, String> {
         .iter()
         .filter_map(|n| {
             let stream = Stream::parse(n)?;
-            let bytes = std::fs::metadata(dir.join(n)).map_or(0, |m| m.len());
+            let bytes = std::fs::symlink_metadata(dir.join(n)).map_or(0, |m| m.len());
             Some(Item { stream, bytes })
         })
         .collect();

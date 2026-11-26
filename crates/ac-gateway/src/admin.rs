@@ -6,7 +6,7 @@
 use rusty_json::Value;
 
 use crate::backups::Backups;
-use crate::tokens::{self, Agents, Keys, RevokeError, Scopes, Token, TokenFile, Tokens};
+use crate::tokens::{self, Agents, Keys, Scopes, Token, TokenError, TokenFile, Tokens};
 use crate::{error, escape, members, Reply};
 
 /// One admin call, from its method and path.
@@ -78,16 +78,18 @@ impl Admin {
         self
     }
 
-    /// Serve `call` with `body` at `now` (Unix seconds).
-    pub fn serve(&self, call: Call<'_>, body: &[u8], now: u64) -> Done {
+    /// Serve `call` from `caller` with `body` at `now` (Unix seconds). A caller only creates or
+    /// revokes tokens that do not outlive its own (ADR-031), so a short-lived admin token cannot
+    /// mint a lasting one or revoke the owner's.
+    pub fn serve(&self, call: Call<'_>, body: &[u8], now: u64, caller: &Token) -> Done {
         let read = |reply| Done {
             reply,
             audit: String::new(),
         };
         match call {
             Call::Tokens => read(self.list(now)),
-            Call::Create(name) => self.create(name, body, now),
-            Call::Revoke(name) => self.revoke(name, now),
+            Call::Create(name) => self.create(name, body, now, caller),
+            Call::Revoke(name) => self.revoke(name, now, caller),
             Call::Backups => read(self.backups().map_or_else(|r| r, Backups::list)),
             Call::BackUp => read(self.backups().map_or_else(|r| r, Backups::start)),
         }
@@ -109,55 +111,43 @@ impl Admin {
         }
     }
 
-    fn create(&self, name: &str, body: &[u8], now: u64) -> Done {
-        let named = format!(" name={}", shown(name));
-        let done = |reply| Done {
-            reply,
-            audit: named.clone(),
+    fn create(&self, name: &str, body: &[u8], now: u64, caller: &Token) -> Done {
+        let Some(named) = named(name) else {
+            return invalid(name);
         };
-        if let Err(e) = tokens::check_name(name) {
-            return done(error(400, &e));
-        }
+        let done = |reply, audit: String| Done { reply, audit };
         let grant = match Grant::parse(body) {
             Ok(g) => g,
-            Err(reply) => return done(reply),
+            Err(reply) => return done(reply, named),
         };
         let audit = format!("{named}{}", grant.audit(now));
-        match self.file.list() {
-            Ok(t) if t.iter().any(|t| t.name == name) => {
-                let reply = error(409, &format!("a token named {name} exists"));
-                return Done { reply, audit };
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Done {
-                    reply: failed(&e),
-                    audit,
-                }
-            }
+        let expires = grant.lifetime.map(|l| now.saturating_add(l));
+        if expires.unwrap_or(u64::MAX) > caller.end() {
+            let until = caller.expires.map_or_else(String::new, tokens::utc);
+            let why = format!(
+                "token {} expires at {until}: a token it creates must expire no later",
+                caller.name
+            );
+            return done(error(403, &why), audit);
         }
         let made = self
             .file
-            .create(name, grant.scopes, grant.agents, now, grant.lifetime);
+            .create_new(name, grant.scopes, grant.agents, now, grant.lifetime);
         let reply = match made {
             Ok(secret) => {
                 self.refresh();
-                created(name, &secret, grant.lifetime.map(|l| now + l))
+                created(name, &secret, expires)
             }
-            Err(e) => failed(&e),
+            Err(e) => refused(name, e),
         };
-        Done { reply, audit }
+        done(reply, audit)
     }
 
-    fn revoke(&self, name: &str, now: u64) -> Done {
-        let audit = format!(" name={}", shown(name));
-        if let Err(e) = tokens::check_name(name) {
-            return Done {
-                reply: error(400, &e),
-                audit,
-            };
-        }
-        let reply = match self.file.revoke_keeping_admin(name, now) {
+    fn revoke(&self, name: &str, now: u64, caller: &Token) -> Done {
+        let Some(audit) = named(name) else {
+            return invalid(name);
+        };
+        let reply = match self.file.revoke_keeping_admin(name, now, caller.end()) {
             Ok(()) => {
                 self.refresh();
                 Reply {
@@ -165,12 +155,7 @@ impl Admin {
                     body: format!(r#"{{"revoked":"{name}"}}"#),
                 }
             }
-            Err(RevokeError::Unknown) => error(404, &format!("no token named {name}")),
-            Err(RevokeError::LastAdmin) => error(
-                409,
-                "refused: no live token with admin for * would remain (use the host's CLI)",
-            ),
-            Err(RevokeError::Failed(e)) => failed(&e),
+            Err(e) => refused(name, e),
         };
         Done { reply, audit }
     }
@@ -220,6 +205,7 @@ impl Grant {
         };
         let lifetime = match value.get("expires") {
             None => None,
+            Some(v) if v.is_null() => None,
             Some(v) => {
                 let text = v.as_str().ok_or_else(|| bad("expires must be a string"))?;
                 Some(tokens::parse_lifetime(text).map_err(|e| bad(&e))?)
@@ -233,9 +219,9 @@ impl Grant {
     }
 
     fn audit(&self, now: u64) -> String {
-        let expires = self
-            .lifetime
-            .map_or_else(String::new, |l| format!(" expires={}", now + l));
+        let expires = self.lifetime.map_or_else(String::new, |l| {
+            format!(" expires={}", now.saturating_add(l))
+        });
         format!(" scopes={} agents={}{expires}", self.scopes, self.agents)
     }
 }
@@ -289,6 +275,43 @@ fn list_json(tokens: &Tokens, now: u64) -> String {
     format!(r#"{{"tokens":[{}]}}"#, items.join(","))
 }
 
+/// ` name=<name>` for the audit line, if the name is valid.
+fn named(name: &str) -> Option<String> {
+    tokens::check_name(name)
+        .ok()
+        .map(|()| format!(" name={name}"))
+}
+
+/// 400 for a name from the path that is not a token name; the audit line does not repeat it.
+fn invalid(name: &str) -> Done {
+    let e = tokens::check_name(name).err().unwrap_or_default();
+    Done {
+        reply: error(400, &e),
+        audit: " name=<invalid>".into(),
+    }
+}
+
+/// The answer for a write the tokens file refused.
+fn refused(name: &str, e: TokenError) -> Reply {
+    match e {
+        TokenError::Invalid(e) => error(400, &e),
+        TokenError::Exists => error(409, &format!("a token named {name} exists")),
+        TokenError::Full => error(507, "the tokens file is full: revoke unused tokens first"),
+        TokenError::Unknown => error(404, &format!("no token named {name}")),
+        TokenError::Outlives => error(
+            403,
+            &format!(
+                "token {name} outlives the token revoking it: revoke it with a longer-lived one"
+            ),
+        ),
+        TokenError::LastAdmin => error(
+            409,
+            "refused: no other live token with admin for * lasts as long (use the host's CLI)",
+        ),
+        TokenError::Failed(e) => failed(&e),
+    }
+}
+
 fn created(name: &str, secret: &str, expires: Option<u64>) -> Reply {
     Reply {
         status: 201,
@@ -312,15 +335,11 @@ fn failed(e: &str) -> Reply {
     )
 }
 
-/// A name from the path, for the log: at most 40 characters, control characters out.
-fn shown(name: &str) -> String {
-    escape(&name.chars().take(40).collect::<String>())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+    use std::sync::{Arc, Barrier};
 
     fn admin() -> (Admin, Keys, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -345,8 +364,20 @@ mod tests {
         (Admin::new(file, keys.clone()), keys, dir)
     }
 
+    /// The token named `name` in the file.
+    fn token(a: &Admin, name: &str) -> Token {
+        let all = a.file.list().unwrap_or_else(|e| panic!("{e}"));
+        let found = all.iter().find(|t| t.name == name).cloned();
+        found.unwrap_or_else(|| panic!("no {name}"))
+    }
+
+    /// As `owner`, which never expires.
     fn status(a: &Admin, call: Call<'_>, body: &str) -> (u16, String) {
-        let d = a.serve(call, body.as_bytes(), 200);
+        status_as(a, "owner", call, body)
+    }
+
+    fn status_as(a: &Admin, caller: &str, call: Call<'_>, body: &str) -> (u16, String) {
+        let d = a.serve(call, body.as_bytes(), 200, &token(a, caller));
         (d.reply.status, d.reply.body)
     }
 
@@ -372,7 +403,12 @@ mod tests {
     fn create_list_revoke() {
         let (a, keys, dir) = admin();
         let body = r#"{"scopes":["jobs:read","jobs:write"],"agents":["a1"],"expires":"30d"}"#;
-        let d = a.serve(Call::Create("ci"), body.as_bytes(), 200);
+        let d = a.serve(
+            Call::Create("ci"),
+            body.as_bytes(),
+            200,
+            &token(&a, "owner"),
+        );
         assert_eq!(d.reply.status, 201, "{}", d.reply.body);
         assert!(d.reply.body.contains(r#""token":""#));
         assert_eq!(
@@ -395,6 +431,12 @@ mod tests {
         assert_eq!(status(&a, Call::Revoke("ci"), "").0, 200);
         assert_eq!(status(&a, Call::Revoke("ci"), "").0, 404);
         assert_eq!(keys.get().iter().count(), 1);
+        let never = r#"{"scopes":["viewer:read"],"agents":"*","expires":null}"#;
+        assert_eq!(
+            status(&a, Call::Create("watch"), never).0,
+            201,
+            "null: never"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -426,24 +468,136 @@ mod tests {
             assert_eq!(status(&a, Call::Create(name), body).0, 400, "{name} {body}");
         }
         assert_eq!(status(&a, Call::Revoke("Bad!"), "").0, 400);
+        let d = a.serve(Call::Revoke("Bad\n!"), b"", 200, &token(&a, "owner"));
+        assert_eq!(d.audit, " name=<invalid>", "an invalid name is not logged");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Nano's review of #56: a short-lived admin token can neither mint a lasting one nor revoke
+    /// the owner's, so the API is never left without a host admin once it expires.
+    #[test]
+    fn a_token_never_outlives_the_one_that_made_it() {
+        let (a, _, dir) = admin();
+        let brief = r#"{"scopes":["admin"],"agents":"*","expires":"1h"}"#;
+        assert_eq!(status(&a, Call::Create("brief"), brief).0, 201);
+        for body in [
+            r#"{"scopes":["admin"],"agents":"*"}"#,
+            r#"{"scopes":["jobs:read"],"agents":"*","expires":"2h"}"#,
+        ] {
+            let (code, why) = status_as(&a, "brief", Call::Create("more"), body);
+            assert_eq!(code, 403, "{body}");
+            assert!(why.contains("no later"), "{why}");
+        }
+        let shorter = r#"{"scopes":["jobs:read"],"agents":"*","expires":"30m"}"#;
+        assert_eq!(status_as(&a, "brief", Call::Create("job"), shorter).0, 201);
+        assert_eq!(status_as(&a, "brief", Call::Revoke("owner"), "").0, 403);
+        assert_eq!(status_as(&a, "brief", Call::Revoke("job"), "").0, 200);
+        assert_eq!(
+            status_as(&a, "brief", Call::Revoke("brief"), "").0,
+            200,
+            "itself: owner stays"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn the_last_host_admin_stays() {
+    fn a_host_admin_goes_only_if_another_lasts_as_long() {
         let (a, _, dir) = admin();
-        assert_eq!(status(&a, Call::Revoke("owner"), "").0, 409);
+        assert_eq!(status(&a, Call::Revoke("owner"), "").0, 409, "the only one");
         let restricted = r#"{"scopes":["admin"],"agents":["a1"]}"#;
         assert_eq!(status(&a, Call::Create("half"), restricted).0, 201);
         assert_eq!(status(&a, Call::Revoke("owner"), "").0, 409, "not for *");
-        let expiring = r#"{"scopes":["admin"],"agents":"*","expires":"1m"}"#;
+        let expiring = r#"{"scopes":["admin"],"agents":"*","expires":"1h"}"#;
         assert_eq!(status(&a, Call::Create("brief"), expiring).0, 201);
-        let later = a.serve(Call::Revoke("owner"), b"", 200 + 61);
-        assert_eq!(later.reply.status, 409, "expired by then");
         assert_eq!(
             status(&a, Call::Revoke("owner"), "").0,
+            409,
+            "brief ends sooner"
+        );
+        let lasting = r#"{"scopes":["admin"],"agents":"*"}"#;
+        assert_eq!(status(&a, Call::Create("spare"), lasting).0, 201);
+        assert_eq!(status(&a, Call::Revoke("owner"), "").0, 200);
+        assert_eq!(
+            status_as(&a, "spare", Call::Revoke("brief"), "").0,
             200,
-            "brief is live"
+            "spare covers it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Both checks run under the file's lock: of two revokes of the last two lasting host admins,
+    /// one wins; of two creates of one name, one gets 409 (not a 500).
+    #[test]
+    fn concurrent_writes_keep_the_rules() {
+        let (a, _, dir) = admin();
+        let lasting = r#"{"scopes":["admin"],"agents":"*"}"#;
+        assert_eq!(status(&a, Call::Create("spare"), lasting).0, 201);
+        let a = Arc::new(a);
+        let race = |calls: [(&'static str, Call<'static>, &'static str); 2]| -> Vec<u16> {
+            let gate = Arc::new(Barrier::new(2));
+            let runs: Vec<_> = calls
+                .into_iter()
+                .map(|(caller, call, body)| {
+                    let (a, gate) = (Arc::clone(&a), Arc::clone(&gate));
+                    std::thread::spawn(move || {
+                        let me = token(&a, caller);
+                        gate.wait();
+                        a.serve(call, body.as_bytes(), 200, &me).reply.status
+                    })
+                })
+                .collect();
+            let mut codes: Vec<u16> = runs.into_iter().map(|r| r.join().unwrap_or(0)).collect();
+            codes.sort_unstable();
+            codes
+        };
+        let revokes = race([
+            ("owner", Call::Revoke("spare"), ""),
+            ("spare", Call::Revoke("owner"), ""),
+        ]);
+        assert_eq!(revokes, [200, 409]);
+        let one = r#"{"scopes":["jobs:read"],"agents":"*"}"#;
+        let left = a.file.list().unwrap_or_default();
+        let who = left
+            .iter()
+            .next()
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let who: &'static str = Box::leak(who.into_boxed_str());
+        let creates = race([
+            (who, Call::Create("dup"), one),
+            (who, Call::Create("dup"), one),
+        ]);
+        assert_eq!(creates, [201, 409]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_500_and_a_full_one_507() {
+        let (a, _, dir) = admin();
+        let owner = token(&a, "owner");
+        let path = dir.join("tokens");
+        let full = format!(
+            "{}\n{}",
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "#".repeat(64 * 1024 - 300)
+        );
+        std::fs::write(&path, full).unwrap_or_else(|e| panic!("{e}"));
+        let body = br#"{"scopes":["admin"],"agents":"*"}"#;
+        let made: Vec<u16> = (0..4)
+            .map(|i| {
+                let name = format!("t{i}");
+                let name: &'static str = Box::leak(name.into_boxed_str());
+                a.serve(Call::Create(name), body, 200, &owner).reply.status
+            })
+            .collect();
+        assert!(made.contains(&507), "{made:?}");
+        std::fs::write(&path, "not a token line\n").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(a.serve(Call::Tokens, b"", 200, &owner).reply.status, 500);
+        assert_eq!(
+            a.serve(Call::Revoke("owner"), b"", 200, &owner)
+                .reply
+                .status,
+            500
         );
         let _ = std::fs::remove_dir_all(dir);
     }

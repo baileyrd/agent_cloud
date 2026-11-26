@@ -596,7 +596,7 @@ hold the agents' logins):
 sudo mkdir -p /mnt/agent-backups
 echo 'beast:/srv/agent-backups /mnt/agent-backups nfs4 _netdev,hard,noatime 0 0' | sudo tee -a /etc/fstab
 sudo mount /mnt/agent-backups
-sudo touch /mnt/agent-backups/.ac-backup-dest   # once, on the mounted share: runs refuse a destination without it
+sudo touch /mnt/agent-backups/.ac-backup-dest   # once, on the mounted share (see below)
 sudo ac-ctl backup /mnt/agent-backups          # a1 backed up 20261028-130512 (full, 1.2 GiB)
 sudo ac-ctl backup /mnt/agent-backups a1       # a1 backed up ... (incremental from 20261028-130512, 3.1 MiB)
 sudo ac-ctl backups /mnt/agent-backups         # a1 20261028-130512 full / a1 ... incremental from ...
@@ -608,6 +608,13 @@ An SMB share works the same way (`cifs` in fstab, with a root-only credentials f
 last backup, in full every 7th (`--full-every N`), keeps the newest 7 restorable backups per agent and the streams
 they need (`--keep N`), and exits 1 if any agent was not backed up; check with `systemctl status ac-backup` or
 `journalctl -u ac-backup`.
+
+`ac-ctl backup` refuses a destination that holds neither `.ac-backup-dest` nor earlier backups: that is
+what an unmounted share looks like (its empty mount point, on the host disk). A destination that already
+holds backups but no marker (set up before the marker existed) is marked by the next run, so upgrading
+needs no step. If you pointed backups elsewhere by overriding `ExecStart` with `systemctl edit`, that
+override keeps working; to let the gateway see the same path, move it into `AC_BACKUP_DEST` and drop the
+override.
 
 With `AC_BACKUP_DEST=/mnt/agent-backups` in `gateway.env` (and a gateway restart), an `admin` token for `*` can
 also list the backups and start a run over the API (ADR-031). A run is the unit's, so it is the same as the timer's:

@@ -2,7 +2,8 @@
 // make one, delete one, restore one onto the paused agent, and fork a new agent from the workspace
 // now or from a checkpoint; with slice 5, its egress profiles (ADR-016): which are attached, how
 // many hosts that lets it reach, and (with egress:write) replacing them. Controls the token's
-// scopes cannot use are hidden or disabled.
+// scopes cannot use are hidden or disabled. With slice 6, links into the terminal viewer and the
+// desktop stream (ADR-006) for a token with viewer:read.
 (() => {
   'use strict';
 
@@ -142,7 +143,10 @@
 
   async function start() {
     $('agent').textContent = agent;
-    $('jobs').href = `/ui/jobs/${encodeURIComponent(agent)}`;
+    const path = encodeURIComponent(agent);
+    $('jobs').href = `/ui/jobs/${path}`;
+    $('term').href = `/ui/${path}`;
+    $('desk').href = `/ui/desk/${path}`;
     const who = await signIn(`Gateway token for ${agent}`);
     if (!who) {
       note('No token. Reload to try again.', true);
@@ -150,6 +154,7 @@
     }
     $('who').textContent = `${who.name} (${who.scopes.join(', ')})`;
     for (const id of ['checkpoint', 'fork']) $(id).hidden = !may('agents:write');
+    for (const id of ['term', 'desk']) $(id).hidden = !may('viewer:read');
     $('checkpoint').addEventListener('submit', checkpoint);
     $('fork').addEventListener('submit', fork);
     $('egress').addEventListener('submit', saveEgress);

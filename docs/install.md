@@ -449,7 +449,8 @@ to its **agent page**, `/ui/agent/<agent-id>`: its state, its checkpoints (make 
 delete one, and restore one once the agent is paused, which keeps the workspace it replaces as a new
 checkpoint), **Egress** (its profiles and how many hosts they let it reach; with `egress:write`, tick profiles and **Save
 profiles** to replace them, and the proxy applies it to the next request), and **Fork** to a new agent from the
-workspace now or from a checkpoint (the token needs both agents). From there **Jobs** opens its **jobs page**, `/ui/jobs/<agent-id>`: submit a prompt (with an optional timeout), the job list, and for the
+workspace now or from a checkpoint (the token needs both agents). With `viewer:read` its header links to the
+**Terminal** viewer (`/ui/<agent-id>`) and the **Desktop** stream (`/ui/desk/<agent-id>`, desktop agents only). From there **Jobs** opens its **jobs page**, `/ui/jobs/<agent-id>`: submit a prompt (with an optional timeout), the job list, and for the
 job you pick its live state (long-polled), **Cancel**, and once it ends its output and witness record (ADR-029)
 with the SHA-256. Job output is agent-written and is shown as plain text only. It needs `jobs:read`; submit and
 cancel need `jobs:write`.

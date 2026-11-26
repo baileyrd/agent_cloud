@@ -173,3 +173,11 @@ test('without the egress routes the section says why and offers no form', async 
   assert.equal(els['egress-state'].textContent, 'Egress: not found');
   assert.equal(els.egress.hidden, true);
 });
+
+test('the viewer links show only for viewer:read, and name the agent', async () => {
+  const viewer = await load({ scopes: ['agents:read', 'viewer:read'] });
+  assert.deepEqual([viewer.els.term.href, viewer.els.desk.href], ['/ui/a1', '/ui/desk/a1']);
+  assert.deepEqual([viewer.els.term.hidden, viewer.els.desk.hidden], [false, false]);
+  const other = await load({ scopes: ['agents:read'] });
+  assert.deepEqual([other.els.term.hidden, other.els.desk.hidden], [true, true]);
+});

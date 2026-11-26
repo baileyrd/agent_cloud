@@ -397,6 +397,7 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `PUT .../{id}/egress` (set its profiles; also `egress_profiles` on create) | `egress:write` |
   | `GET .../{id}/checkpoints` (ADR-018) | `agents:read` |
   | `POST .../{id}/checkpoints`, `DELETE .../checkpoints/{cp}`, `POST .../{id}/restore`, `.../fork` (the token must also be for the fork's new agent) | `agents:write` |
+  | `GET /api/v1/tokens`, `POST /api/v1/tokens/{name}`, `DELETE /api/v1/tokens/{name}` (ADR-031; 404 for any other token) | `admin` for `*` |
 
 - *Agents:* a token restricted to some agents gets 404 for any other agent id, existing or not, before its scope
   is looked at, so it cannot probe for ids. (A wrong method is still 405; that depends on the path's shape only.)
@@ -1164,7 +1165,7 @@ for it when nobody remembers to revoke it, and a leaked one works forever.
   one log line naming the token as expired), whatever the reload state. A viewer stream ends at its next
   message or keep-alive after expiry, as it does on revoke.
 - *Kept in the file:* an expired token is not removed; `token list` shows it as `(expired)`, and `revoke` removes
-  it. The gateway never writes the tokens file, so it stays the only writer's (the CLI's) file.
+  it. The gateway writes the tokens file only through `TokenFile`, the CLI's own code (ADR-031).
 - *Visible to the caller:* `whoami` (REST and MCP) adds `"expires"`: Unix seconds or `null`.
 **Consequences:** a lifetime cannot be extended: create a new token and revoke the old one (rotation, the same
 step as today). Expiry trusts the host clock; a clock set back revives an expired token until it passes again.

@@ -86,6 +86,7 @@ use ac_domain::tune::rules::drift;
 use ac_domain::tune::{recommend, Fact, Profile};
 use ac_domain::{AgentLimits, GuestMemory, State};
 use ac_fleet::Fleet;
+use ac_gateway::admin::Admin;
 use ac_gateway::egress::EgressStore;
 use ac_gateway::jobs::{self, Jobs};
 use ac_gateway::notify::{self, Notify};
@@ -541,6 +542,7 @@ fn run() -> Result<(), String> {
     }
     let app = App::new(api, hub.clone(), keys.clone())
         .with_jobs(Arc::clone(&jobs))
+        .with_admin(Admin::new(tokens_file()?, keys.clone()))
         .with_tailscale_logins(behind_serve);
     let app = Arc::new(app);
     let differ = Arc::clone(&jobs);

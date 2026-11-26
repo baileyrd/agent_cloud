@@ -17,6 +17,7 @@ use ac_domain::job::{Credential, ModelUrl};
 use ac_domain::schedule::Limits;
 use ac_domain::{AgentId, JobId, State};
 use ac_fleet::Fleet;
+use ac_gateway::admin::Admin;
 use ac_gateway::jobs::{self, Answer, Changes, EgressLog, JobRunner, Jobs, Part, Probe, Route};
 use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
@@ -3309,4 +3310,69 @@ fn a_final_drain_that_ends_on_a_full_chunk_is_complete() {
     let (_, _, body) = reader.join().unwrap_or_else(|_| panic!("reader panicked"));
     assert!(!body.contains("log_incomplete"), "{body}");
     assert_eq!(types(&events_of(&body)).last(), Some(&"RUN_FINISHED"));
+}
+
+/// ADR-031: the token routes over HTTP. Only `admin` for `*` sees them; a new token works at once,
+/// a revoked one stops at once, answers are never cached, and the last host admin stays.
+#[test]
+fn token_routes_over_http() {
+    use std::os::unix::fs::MetadataExt;
+    let r = rig();
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let file = TokenFile::new(r.root.join("tokens"), me);
+    let make = |name: &str, scopes: &str, agents: &str| {
+        let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
+        let agents = Agents::parse(agents).unwrap_or_else(|e| panic!("{e}"));
+        file.create(name, scopes, agents, 1, None)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let owner = make("owner", "admin", "*");
+    let half = make("half", "admin", "a1");
+    let keys = Keys::new(Tokens::default());
+    reload(&file, &keys);
+    let fleet = Fleet::new(Rt, Arc::clone(&r.store));
+    let api = Api::new(fleet).with_jobs(r.jobs.clone());
+    let hub = Hub::new(NoTerm, r.root.join("history"));
+    let admin = Admin::new(TokenFile::new(r.root.join("tokens"), me), keys.clone());
+    let app = App::new(api, hub, keys).with_admin(admin);
+    let server = Server::bind_shared("127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")), app)
+        .unwrap_or_else(|e| panic!("bind: {e}"));
+    let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
+    std::thread::spawn(move || server.run());
+
+    let (code, head, body) = request_as(addr, &owner, "GET", "/api/v1/tokens", "");
+    assert_eq!(code, 200, "{body}");
+    assert!(head.contains("cache-control: no-store"));
+    assert!(body.contains(r#""name":"half","scopes":["admin"],"agents":["a1"]"#));
+    assert_eq!(request_as(addr, &half, "GET", "/api/v1/tokens", "").0, 404);
+
+    let grant = r#"{"scopes":["viewer:read"],"agents":"*","expires":"1h"}"#;
+    let (code, head, body) = request_as(addr, &owner, "POST", "/api/v1/tokens/ci", grant);
+    assert_eq!(code, 201, "{body}");
+    assert!(head.contains("cache-control: no-store"));
+    let secret = body.split('"').nth(7).unwrap_or_default().to_owned();
+    let (code, _, who) = request_as(addr, &secret, "GET", "/api/v1/whoami", "");
+    assert_eq!(code, 200, "in force at once");
+    assert!(
+        who.starts_with(r#"{"name":"ci","scopes":["viewer:read"]"#),
+        "{who}"
+    );
+
+    let revoke = |name: &str| {
+        request_as(
+            addr,
+            &owner,
+            "DELETE",
+            &format!("/api/v1/tokens/{name}"),
+            "",
+        )
+        .0
+    };
+    assert_eq!(revoke("ci"), 200);
+    assert_eq!(
+        request_as(addr, &secret, "GET", "/api/v1/whoami", "").0,
+        401
+    );
+    assert_eq!(revoke("owner"), 409, "the last host admin");
+    assert_eq!(revoke("nobody"), 404);
 }

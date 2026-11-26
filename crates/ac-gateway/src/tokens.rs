@@ -208,6 +208,11 @@ impl Token {
     pub fn live(&self, now: u64) -> bool {
         self.expires.is_none_or(|e| now < e)
     }
+
+    /// Whether it is `admin` for every agent: what the host-wide routes need (ADR-031).
+    pub fn host_admin(&self) -> bool {
+        self.scopes.allows(Scope::Admin) && self.agents == Agents::All
+    }
 }
 
 /// What an `Authorization` header presented.
@@ -265,6 +270,12 @@ impl Tokens {
     /// Whether there are none.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Whether one of them is live at `now` and [`Token::host_admin`]: someone can still manage
+    /// the host over the API.
+    pub fn has_host_admin(&self, now: u64) -> bool {
+        self.0.iter().any(|t| t.live(now) && t.host_admin())
     }
 
     /// Whether `token` (name, scopes, agents and digest) is still one of them.
@@ -547,18 +558,29 @@ impl TokenFile {
 
     /// Remove the token named `name`.
     pub fn revoke(&self, name: &str) -> Result<(), String> {
-        self.edit(|text| {
-            let kept: Vec<&str> = text
-                .lines()
-                .filter(|l| {
-                    l.split('#').next().unwrap_or("").split_whitespace().next() != Some(name)
-                })
-                .collect();
-            if kept.len() == text.lines().count() {
-                return Err(format!("no token named {name:?}"));
+        self.edit(|text| without(text, name).ok_or_else(|| format!("no token named {name:?}")))
+    }
+
+    /// Remove the token named `name` unless that leaves no live host admin at `now` (ADR-031's
+    /// lockout guard), checked under the same lock as the write.
+    pub fn revoke_keeping_admin(&self, name: &str, now: u64) -> Result<(), RevokeError> {
+        let mut why = None;
+        let done = self.edit(|text| {
+            let Some(next) = without(text, name) else {
+                why = Some(RevokeError::Unknown);
+                return Err(String::new());
+            };
+            if !Tokens::parse(&next).is_ok_and(|t| t.has_host_admin(now)) {
+                why = Some(RevokeError::LastAdmin);
+                return Err(String::new());
             }
-            Ok(kept.iter().map(|l| format!("{l}\n")).collect())
-        })
+            Ok(next)
+        });
+        match (done, why) {
+            (Ok(()), _) => Ok(()),
+            (Err(_), Some(why)) => Err(why),
+            (Err(e), None) => Err(RevokeError::Failed(e)),
+        }
     }
 
     /// The tokens now in the file (none if it is missing).
@@ -596,6 +618,26 @@ impl TokenFile {
         rusty_atomic_file::write_private(&self.path, next.as_bytes())
             .map_err(|e| format!("{shown}: {e}"))
     }
+}
+
+/// Why [`TokenFile::revoke_keeping_admin`] did not revoke.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeError {
+    /// No token has that name.
+    Unknown,
+    /// It would leave no live host admin.
+    LastAdmin,
+    /// The file could not be read or written.
+    Failed(String),
+}
+
+/// `text` without the line of the token named `name`, or `None` if there is none.
+fn without(text: &str, name: &str) -> Option<String> {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| l.split('#').next().unwrap_or("").split_whitespace().next() != Some(name))
+        .collect();
+    (kept.len() != text.lines().count()).then(|| kept.iter().map(|l| format!("{l}\n")).collect())
 }
 
 /// 32 bytes from the kernel's random source, as hex. No fallback: a token must be unguessable.

@@ -53,9 +53,12 @@ const JOBS_PAGE: &str = include_str!("../assets/jobs.html");
 const JOBS_SCRIPT: &str = include_str!("../assets/jobs.js");
 const AGENT_PAGE: &str = include_str!("../assets/agent.html");
 const AGENT_SCRIPT: &str = include_str!("../assets/agent.js");
+const ADMIN_PAGE: &str = include_str!("../assets/admin.html");
+const ADMIN_SCRIPT: &str = include_str!("../assets/admin.js");
 /// The management pages' scripts, whose API calls must all be in the catalog.
 #[cfg(test)]
-const UI_SCRIPTS: [(&str, &str); 4] = [
+const UI_SCRIPTS: [(&str, &str); 5] = [
+    ("admin.js", ADMIN_SCRIPT),
     ("agent.js", AGENT_SCRIPT),
     ("ui.js", UI_SCRIPT),
     ("agents.js", AGENTS_SCRIPT),
@@ -577,6 +580,9 @@ fn asset(method: &str, path: &str) -> Option<Response> {
         "desk.js" => (DESK_SCRIPT, JS),
         "jobs.js" => (JOBS_SCRIPT, JS),
         "agent.js" => (AGENT_SCRIPT, JS),
+        "admin.js" => (ADMIN_SCRIPT, JS),
+        // A trailing slash, since any single segment could be an agent's viewer.
+        "admin/" => (ADMIN_PAGE, "text/html; charset=utf-8"),
         page if agent_page(page, "jobs/") => (JOBS_PAGE, "text/html; charset=utf-8"),
         page if agent_page(page, "agent/") => (AGENT_PAGE, "text/html; charset=utf-8"),
         id if ac_domain::AgentId::parse(id).is_ok() => (PAGE, "text/html; charset=utf-8"),
@@ -707,7 +713,25 @@ mod tests {
         assert!(asset("GET", "/ui/jobs/..").is_some_and(|r| r.status == StatusCode::from_u16(404)));
         assert!(asset("GET", "/ui/agent/a1").is_some_and(|r| r.status == StatusCode::OK));
         assert!(asset("GET", "/ui/agent/").is_some_and(|r| r.status == StatusCode::from_u16(404)));
-        for js in ["/ui/ui.js", "/ui/agents.js", "/ui/jobs.js", "/ui/agent.js"] {
+        let body = |path: &str| match asset("GET", path).map(|r| r.body) {
+            Some(rusty_serve::Body::Json(b)) => String::from_utf8_lossy(&b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body("/ui/admin/").contains("/ui/admin.js"),
+            "the admin page"
+        );
+        assert!(
+            body("/ui/admin").contains("/ui/viewer.js"),
+            "agent admin's viewer"
+        );
+        for js in [
+            "/ui/ui.js",
+            "/ui/agents.js",
+            "/ui/jobs.js",
+            "/ui/agent.js",
+            "/ui/admin.js",
+        ] {
             assert!(asset("GET", js).is_some_and(
                 |r| r.headers.get("content-type") == Some("text/javascript; charset=utf-8")
             ));
@@ -784,6 +808,8 @@ mod tests {
             ("jobs.js", JOBS_SCRIPT),
             ("agent.html", AGENT_PAGE),
             ("agent.js", AGENT_SCRIPT),
+            ("admin.html", ADMIN_PAGE),
+            ("admin.js", ADMIN_SCRIPT),
         ] {
             for banned in [
                 "http://",
@@ -799,7 +825,7 @@ mod tests {
                 assert!(!text.contains(banned), "{name} contains {banned}");
             }
         }
-        for page in [PAGE, AGENTS_PAGE, JOBS_PAGE, AGENT_PAGE] {
+        for page in [PAGE, AGENTS_PAGE, JOBS_PAGE, AGENT_PAGE, ADMIN_PAGE] {
             assert!(
                 !page.contains("<script>") && !page.contains("style="),
                 "no inline script or style"

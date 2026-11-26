@@ -1,5 +1,6 @@
 // The agents page (ADR-030 slice 1, #516): every agent the token is for, with its state and health,
-// and create, pause, resume, destroy and purge; with slice 4, the host's capacity above the list. Controls the token's scopes cannot use are hidden.
+// and create, pause, resume, destroy and purge; with slice 4, the host's capacity above the list; a
+// link to the admin page for a host admin (ADR-031). Controls the token's scopes cannot use are hidden.
 (() => {
   'use strict';
 
@@ -117,6 +118,8 @@
     }
     $('who').textContent = `${who.name} (${who.scopes.join(', ')})`;
     $('create').hidden = !may('agents:write');
+    // The admin page's routes need admin for every agent (ADR-031).
+    $('admin').hidden = !(may('admin') && who.agents === '*');
     $('create').addEventListener('submit', create);
     $('refresh').addEventListener('click', refresh);
     await refresh();

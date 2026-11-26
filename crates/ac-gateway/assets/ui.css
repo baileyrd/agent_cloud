@@ -45,3 +45,7 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
 th { color: var(--dim); font-weight: normal; }
 td.actions { text-align: right; white-space: nowrap; }
 td.actions button + button { margin-left: 6px; }
+#scopes { flex-wrap: wrap; }
+#scopes label { display: inline-flex; gap: 4px; align-items: center; }
+.secret { padding: 8px; margin-bottom: 12px; border: 1px solid var(--warn); border-radius: 4px; }
+.secret pre { user-select: all; margin: 8px 0; }

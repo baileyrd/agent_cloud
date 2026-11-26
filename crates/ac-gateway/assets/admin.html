@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Admin</title>
+<link rel="stylesheet" href="/ui/ui.css">
+</head>
+<body>
+<header>
+  <a href="/ui/">Agents</a>
+  <strong>Admin</strong>
+  <span id="who"></span>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<main>
+  <p id="note" role="status"></p>
+  <section id="admin" hidden>
+    <h2>Tokens</h2>
+    <div id="secret" class="secret" hidden>
+      <p>New token <strong id="secret-name"></strong>. Copy it now: it cannot be shown again.</p>
+      <pre id="secret-text"></pre>
+      <button id="copy" type="button">Copy</button>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Scopes</th><th>Agents</th><th>Created</th><th>Expires</th><th></th></tr></thead>
+      <tbody id="tokens"></tbody>
+    </table>
+    <h3>New token</h3>
+    <form id="create" class="stack">
+      <span>
+        <label for="new-name">Name</label>
+        <input id="new-name" autocomplete="off" spellcheck="false" placeholder="ci">
+        <label for="new-agents">Agents</label>
+        <input id="new-agents" autocomplete="off" spellcheck="false" value="*" placeholder="* or a1,a2">
+        <label for="new-expires">Lifetime</label>
+        <input id="new-expires" autocomplete="off" spellcheck="false" value="30d" placeholder="never">
+      </span>
+      <span id="scopes"></span>
+      <span><button type="submit">Create</button></span>
+    </form>
+
+    <h2>Backups</h2>
+    <p id="backups-off" hidden></p>
+    <div id="backups" hidden>
+      <p><span id="run"></span> <button id="back-up" type="button">Back up now</button></p>
+      <p id="state"></p>
+      <table>
+        <thead><tr><th>Agent</th><th>Backup</th><th>Kind</th><th>Size</th><th></th></tr></thead>
+        <tbody id="streams"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script src="/ui/ui.js"></script>
+<script src="/ui/admin.js"></script>
+</body>
+</html>

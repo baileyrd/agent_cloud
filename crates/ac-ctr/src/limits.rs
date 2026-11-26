@@ -28,10 +28,11 @@ impl<S: Spawner> CtrRuntime<S> {
             .join(format!("kata_{id}"))
     }
 
-    /// Set the workspace's btrfs quota, if there is a disk limit. It needs a subvolume.
+    /// Set the workspace's btrfs quota, if there is a disk limit (it needs a subvolume), else
+    /// clear one an earlier boot set.
     pub(crate) fn limit_disk(&self, op: &'static str, dir: &Path) -> Result<(), PortError> {
         let Some(bytes) = self.cfg.limits.disk_bytes() else {
-            return Ok(());
+            return self.clear_disk_limit(op, dir);
         };
         if self.volume_at(op, dir)? != Volume::Subvolume {
             return Err(PortError {
@@ -43,16 +44,41 @@ impl<S: Spawner> CtrRuntime<S> {
                 ),
             });
         }
-        let bytes = bytes.to_string();
-        self.btrfs(
-            op,
-            &[
-                OsStr::new("qgroup"),
-                OsStr::new("limit"),
-                OsStr::new(&bytes),
-                dir.as_os_str(),
-            ],
-        )
+        self.qgroup_limit(op, &bytes.to_string(), dir)
+            .map_err(|e| PortError {
+                op,
+                cause: format!(
+                    "{}; if quotas are off, run btrfs quota enable --simple on the workspace \
+                     filesystem",
+                    e.cause
+                ),
+            })
+    }
+
+    /// No disk limit: drop any quota an earlier boot set, so unset means unlimited (#29). With
+    /// quotas off there is none to drop, so a failure is logged, never fatal.
+    fn clear_disk_limit(&self, op: &'static str, dir: &Path) -> Result<(), PortError> {
+        if self.volume_at(op, dir)? != Volume::Subvolume {
+            return Ok(());
+        }
+        if let Err(e) = self.qgroup_limit(op, "none", dir) {
+            eprintln!(
+                "ac-ctr: {op}: no disk limit; clearing a quota on {} failed (quotas off?): {}",
+                dir.display(),
+                e.cause
+            );
+        }
+        Ok(())
+    }
+
+    fn qgroup_limit(&self, op: &'static str, size: &str, dir: &Path) -> Result<(), PortError> {
+        let args = [
+            OsStr::new("qgroup"),
+            OsStr::new("limit"),
+            OsStr::new(size),
+            dir.as_os_str(),
+        ];
+        self.btrfs(op, &args)
     }
 
     /// Write `cpu.max` and `memory.max` on the running sandbox's cgroup, if either is limited.
@@ -73,13 +99,17 @@ impl<S: Spawner> CtrRuntime<S> {
         std::fs::write(&control, limits.controllers())
             .map_err(|e| fail("enable controllers in", &control, e))?;
         let procs = dir.join("cgroup.procs");
-        let held = std::fs::read_to_string(&procs).map_err(|e| fail("read", &procs, e))?;
+        // Missing or empty, the hint is the same: Kata put the sandbox elsewhere.
+        let held = match std::fs::read_to_string(&procs) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            read => read.map_err(|e| fail("read", &procs, e))?,
+        };
         if held.trim().is_empty() {
             return Err(PortError {
                 op,
                 cause: format!(
-                    "{} holds no process, so limits there would bind nothing: set \
-                     sandbox_cgroup_only = true in Kata's [runtime] table",
+                    "{} is missing or holds no process, so limits there would bind nothing: \
+                     set sandbox_cgroup_only = true in Kata's [runtime] table",
                     dir.display()
                 ),
             });

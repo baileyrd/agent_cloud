@@ -40,15 +40,18 @@ echo "== chromium policy"
 gx policy 'cat /etc/chromium/policies/managed/agent.json' | grep -q '"ExtensionInstallBlocklist"' \
     && ok "policy file present" || bad "policy file missing"
 # The effective policy is what Chromium itself reports on chrome://policy, not what the file says.
-if gx dom 'timeout 60 chromium --headless=new --virtual-time-budget=5000 --dump-dom chrome://policy' > "$WORK/policy.html"; then
-    for k in $POLICIES; do
-        grep -q "$k" "$WORK/policy.html" && ok "effective policy: $k" || bad "chrome://policy does not show $k"
-    done
+# Headless Chromium cannot be used for this: RemoteDebuggingAllowed=false makes --headless hang
+# ("DevTools remote debugging is disallowed by the system admin"). So open chrome://policy on the real
+# display :0 and take a screenshot of it with ffmpeg; read the policies from policy.png by eye.
+gx open '(chromium --start-maximized >/dev/null 2>&1 &); sleep 12
+    xdotool search --onlyvisible --class chromium windowactivate --sync
+    xdotool key ctrl+l; xdotool type --delay 30 chrome://policy; xdotool key Return; sleep 4' > "$WORK/open" \
+    || { bad "could not open chrome://policy on :0"; tail -5 "$WORK/open"; }
+if gx shot 'ffmpeg -loglevel error -y -f x11grab -video_size 1920x1080 -i :0 -frames:v 1 /workspace/policy.png' > "$WORK/shot"; then
+    ok "chrome://policy on :0 captured; check $POLICIES in /workspace/policy.png in $AGENT's workspace"
 else
-    bad "chromium failed:"; tail -15 "$WORK/policy.html"
+    bad "screenshot failed"; tail -5 "$WORK/shot"
 fi
-gx shot 'timeout 60 chromium --headless=new --window-size=1280,2400 --screenshot=/workspace/policy.png chrome://policy' > "$WORK/shot" \
-    && echo "see /workspace/policy.png in $AGENT's workspace" || { echo "note: screenshot failed"; tail -5 "$WORK/shot"; }
 
 echo "== memory at idle"
 under() { [ "$2" -le "$LIMIT_MIB" ] && ok "$1 ${2} MiB <= ${LIMIT_MIB} MiB" || bad "$1 ${2} MiB > ${LIMIT_MIB} MiB"; }

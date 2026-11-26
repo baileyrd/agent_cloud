@@ -10,7 +10,9 @@ chmod 0700 "$XDG_RUNTIME_DIR"
 
 xorg() {
     while :; do
-        Xorg "$DISPLAY" -noreset -novtswitch -nolisten tcp -config /etc/agent-desktop/xorg.conf \
+        # /usr/libexec/Xorg, not /usr/bin/Xorg: that wrapper execs Xorg.wrap, which refuses a
+        # non-console user ("Only console users are allowed to run the X server").
+        /usr/libexec/Xorg "$DISPLAY" -noreset -novtswitch -nolisten tcp -config /etc/agent-desktop/xorg.conf \
             -logfile "$logs/Xorg.log"
         echo "desktop-session: Xorg exited ($?); restarting in 2 s" >&2
         sleep 2

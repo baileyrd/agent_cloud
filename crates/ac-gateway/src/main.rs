@@ -297,6 +297,9 @@ fn watch(
             return stop.shutdown();
         }
         let force = signal == Some(SignalEvent::Hangup);
+        // Under the file's lock, as the admin routes publish, so an older read never wins.
+        // Without a lock (no directory) the routes cannot edit either: read anyway.
+        let _held = file.lock().ok();
         match file.reload(force) {
             Ok(Some(tokens)) => {
                 let n = tokens.iter().count();

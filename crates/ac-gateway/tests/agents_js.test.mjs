@@ -79,11 +79,30 @@ test('lists the agents with the actions each state allows', async () => {
   assert.equal(els.rows.children[0].children[0].children[0].href, '/ui/agent/a1');
 });
 
+test('the capacity line shows room, /dev/shm and job slots', async () => {
+  const figures = {
+    shm_total_mib: 9000, shm_free_mib: 4600, guest_mib: 2048, running_agents: 2, committed_mib: 4096,
+    margin_mib: 512, max_more_agents: 1, running_jobs: 1, queued_jobs: 3, max_running_jobs: 2,
+  };
+  const { els } = await load({
+    scopes: ['agents:read'],
+    answers: { 'GET /api/v1/agents': [[200, AGENTS]], 'GET /api/v1/capacity': [[200, figures]] },
+  });
+  assert.equal(els.capacity.hidden, false);
+  assert.equal(els.capacity.textContent,
+    'room for 1 more agent · 2 running · /dev/shm 4600 of 9000 MiB free · 2048 MiB per guest · jobs: 1 of 2 running, 3 queued');
+});
+
 test('a read-only token sees the list without any controls', async () => {
   const { els, sent } = await load({ scopes: ['agents:read'], answers: { 'GET /api/v1/agents': [[200, AGENTS]] } });
   assert.deepEqual(labels(els), [[], [], []]);
   assert.equal(els.create.hidden, true);
-  assert.deepEqual(sent.map((r) => r.method), ['GET', 'GET']);
+  assert.deepEqual(sent.map((r) => [r.method, r.url]), [
+    ['GET', '/api/v1/whoami'],
+    ['GET', '/api/v1/agents'],
+    ['GET', '/api/v1/capacity'],
+  ]);
+  assert.equal(els.capacity.hidden, true, 'no capacity line when the gateway refuses it');
 });
 
 test('a wrong token is asked for again, and the token never leaves the header', async () => {
@@ -92,7 +111,7 @@ test('a wrong token is asked for again, and the token never leaves the header', 
     tokens: ['wrong', TOKEN],
     answers: { 'GET /api/v1/agents': [[200, { agents: [] }]] },
   });
-  assert.deepEqual(sent.map((r) => r.url), ['/api/v1/whoami', '/api/v1/whoami', '/api/v1/agents']);
+  assert.deepEqual(sent.map((r) => r.url), ['/api/v1/whoami', '/api/v1/whoami', '/api/v1/agents', '/api/v1/capacity']);
   assert.equal(els.empty.hidden, false);
   for (const r of sent) assert.ok(!r.url.includes(TOKEN) && !(r.body ?? '').includes(TOKEN));
 });

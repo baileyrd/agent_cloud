@@ -1563,3 +1563,7 @@ not a live transcript, and long-polls need no stream slot (`MAX_STREAMS`).
 to and which later slices extend (egress, viewer links). It lists checkpoints with the cap, makes and deletes
 them, offers **Restore** only while the agent is paused (the gateway refuses it otherwise), and forks from
 the workspace now or a picked checkpoint. Forking with egress profiles is left to slice 5.
+
+**Addendum (2026-11-25, slice 4):** capacity is one line above the agents list, read with the list: room for
+more agents, running agents, `/dev/shm` free and total, guest size, and job slots when the job runner is on.
+It is hidden when the call fails. A job's own queued reason shows on the jobs page (slice 2).

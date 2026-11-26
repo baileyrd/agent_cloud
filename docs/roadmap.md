@@ -11,11 +11,14 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [x] SELinux stays enforcing; no Kata-related denials seen
 
 ## M1: One agent, by hand
-- [ ] Desktop image: Xorg dummy (or chosen streamer), Xfce, policy-locked Chromium
+- [x] Desktop image (`images/agent-desktop`): Xorg dummy, Xfce, policy-locked Chromium; `scripts/desktop-smoke.sh`
+  PASS on BaileyServ 2026-11-26 (#472, PRs #45, #61)
 - [x] Shell image (`images/agent-shell`): unprivileged user, Claude Code, toolchains; its login is kept on
   `/workspace` and survives pause/resume
 - [x] Start one container under Kata via `ac-ctl` (create/pause/resume/destroy verified with `nginx:alpine`)
-- [ ] Start one real agent image (shell + desktop), open its desktop, run a task end to end
+- [x] Start one real agent image (shell + desktop), open its desktop, run a task end to end: a job built a page,
+  opened it in Chromium on the desktop and saved a screenshot while watched and taken over at `/ui/desk/d1`
+  (#474, BaileyServ 2026-11-26). Default job tools cannot do it yet (#1628)
 
 ## M2: Viewer
 - [x] Terminal viewer: watch an agent's tmux session and take over its input from a browser, view-only by
@@ -23,8 +26,9 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [x] Window list in the viewer: watch any of the session's windows (job windows marked) without moving the
   agent, and type into the one shown (ADR-006; verified on BaileyServ 2026-10-22; Ctrl-b never reached tmux
   from a browser)
-- [ ] Desktop streaming layer on the same transport and take-over lock: JPEG frames over an exec pipe,
-  `xdotool` input (ADR-006 desktop addendum, #473); a live check on BaileyServ is still to do
+- [x] Desktop streaming layer on the same transport and take-over lock: JPEG frames over an exec pipe,
+  `xdotool` input (ADR-006 desktop addendum, #473; verified on BaileyServ 2026-11-26: 4 frames/s, take-over
+  shared with the terminal, ffmpeg gone within 5 s of the tab closing)
 
 ## M3: Control plane
 - [x] Spawner: create, pause (stops the VM), resume, destroy (keeps the workspace) and purge, verified through

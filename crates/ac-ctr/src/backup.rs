@@ -38,16 +38,41 @@ pub struct Sent {
     pub pruned: Vec<BackupId>,
 }
 
-/// What `dest` is as a backup destination: marked, holding earlier backups (an agent directory
-/// or the state copies), or neither. A missing directory is empty.
+/// What `dest` is as a backup destination: marked, holding completed earlier backups, or
+/// neither. A missing directory is empty, and so is one with only empty or unfinished
+/// directories in it: a mount point can hold those, a destination that ran holds more.
 pub fn destination(dest: &Path) -> Result<backup::Destination, PortError> {
-    let op = "backup destination";
     let marker = dest.join(backup::MARKER);
     let marked = std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file());
-    let holds = names_in(op, dest, true)?
-        .iter()
-        .any(|n| n == ac_domain::state::DIR || AgentId::parse(n).is_ok());
-    Ok(backup::Destination::of(marked, holds))
+    Ok(backup::Destination::of(marked, holds_backups(dest)?))
+}
+
+/// Whether `dest` holds a completed backup: an agent directory with a restorable chain (its
+/// full stream, renamed from `.part` once flushed), or a state copy with its manifest (written
+/// last, then renamed from `.part`).
+fn holds_backups(dest: &Path) -> Result<bool, PortError> {
+    let op = "backup destination";
+    for name in names_in(op, dest, true)? {
+        if AgentId::parse(&name).is_ok() {
+            if !backup::restorable(&streams_in(op, &dest.join(&name))?).is_empty() {
+                return Ok(true);
+            }
+            continue;
+        }
+        if name != ac_domain::state::DIR {
+            continue;
+        }
+        let state = dest.join(&name);
+        let copied = names_in(op, &state, true)?.iter().any(|id| {
+            BackupId::parse(id).is_ok()
+                && std::fs::symlink_metadata(state.join(id).join(ac_domain::state::MANIFEST))
+                    .is_ok_and(|m| m.is_file())
+        });
+        if copied {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Subvolume ids in `dir` that parse as backup ids, oldest first; nothing there is fine.
@@ -315,7 +340,33 @@ mod tests {
         let _ = std::fs::create_dir_all(dir.join("not an agent"));
         assert_eq!(is(&dir), backup::Destination::Empty, "a mount point");
         let _ = std::fs::create_dir_all(dir.join("a1"));
-        assert_eq!(is(&dir), backup::Destination::Unmarked);
+        let _ = std::fs::create_dir_all(dir.join("_state/20261125-033000"));
+        let _ = std::fs::create_dir_all(dir.join("_state/20261126-033000.part"));
+        let _ = std::fs::write(dir.join("_state/20261126-033000.part/MANIFEST"), b"");
+        assert_eq!(
+            is(&dir),
+            backup::Destination::Empty,
+            "empty or unfinished directories"
+        );
+        let _ = std::fs::write(dir.join("a1/20261125-033000.full.btrfs.part"), b"x");
+        let _ = std::fs::write(
+            dir.join("a1/20261126-033000.after-20261120-033000.btrfs"),
+            b"x",
+        );
+        assert_eq!(is(&dir), backup::Destination::Empty, "no restorable stream");
+        let _ = std::fs::write(dir.join("_state/20261125-033000/MANIFEST"), b"");
+        assert_eq!(
+            is(&dir),
+            backup::Destination::Unmarked,
+            "a completed state copy"
+        );
+        let _ = std::fs::remove_dir_all(dir.join("_state"));
+        let _ = std::fs::write(dir.join("a1/20261124-033000.full.btrfs"), b"x");
+        assert_eq!(
+            is(&dir),
+            backup::Destination::Unmarked,
+            "a completed stream"
+        );
         let _ = std::fs::write(dir.join(backup::MARKER), b"");
         assert_eq!(is(&dir), backup::Destination::Marked);
         let _ = std::fs::remove_dir_all(&dir);

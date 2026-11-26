@@ -1624,7 +1624,8 @@ for the most trusted token only, and the gateway's existing code does the work.
   - *Where:* `AC_BACKUP_DEST` in `gateway.env`. `ac-backup.service` reads the same file and uses it for its
     destination, instead of a path fixed in `ExecStart`. While it is unset, the backup routes answer 404 with
     "no backup destination". An unmounted share leaves its empty mount point, so a destination counts only
-    when it holds the marker file `.ac-backup-dest` or earlier backups (agent directories or `_state`).
+    when it holds the marker file `.ac-backup-dest` or a completed earlier backup: an agent's restorable
+    full stream, or a state copy with its `MANIFEST` (empty or `.part` directories do not count).
     `ac-ctl backup` refuses any other with a clear reason (exit 1) and writes the marker on one that already
     holds backups, so hosts set up before the marker keep backing up with no step. A new share needs
     `touch .ac-backup-dest` once, mounted. The gateway applies the same test (503 otherwise) and only reads.

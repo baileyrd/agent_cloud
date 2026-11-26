@@ -260,3 +260,51 @@ fn restore(
     }
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ac-ctl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("a1"));
+        let _ = std::fs::create_dir_all(dir.join("_state"));
+        dir
+    }
+
+    #[test]
+    fn empty_agent_and_state_directories_are_refused_and_left_unmarked() {
+        let dir = fresh("empty");
+        let refused = check_destination(&dir).err().unwrap_or_default();
+        assert!(refused.contains("is the share mounted?"), "{refused}");
+        assert!(
+            !dir.join(backup::MARKER).exists(),
+            "no marker on a bare mount point"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_completed_legacy_destination_is_marked_once() {
+        let dir = fresh("legacy");
+        let _ = std::fs::write(dir.join("a1/20261125-033000.full.btrfs"), b"stream");
+        assert_eq!(check_destination(&dir), Ok(()));
+        assert!(dir.join(backup::MARKER).is_file());
+        assert_eq!(check_destination(&dir), Ok(()), "marked now");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_fresh_destination_needs_the_marker_set_up() {
+        let dir = std::env::temp_dir().join(format!("ac-ctl-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(check_destination(&dir).is_err());
+        let _ = std::fs::write(dir.join(backup::MARKER), b"");
+        assert_eq!(check_destination(&dir), Ok(()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

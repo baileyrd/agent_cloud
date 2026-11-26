@@ -6,7 +6,8 @@
 # The destination is any directory, best a share on another machine, mounted at
 # /mnt/agent-backups. To use another path, set AC_BACKUP_DEST in gateway.env (the gateway's backup
 # routes read the same setting, ADR-031) and `systemctl edit ac-backup.service` to override
-# RequiresMountsFor. A run that leaves any agent without a backup (a
+# RequiresMountsFor. Either way the destination must hold the file .ac-backup-dest (create it once, with
+# the share mounted), or the run fails. A run that leaves any agent without a backup (a
 # plain-directory workspace, a full or missing share) exits 1, so the unit shows failed.
 [Unit]
 Description=agent-cloud workspace backups
@@ -17,6 +18,8 @@ Type=oneshot
 # The default; gateway.env overrides it.
 Environment=AC_BACKUP_DEST=/mnt/agent-backups
 EnvironmentFile=-/etc/agent-cloud/gateway.env
+# A share that is not mounted leaves its empty mount point: refuse it rather than fill the host disk.
+ExecStartPre=/usr/bin/test -f ${AC_BACKUP_DEST}/.ac-backup-dest
 ExecStart=/usr/local/bin/ac-ctl backup ${AC_BACKUP_DEST}
 # Backups yield to the agents' builds.
 Nice=19

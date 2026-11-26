@@ -228,7 +228,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
         let (Some(admin), Some(call)) = (&self.admin, admin::route(method, path)) else {
             return json(error(404, "not found"));
         };
-        let done = admin.serve(call, body, tokens::unix_now());
+        let done = admin.serve(call, body, tokens::unix_now(), token);
         if let Some(action) = rule.audit {
             eprintln!(
                 "ac-gateway: audit token={} action={action}{} status={}",

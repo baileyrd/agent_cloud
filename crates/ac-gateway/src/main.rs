@@ -294,6 +294,7 @@ fn watch(
     notify: Notify,
     stop: ShutdownHandle,
 ) {
+    let mut failing: Option<String> = None;
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let signal = signals.take();
@@ -303,27 +304,19 @@ fn watch(
             return stop.shutdown();
         }
         let force = signal == Some(SignalEvent::Hangup);
-        // Under the file's lock, as the admin routes publish, so an older read never wins.
-        // With no directory the routes cannot edit either, so read anyway; any other lock
-        // failure skips this round, since an unlocked read could publish an older set.
-        let _held = match file.lock() {
-            Ok(held) => Some(held),
-            Err(_) if !file.path().parent().is_some_and(|d| d.exists()) => None,
-            Err(e) => {
-                eprintln!(
-                    "ac-gateway: tokens not reloaded this round, keeping the current ones: {e}"
-                );
-                continue;
-            }
-        };
-        match file.reload(force) {
-            Ok(Some(tokens)) => {
-                let n = tokens.iter().count();
-                keys.set(tokens);
+        // Published only under the file's lock (see `TokenFile::publish`); a failure keeps the
+        // current set and is logged once until it changes, since it repeats every second.
+        match file.publish(&keys, force) {
+            Ok(Some(n)) => {
+                failing = None;
                 eprintln!("ac-gateway: tokens reloaded: {n} from the file");
             }
-            Ok(None) => {}
-            Err(e) => eprintln!("ac-gateway: tokens not reloaded, keeping the current ones: {e}"),
+            Ok(None) => failing = None,
+            Err(e) if failing.as_deref() == Some(e.as_str()) => {}
+            Err(e) => {
+                eprintln!("ac-gateway: tokens not reloaded, keeping the current ones: {e}");
+                failing = Some(e);
+            }
         }
     });
 }

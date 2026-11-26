@@ -622,6 +622,20 @@ impl TokenFile {
         Ok(lock)
     }
 
+    /// Re-read the file if it changed (or `force`) and put its tokens in force, both under
+    /// [`Self::lock`], as the admin routes publish: the number published, `Ok(None)` if it is
+    /// unchanged. Nothing is published without the lock: when it cannot be taken (no directory:
+    /// token storage not set up, so nothing can edit it either) the current set stays.
+    pub fn publish(&mut self, keys: &Keys, force: bool) -> Result<Option<usize>, String> {
+        let _held = self.lock()?;
+        let Some(tokens) = self.reload(force)? else {
+            return Ok(None);
+        };
+        let n = tokens.iter().count();
+        keys.set(tokens);
+        Ok(Some(n))
+    }
+
     /// Rewrite the file through `change`, under an exclusive lock on its directory, so concurrent
     /// edits do not lose each other. The current file must pass every check, and so must the
     /// result; it replaces the file atomically (temp file, fsync, rename), mode 0600.
@@ -917,6 +931,34 @@ mod tests {
         ));
         let huge = format!("Bearer {}", "x".repeat(100_000));
         assert!(matches!(t.find(Some(&huge)), Presented::Unknown(_)));
+    }
+
+    #[test]
+    fn publishing_needs_the_lock_and_keeps_the_set_without_it() {
+        let path = tmp();
+        let file = TokenFile::new(&path, me());
+        let one = Scopes::parse("jobs:read").unwrap_or_default();
+        let _ = file.create("ci", one, Agents::All, 1, None);
+        let keys = Keys::new(Tokens::default());
+        let mut watch = TokenFile::new(&path, me());
+        assert_eq!(watch.publish(&keys, false), Ok(Some(1)));
+        assert_eq!(watch.publish(&keys, false), Ok(None), "unchanged");
+        assert_eq!(keys.get().iter().count(), 1);
+
+        let gone = std::env::temp_dir().join(format!("ac-no-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gone);
+        let mut lost = TokenFile::new(gone.join("tokens"), me());
+        let err = lost.publish(&keys, true).err().unwrap_or_default();
+        assert!(
+            err.starts_with("ac-no-dir") || err.contains("ac-no-dir"),
+            "{err}"
+        );
+        assert_eq!(
+            keys.get().iter().count(),
+            1,
+            "a lock failure publishes nothing"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap_or(Path::new("/nonexistent")));
     }
 
     #[test]

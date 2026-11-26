@@ -1531,6 +1531,7 @@ no npm package and no third-party code.
 - *Not in the UI:* backups (ADR-021) and token management (ADR-011) have no API routes. Both are host-local
   on purpose: `ac-ctl` and `ac-gateway token` over sudo. Adding routes for them is new backend surface, and
   a token-minting route would let a stolen token mint more. They stay out unless a later ADR adds routes.
+  *Superseded 2026-11-26 (Nano):* the UI gets an admin section for both; ADR-031 adds the routes.
 
 **Alternatives considered:**
 - *Server-rendered pages from the gateway* (HTML built in Rust, forms posting back). A browser form cannot
@@ -1577,3 +1578,78 @@ names. Profiles are edited on the host, not here: the API has no route to change
 **Addendum (2026-11-25, slice 6):** the agent page's header links to the terminal viewer (`/ui/<agent>`) and the
 desktop stream (`/ui/desk/<agent>`, #473), shown only to a token with `viewer:read`. The viewers ask for their
 own token: this page's token is never passed on, since it lives only in this page's closure.
+
+## ADR-031: Admin routes and an admin page for tokens and backups
+**Status:** proposed (2026-11-26). Mill Board card #516. Asked for by Nano, who turned down ADR-030's cut:
+"The web ui needs to have an admin section for backups and token management".
+**Context:** tokens (ADR-011, ADR-022) and backups (ADR-021) are managed only on the host, with
+`ac-gateway token` and `ac-ctl` over sudo. ADR-030 left them out of the UI because they had no routes. The
+risk ADR-030 named still holds: a route that mints tokens lets a stolen token mint more. So these routes are
+for the most trusted token only, and the gateway's existing code does the work.
+
+**Decision.**
+- *Scope:* every route here needs `admin`. There is no new scope: a token that can mint tokens can already
+  grant itself anything, so a narrower `tokens:write` would only look narrower. A token restricted to some
+  agents can still hold `admin`, but these routes act on the whole host, so they also require `agents *`.
+  Without it the answer is 404, so a restricted admin cannot tell the routes exist.
+- *Not over MCP:* none of these routes is offered as an MCP tool (ADR-017). A token secret in a tool result
+  would land in a model's context and its logs.
+- *Tokens:*
+  - `GET /api/v1/tokens` lists name, scopes, agents, created, expires and whether it has expired. Never the
+    digest.
+  - `POST /api/v1/tokens/{name}` takes `{"scopes": [...], "agents": "*" | [...], "expires": "<n>m|h|d"?}` and
+    answers 201 with `{"name", "token"}`. The secret is shown once (`Cache-Control: no-store`), never logged,
+    and never stored except as its digest. The names, scopes, agents and lifetime follow the CLI's rules,
+    with the same parser.
+  - `DELETE /api/v1/tokens/{name}` revokes it.
+  - *Writer:* the gateway writes the tokens file with the CLI's own `TokenFile` code: under the `flock` on
+    its directory, then an atomic 0600 rewrite. ADR-011's "the gateway never writes the tokens file" becomes
+    "the gateway and the CLI write it only through `TokenFile`". The reload picks up the change, so a revoked
+    token's requests and open streams end as they do after the CLI's revoke.
+  - *Lockout guard:* a revoke that would leave no live token with `admin` for `*` is refused (409). This
+    covers revoking the calling token when it is the last such token. The host's CLI can still do it.
+  - *Audit:* the journal gets `audit token=<caller> action=token-create|token-revoke name=<name>
+    [scopes=<s>] [agents=<a>] [expires=<unix>] status=<code>`. No agent history: these are not per agent.
+- *Backups:*
+  - *Where:* `AC_BACKUP_DEST` in `gateway.env`. `ac-backup.service` reads the same file and uses it for its
+    destination, instead of a path fixed in `ExecStart`. While it is unset, the backup routes answer 404 with
+    "no backup destination". If the directory is missing (the share is not mounted), the answer is 503.
+  - `GET /api/v1/backups` lists, for each agent directory at the destination, its streams: id, full or
+    incremental, size, and whether it can be restored. It also lists the state copies (`_state`) and the
+    last run of `ac-backup.service` (active or not, its result, and when it last started and finished, from
+    `systemctl show`). It only reads, through the same `ac_domain::backup` rules as `ac-ctl backups`.
+  - `POST /api/v1/backups` starts `ac-backup.service` (`systemctl start --no-block`) and answers 202, or 409
+    while a run is active. The gateway does not send streams itself, so a run from the page is the same as
+    the timer's: nice 19, idle I/O, the unit's sandbox, one run at a time, and a failure shown by the unit.
+    It backs up every agent. That is the unit's job, and a per-agent run would need a second unit.
+  - `POST /api/v1/agents/{id}/restore-backup` takes `{"backup": "<id>"?}` (default the newest restorable)
+    and runs ADR-021's restore in the gateway: `CtrRuntime::restore_backup` under `<data>/backup.lock`. It
+    is refused (409) unless the agent is paused, with the same refusals as `ac-ctl restore-backup`. The
+    workspace there is kept as a checkpoint first, so the same checkpoint cap applies. The request lasts
+    as long as the receive. It is audited to the agent's history as `restore-backup backup=<id>`.
+  - *Not over the API:* `restore-state` needs the gateway stopped, so it stays on the CLI. Deleting backups is
+    left to retention. The destination is not changed from the page.
+- *Page:* `/ui/admin`, linked from the agents page only for an admin token for `*`. It is static, like
+  ADR-030's pages, and covered by the same catalog test.
+  - *Tokens:* a table with **Revoke** (confirmed first) and a create form (name, scope checkboxes, agents,
+    lifetime). The page suggests a 30-day lifetime and lets you clear it. The new secret is shown once, in a
+    box with a copy button and a note that it cannot be shown again. It is dropped from the page on the next
+    action.
+  - *Backups:* the last run with **Back up now**, the state copies, and each agent's backups. **Restore**
+    appears for a paused agent's restorable backups, confirmed first.
+
+**Alternatives considered:**
+- *A narrower `tokens:write` and `backups:write`.* A token that can mint tokens is `admin` in all but name,
+  so a narrower scope would mislead. Backups read every agent's workspace, so they are host-wide too.
+- *The gateway running `btrfs send` itself.* That would lose the unit's nice and I/O class, its sandbox and
+  its one-run-at-a-time, and it would tie a gateway restart to a long send.
+- *Leaving restore on the CLI.* The gateway already restores checkpoints with the same runtime, and a restore
+  needs the agent paused, which the page can show. Keeping it off the page would split the admin section.
+
+**Consequences:** a stolen admin token can now mint tokens and restore backups remotely. Before, it could
+already destroy every agent and type into every shell, so this widens what it can do over time more than
+what it can reach, and the journal records every use. The tokens file has two writers, both using
+`TokenFile`. A restore holds one HTTP request for minutes. The page shows a secret once, so a person can
+paste it into the wrong place, just as with the CLI.
+**Not now:** token rotation in one step (create then revoke); per-agent backup runs; restore-state over the
+API; showing a backup's file list (a stream cannot be browsed, ADR-021).

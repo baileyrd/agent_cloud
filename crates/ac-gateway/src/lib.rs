@@ -37,6 +37,7 @@
 //! 409 and changes nothing; without snapshots (no `with_snapshots`), 404.
 
 pub mod access;
+pub mod agui;
 pub mod bind;
 pub mod egress;
 pub mod jobs;

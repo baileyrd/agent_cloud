@@ -268,7 +268,7 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             ),
             Some(Answer::Text(text)) => untrusted(text.into_bytes()),
             None => match jobs::route(method, path) {
-                Some(route) => self.job(route, target, body),
+                Some(route) => self.job(route, target, body, token),
                 None => {
                     let may_attach = token.scopes.allows(Scope::EgressWrite);
                     if let Some(id) = crate::create_target(method, target) {
@@ -347,7 +347,13 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
 
     /// A job route. A submit takes the lifecycle lock around the agent's state check and the
     /// queueing, so a pause cannot slip between them; the others never take it.
-    fn job(&self, route: Result<Route, Reply>, target: &str, body: &[u8]) -> Response {
+    fn job(
+        &self,
+        route: Result<Route, Reply>,
+        target: &str,
+        body: &[u8],
+        token: &Token,
+    ) -> Response {
         let Some(jobs) = &self.jobs else {
             return json(error(404, "not found"));
         };
@@ -363,6 +369,16 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             });
         }
         let query = target.split_once('?').map_or("", |(_, q)| q);
+        if let Route::Events(id, job) = &route {
+            return match Jobs::events(jobs, id, job, query) {
+                Ok(stream) => events(Revocable {
+                    stream,
+                    keys: self.keys.clone(),
+                    token: token.clone(),
+                }),
+                Err(reply) => json(reply),
+            };
+        }
         match jobs.handle(route, query) {
             jobs::Answer::Json(reply) => json(reply),
             jobs::Answer::Output(bytes) => untrusted(bytes),
@@ -370,15 +386,16 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
     }
 }
 
-/// A viewer stream that ends once its token is revoked, changed or expired (checked at every
-/// message and keep-alive, so within a few seconds of the reload or the expiry). Ending it gives up the viewer's seat.
-struct Revocable {
-    stream: crate::viewer::Stream,
+/// A viewer or job-event stream that ends once its token is revoked, changed or expired (checked
+/// at every message and keep-alive, so within a few seconds of the reload or the expiry). Ending
+/// it gives up the stream's seat.
+struct Revocable<I> {
+    stream: I,
     keys: Keys,
     token: Token,
 }
 
-impl Iterator for Revocable {
+impl<I: Iterator<Item = Vec<u8>>> Iterator for Revocable<I> {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Vec<u8>> {
@@ -439,6 +456,18 @@ fn created_job(response: &Response) -> Option<String> {
 /// A request path for the log: control characters out, at most 200 characters.
 fn shown(path: &str) -> String {
     escape(&path.chars().take(200).collect::<String>())
+}
+
+/// A job's AG-UI events (#471). The text in them is agent-written: never sniffed or cached.
+fn events(stream: Revocable<jobs::EventStream>) -> Response {
+    let headers = [
+        ("X-Content-Type-Options", "nosniff"),
+        ("Cache-Control", "no-store"),
+    ];
+    with(
+        Response::stream(rusty_agui::sse::CONTENT_TYPE, stream),
+        &headers,
+    )
 }
 
 /// Agent-written bytes as plain text (see [`UNTRUSTED`]).

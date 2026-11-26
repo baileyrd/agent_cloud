@@ -172,11 +172,17 @@ impl Admin {
         Done { reply, audit }
     }
 
-    /// Put the file's tokens in force now; on failure the reload loop retries within a second.
+    /// Put the file's tokens in force now, read and published under the file's lock so a
+    /// concurrent refresh never publishes an older set; on failure the reload loop retries
+    /// within a second.
     fn refresh(&self) {
-        match self.file.list() {
-            Ok(tokens) => self.keys.set(tokens),
-            Err(e) => eprintln!("ac-gateway: admin: tokens not refreshed: {e}"),
+        let published = self.file.lock().and_then(|_held| {
+            let tokens = self.file.list()?;
+            self.keys.set(tokens);
+            Ok(())
+        });
+        if let Err(e) = published {
+            eprintln!("ac-gateway: admin: tokens not refreshed: {e}");
         }
     }
 }
@@ -585,6 +591,13 @@ mod tests {
             (who, Call::Create("dup"), one),
         ]);
         assert_eq!(creates, [201, 409]);
+        let names = |t: &Tokens| t.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        let file = a.file.list().unwrap_or_default();
+        assert_eq!(
+            names(&a.keys.get()),
+            names(&file),
+            "the newest set is in force"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -285,8 +285,18 @@ fn watch(
         }
         let force = signal == Some(SignalEvent::Hangup);
         // Under the file's lock, as the admin routes publish, so an older read never wins.
-        // Without a lock (no directory) the routes cannot edit either: read anyway.
-        let _held = file.lock().ok();
+        // With no directory the routes cannot edit either, so read anyway; any other lock
+        // failure skips this round, since an unlocked read could publish an older set.
+        let _held = match file.lock() {
+            Ok(held) => Some(held),
+            Err(_) if !file.path().parent().is_some_and(|d| d.exists()) => None,
+            Err(e) => {
+                eprintln!(
+                    "ac-gateway: tokens not reloaded this round, keeping the current ones: {e}"
+                );
+                continue;
+            }
+        };
         match file.reload(force) {
             Ok(Some(tokens)) => {
                 let n = tokens.iter().count();

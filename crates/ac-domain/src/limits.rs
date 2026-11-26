@@ -11,6 +11,10 @@ pub const CPU_PERIOD_US: u64 = 100_000;
 /// Real builds: VM PSS ran ~120 MiB above the guest memory in `/dev/shm`).
 pub const MIN_OVERHEAD_MIB: u64 = 128;
 
+/// MiB and GiB as shifts into bytes.
+const MIB_SHIFT: u32 = 20;
+const GIB_SHIFT: u32 = 30;
+
 /// Most cores a limit may name.
 const MAX_CPUS: u32 = 1024;
 
@@ -70,11 +74,13 @@ impl AgentLimits {
     /// Unset or empty means no limit; zero or anything malformed is an error.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let var = |key: &str| get(key).filter(|v| !v.trim().is_empty());
-        let size = |key: &str| -> Result<Option<u64>, String> {
+        // `shift` turns the unit into bytes; a value whose bytes overflow u64 is refused, not wrapped.
+        let size = |key: &str, shift: u32| -> Result<Option<u64>, String> {
+            let most = u64::MAX >> shift;
             var(key)
                 .map(|v| match v.trim().parse::<u64>() {
-                    Ok(n) if n > 0 => Ok(n),
-                    _ => Err(format!("{key}={v}: want a whole number above 0")),
+                    Ok(n) if n > 0 && n <= most => Ok(n),
+                    _ => Err(format!("{key}={v}: want a whole number from 1 to {most}")),
                 })
                 .transpose()
         };
@@ -83,8 +89,8 @@ impl AgentLimits {
             .transpose()?;
         Ok(Self {
             cpus,
-            memory_mib: size("AC_AGENT_MEMORY_MIB")?,
-            disk_gib: size("AC_AGENT_DISK_GIB")?,
+            memory_mib: size("AC_AGENT_MEMORY_MIB", MIB_SHIFT)?,
+            disk_gib: size("AC_AGENT_DISK_GIB", GIB_SHIFT)?,
         })
     }
 
@@ -120,14 +126,20 @@ impl AgentLimits {
         let cpu = self.cpus.map(|c| ("cpu.max", c.cpu_max()));
         let memory = self
             .memory_mib
-            .map(|m| ("memory.max", (m << 20).to_string()));
+            .map(|m| ("memory.max", bytes(m, MIB_SHIFT).to_string()));
         [cpu, memory].into_iter().flatten().collect()
     }
 
     /// The workspace quota in bytes, for `btrfs qgroup limit`.
     pub fn disk_bytes(&self) -> Option<u64> {
-        self.disk_gib.map(|g| g << 30)
+        self.disk_gib.map(|g| bytes(g, GIB_SHIFT))
     }
+}
+
+/// `n << shift`, saturating: parsing refuses values that overflow, so this only guards limits
+/// built by hand, and a saturated limit is never smaller than the one asked for.
+fn bytes(n: u64, shift: u32) -> u64 {
+    n.saturating_mul(1 << shift)
 }
 
 impl fmt::Display for AgentLimits {
@@ -248,10 +260,37 @@ mod tests {
             ("AC_AGENT_MEMORY_MIB", "0"),
             ("AC_AGENT_MEMORY_MIB", "2G"),
             ("AC_AGENT_DISK_GIB", "-1"),
+            ("AC_AGENT_MEMORY_MIB", "17592186044416"),
+            ("AC_AGENT_DISK_GIB", "17179869185"),
         ] {
             let err = from(&[(key, value)]).err().unwrap_or_default();
             assert!(err.starts_with(key), "{key}={value}: {err}");
         }
+    }
+
+    #[test]
+    fn largest_sizes_parse_without_wrapping() {
+        let max_mib = (u64::MAX >> MIB_SHIFT).to_string();
+        let max_gib = (u64::MAX >> GIB_SHIFT).to_string();
+        let l = from(&[
+            ("AC_AGENT_MEMORY_MIB", &max_mib),
+            ("AC_AGENT_DISK_GIB", &max_gib),
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        let memory = l.cgroup_files().pop().map(|(_, v)| v).unwrap_or_default();
+        assert_eq!(memory, ((u64::MAX >> MIB_SHIFT) << MIB_SHIFT).to_string());
+        assert_eq!(l.disk_bytes(), Some((u64::MAX >> GIB_SHIFT) << GIB_SHIFT));
+    }
+
+    #[test]
+    fn hand_built_overflow_saturates_instead_of_shrinking() {
+        let l = AgentLimits {
+            memory_mib: Some(u64::MAX),
+            disk_gib: Some(u64::MAX),
+            ..AgentLimits::default()
+        };
+        assert_eq!(l.disk_bytes(), Some(u64::MAX));
+        assert_eq!(l.cgroup_files(), vec![("memory.max", u64::MAX.to_string())]);
     }
 
     #[test]

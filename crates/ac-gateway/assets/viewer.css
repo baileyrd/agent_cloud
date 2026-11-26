@@ -48,3 +48,7 @@ button[hidden] { display: none; }
   background: var(--fg); opacity: 0.55; pointer-events: none;
 }
 #measure { position: absolute; visibility: hidden; white-space: pre; font: 14px/var(--lh) ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace; }
+#other { color: var(--accent); }
+#desk { flex: 1; overflow: auto; outline: none; display: flex; justify-content: center; align-items: flex-start; }
+#desk:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+#desk canvas { max-width: 100%; height: auto; background: #000; }

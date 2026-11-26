@@ -45,8 +45,8 @@ reuse of ports-and-adapters patterns from the owner's existing Rust tooling.
 async (ADR-006).
 
 ## ADR-006: Viewer (terminal now, desktop later)
-**Status:** accepted for the terminal (2026-10-20, verified on BaileyServ); the desktop stream
-is still open.
+**Status:** accepted for the terminal (2026-10-20, verified on BaileyServ); desktop stream decided
+2026-11-25 (addendum below), not yet verified live.
 **Decision (terminal):** the owner watches an agent's tmux session `main` in a browser and can
 take over its input, while the agent keeps running. All of it lives in `ac-gateway` (one
 process owns the registry lock); bearer-token auth and the private-bind check are unchanged.
@@ -105,9 +105,54 @@ process owns the registry lock); bearer-token auth and the private-bind check ar
 **Consequences:** a viewer with the lock has the agent's shell, and so its login. Output while
 nobody watches is not recorded (it stays in tmux scrollback). A vanished browser is noticed at
 the next keep-alive write (5 s); a half-open connection holds its seat until TCP gives up.
-**Open (desktop):** Dots' viewer protocol is unknown. Options: KasmVNC (bundles X server, VNC
-and web client), Xvfb/x11vnc plus noVNC, a WebRTC streamer (Neko, Selkies), or ffmpeg
-`x11grab` into the gateway. Leaning: KasmVNC behind the gateway, on the same transport and lock.
+**Addendum (2026-11-25, #473; decided by the owner): the desktop stream sends JPEG frames over an exec
+pipe.** The options were KasmVNC (the earlier leaning), Xvfb/x11vnc with noVNC, a WebRTC streamer (Neko,
+Selkies), and `ffmpeg x11grab` into the gateway. KasmVNC and noVNC need a WebSocket. rusty_serve has none,
+so either rusty_mill gains one (a pin bump) or the stream bypasses the gateway's token, scopes and lock.
+They also bring third-party client JavaScript, which breaks the page's "no third-party code, CSP `'self'`"
+property, and KasmVNC brings its own X server in place of the image's Xorg. WebRTC adds ICE/STUN to a
+tailnet-only host. Chosen: the terminal's own pattern.
+- *Frames:* one long-lived `Exec` per watched desktop runs `ffmpeg -f x11grab -framerate 4 -i :0 -f
+  image2pipe -c:v mjpeg -q:v 10 -` in the guest (images/agent-desktop installs `ffmpeg-free`). The
+  gateway splits its stdout into JPEGs at EOI (`ac_viewer::desk::Frames`; byte stuffing means the first
+  `FF D9` after `FF D8` ends a frame). A frame over 8 MiB is dropped. Each frame goes to every viewer as an
+  NDJSON `frame` message (base64) on the same `fetch`-streamed chunked GET as the terminal, `GET
+  .../desk`. A frame identical to the last one (SHA-256) is not sent, so an idle desktop costs no
+  bandwidth. A joining viewer gets the latest frame at once. Each viewer queues 8 messages. Frames may
+  fill only 6 of them, and a frame past that is skipped for that viewer only, so a `mode` or `bye` always
+  reaches a viewer that is behind on frames (a slow viewer keeps a take-over). `q` on stdin stops ffmpeg
+  while the gateway still reads its stdout (up to 2 s): with stdout closed first, `ctr` would die of
+  SIGPIPE before passing on the quit and leave ffmpeg running in the guest. The `Exec` discipline (quit,
+  signals, reap, then stdin) is unchanged. No port into the VM and no new host process.
+- *One lock:* desktop and terminal viewers of an agent share one registry entry. There is one take-over
+  lock between them (a desktop take-over is refused while a terminal viewer holds it, unless forced, and
+  the reverse) and one per-agent cap. Every viewer of either stream gets the `mode` message. Each stream
+  keeps its input client only while one of its own viewers holds the lock. A viewer id belongs to its
+  stream: a desktop viewer is 404 on the terminal routes and the reverse. When the lock leaves a
+  desktop viewer, its input client releases any mouse button it left down before it quits.
+- *Input:* view-only is the default, and input from a viewer without the lock gets 403 before anything
+  is built. The take-over client is a constant `sh` loop in the guest that runs one `xdotool` per line.
+  It is sent only lines rendered by `ac_viewer::desk::DeskInput`:
+  - `POST .../desk/{viewer}/pointer`: `move X Y` (0 to 8192), `down B`, `up B`, `click B` (B 1 to 5)
+  - `POST .../keys`: X key names or chords, letters, digits, `_` and `+` only, at most 64
+  - `POST .../text`: at most 1024 characters, typed one key per character, as letters and digits,
+    `Return`, `Tab` or `U<hex>` keysyms
+
+  Anything else is 400 (413 past a cap), so no viewer text is read as shell or `xdotool` syntax.
+  Take-over and release are audited as on the terminal (`viewer:control`). Watching needs `viewer:read`.
+- *Page:* `/ui/desk/<agent>` (about 200 lines of in-repo JS, CSP unchanged). It draws each frame on a
+  canvas from a `Blob` through `createImageBitmap`, so no image URL is loaded and nothing is parsed as
+  HTML. Pointer coordinates are scaled from the drawn size to screen pixels. Moves are coalesced, with one
+  request in flight, and keep their order with button presses. A stream that ends before its first frame
+  (no ffmpeg in the image, say) is retried with a doubling wait, up to 60 s. The terminal and desktop
+  pages link to each other.
+- *Recording:* take-over and release events go to the agent's history as on the terminal. Frames are
+  not recorded (a 1080p JPEG is about 150 to 300 KiB). Keystrokes are not recorded either.
+**Consequences:** about 4 frames a second at full resolution, enough to watch and to click, not
+for video. A changing screen costs roughly 0.5 to 1 MiB/s per viewer, and the frame client costs the
+guest one ffmpeg (CPU to measure on the host). No audio, no clipboard sync (type with `text`).
+Not verified live yet: the frame rate, bandwidth and CPU on BaileyServ, and `xdotool` under Xorg's dummy
+driver.
 
 ## ADR-007: Egress control
 **Status:** accepted (2026-10-19; verified on BaileyServ; agent isolation and the firewalld zone
@@ -346,6 +391,8 @@ Handing a script or another agent a token to submit jobs also let it destroy age
   | `POST .../{id}/jobs`, `.../jobs/{job}/cancel` | `jobs:write` |
   | `GET .../{id}/term` (stream), `.../history`; `POST .../{id}/term/{viewer}/window` (pick a window to watch) | `viewer:read` |
   | `POST .../{id}/term/{viewer}/takeover` (`?force=true`), `release`, `keys`, `text`, `paste`, `resize` | `viewer:control` |
+  | `GET .../{id}/desk` (desktop stream, ADR-006) | `viewer:read` |
+  | `POST .../{id}/desk/{viewer}/takeover` (`?force=true`), `release`, `pointer`, `keys`, `text` | `viewer:control` |
   | `GET /api/v1/egress/profiles`, `GET .../{id}/egress` (ADR-016) | `agents:read` |
   | `PUT .../{id}/egress` (set its profiles; also `egress_profiles` on create) | `egress:write` |
   | `GET .../{id}/checkpoints` (ADR-018) | `agents:read` |

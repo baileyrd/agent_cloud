@@ -15,7 +15,7 @@ use ac_domain::{AgentId, State};
 use ac_fleet::Fleet;
 use ac_gateway::egress::EgressStore;
 use ac_gateway::tokens::{Agents, Keys, Scopes, Token, TokenFile, Tokens};
-use ac_gateway::viewer::{Hub, Terminal, ViewClient, ViewCommand, Writer};
+use ac_gateway::viewer::{Desktop, Hub, Terminal, ViewClient, ViewCommand, Writer};
 use ac_gateway::web::App;
 use ac_gateway::Api;
 use ac_ports::{PortError, Runtime, SessionStore};
@@ -490,6 +490,8 @@ struct Viewer {
     r: BufReader<TcpStream>,
     id: String,
     token: String,
+    /// `term` or `desk`.
+    kind: &'static str,
 }
 
 impl Viewer {
@@ -498,12 +500,21 @@ impl Viewer {
     }
 
     fn open_as(addr: SocketAddr, token: &str, agent: &str) -> Result<Self, u16> {
+        Self::open_kind(addr, token, agent, "term")
+    }
+
+    fn open_kind(
+        addr: SocketAddr,
+        token: &str,
+        agent: &str,
+        kind: &'static str,
+    ) -> Result<Self, u16> {
         let s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
         let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
         let mut w = s.try_clone().unwrap_or_else(|e| panic!("{e}"));
         let _ = write!(
             w,
-            "GET /api/v1/agents/{agent}/term HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n"
+            "GET /api/v1/agents/{agent}/{kind} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n"
         );
         let mut r = BufReader::new(s);
         let mut status = String::new();
@@ -522,6 +533,7 @@ impl Viewer {
             r,
             id: String::new(),
             token: token.to_owned(),
+            kind,
         };
         let hello = v.next().unwrap_or_default();
         v.id = hello.split('"').nth(7).unwrap_or_default().to_owned();
@@ -569,7 +581,7 @@ impl Viewer {
     }
 
     fn post_as(&self, addr: SocketAddr, token: &str, action: &str, body: &str) -> (u16, String) {
-        let path = format!("/api/v1/agents/a1/term/{}/{action}", self.id);
+        let path = format!("/api/v1/agents/a1/{}/{}/{action}", self.kind, self.id);
         request_as(
             addr,
             token,
@@ -1323,4 +1335,413 @@ fn mcp_tools_follow_the_token_scopes() {
     let cross = ["Origin: http://evil.example"];
     assert_eq!(rpc(&jobs, &cross, init).0, 403);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---- the desktop stream (ADR-006 desktop addendum) -------------------------------------------
+
+/// A fake desktop: the test pushes frame bytes; input lines and quits are recorded.
+#[derive(Clone, Default)]
+struct FakeDesk(Arc<Mutex<DeskWorld>>);
+
+#[derive(Default)]
+struct DeskWorld {
+    /// stdout of each live frame client.
+    frames: Vec<Sender<Vec<u8>>>,
+    frame_clients: usize,
+    /// Every line any input client received, quits included.
+    input: Vec<String>,
+    input_clients: usize,
+    /// For each `q` a frame client got: whether its stdout was still being read.
+    quit_with_stdout: Vec<bool>,
+}
+
+impl FakeDesk {
+    fn world(&self) -> std::sync::MutexGuard<'_, DeskWorld> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn push(&self, bytes: &[u8]) {
+        self.world()
+            .frames
+            .retain(|tx| tx.send(bytes.to_vec()).is_ok());
+    }
+    fn input(&self) -> Vec<String> {
+        self.world().input.clone()
+    }
+}
+
+struct DeskIn {
+    desk: FakeDesk,
+    alive: Rc<Cell<bool>>,
+    quit: &'static str,
+    /// The frame client's stdout, while open; `None` for the input loop.
+    out_open: Option<Rc<Cell<bool>>>,
+}
+
+/// A frame client's stdout: what the test pushes, then EOF once the client has quit.
+struct DeskOut {
+    rx: Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+    alive: Rc<Cell<bool>>,
+    open: Rc<Cell<bool>>,
+}
+
+impl File for DeskOut {
+    fn read(&mut self, buf: &mut [u8]) -> platform::error::Result<usize> {
+        while self.pending.is_empty() {
+            if !self.alive.get() {
+                return Ok(0);
+            }
+            match self.rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(b) => self.pending = b,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.pending.len());
+        buf[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+    fn write(&mut self, b: &[u8]) -> platform::error::Result<usize> {
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> platform::error::Result<()> {
+        Ok(())
+    }
+    fn sync_all(&mut self) -> platform::error::Result<()> {
+        Ok(())
+    }
+    fn try_clone(&self) -> platform::error::Result<Box<dyn File>> {
+        Err(PlatformError::new(
+            ErrorKind::Unsupported,
+            OsCode::None,
+            "clone",
+        ))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Drop for DeskOut {
+    fn drop(&mut self) {
+        self.open.set(false);
+    }
+}
+
+impl File for DeskIn {
+    fn read(&mut self, _: &mut [u8]) -> platform::error::Result<usize> {
+        Ok(0)
+    }
+    fn write(&mut self, buf: &[u8]) -> platform::error::Result<usize> {
+        for line in String::from_utf8_lossy(buf).lines() {
+            if line == self.quit {
+                self.alive.set(false);
+                if let Some(open) = &self.out_open {
+                    self.desk.world().quit_with_stdout.push(open.get());
+                }
+            }
+            if self.quit == "quit" {
+                self.desk.world().input.push(line.to_owned());
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> platform::error::Result<()> {
+        Ok(())
+    }
+    fn sync_all(&mut self) -> platform::error::Result<()> {
+        Ok(())
+    }
+    fn try_clone(&self) -> platform::error::Result<Box<dyn File>> {
+        Err(PlatformError::new(
+            ErrorKind::Unsupported,
+            OsCode::None,
+            "clone",
+        ))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Desktop for FakeDesk {
+    fn attach_frames(&self, _: &AgentId) -> Result<Exec, String> {
+        let alive = Rc::new(Cell::new(true));
+        let (tx, rx) = mpsc::channel();
+        let mut w = self.world();
+        w.frames.push(tx);
+        w.frame_clients += 1;
+        let open = Rc::new(Cell::new(true));
+        let stdin = DeskIn {
+            desk: self.clone(),
+            alive: Rc::clone(&alive),
+            quit: "q",
+            out_open: Some(Rc::clone(&open)),
+        };
+        let out = DeskOut {
+            rx,
+            pending: Vec::new(),
+            alive: Rc::clone(&alive),
+            open,
+        };
+        let child = FakeChild {
+            alive,
+            stdin: Some(Box::new(stdin)),
+            stdout: Some(Box::new(out)),
+        };
+        Ok(Exec::new(
+            Box::new(child),
+            b"q\n",
+            Duration::from_millis(100),
+        ))
+    }
+    fn attach_input(&self, _: &AgentId) -> Result<Exec, String> {
+        let alive = Rc::new(Cell::new(true));
+        self.world().input_clients += 1;
+        let stdin = DeskIn {
+            desk: self.clone(),
+            alive: Rc::clone(&alive),
+            quit: "quit",
+            out_open: None,
+        };
+        let child = FakeChild {
+            alive,
+            stdin: Some(Box::new(stdin)),
+            stdout: None,
+        };
+        Ok(Exec::new(
+            Box::new(child),
+            b"quit\n",
+            Duration::from_millis(100),
+        ))
+    }
+}
+
+fn serve_desk(fake: &Fake, desk: &FakeDesk, history: &std::path::Path, keys: Keys) -> SocketAddr {
+    let api = Api::new(Fleet::new(Rt, Store::default()));
+    let hub = Hub::with_caps(fake.clone(), history.to_path_buf(), 4, 16).with_desktop(desk.clone());
+    let server = Server::bind_shared(
+        "127.0.0.1:0".parse().unwrap_or_else(|e| panic!("{e}")),
+        App::new(api, hub, keys),
+    )
+    .unwrap_or_else(|e| panic!("bind: {e}"));
+    let addr = server.local_addr().unwrap_or_else(|e| panic!("{e}"));
+    std::thread::spawn(move || server.run());
+    addr
+}
+
+fn owner_keys() -> Keys {
+    let mut t = Tokens::default();
+    let _ = t.add(Token::admin("owner", TOKEN));
+    Keys::new(t)
+}
+
+fn jpeg(body: &[u8]) -> Vec<u8> {
+    [&[0xFF, 0xD8][..], body, &[0xFF, 0xD9]].concat()
+}
+
+#[test]
+fn a_desktop_is_watched_and_taken_over_on_the_terminals_lock() {
+    let (fake, desk, dir) = (Fake::new(), FakeDesk::default(), tmp("desk"));
+    let addr = serve_desk(&fake, &desk, &dir, owner_keys());
+    let mut d = Viewer::open_kind(addr, TOKEN, "a1", "desk").unwrap_or_else(|c| panic!("open {c}"));
+    assert_eq!(d.id.len(), 16);
+    assert!(d.until("\"t\":\"mode\"").contains("null"));
+    wait_for("frame client", || desk.world().frame_clients == 1);
+
+    // Frames arrive base64-encoded, split across reads; a repeat is not sent again.
+    let one = jpeg(b"one");
+    let (head, tail) = one.split_at(3);
+    desk.push(head);
+    desk.push(tail);
+    let msg = d.until("\"t\":\"frame\"");
+    assert_eq!(msg, "{\"t\":\"frame\",\"jpeg\":\"/9hvbmX/2Q==\"}\n");
+    desk.push(&one);
+    desk.push(&jpeg(b"two"));
+    let next = d.until("\"t\":\"frame\"");
+    assert_eq!(
+        next, "{\"t\":\"frame\",\"jpeg\":\"/9h0d2//2Q==\"}\n",
+        "the repeat was skipped"
+    );
+
+    // A viewer that joins gets the latest frame at once.
+    let mut d2 = Viewer::open_kind(addr, TOKEN, "a1", "desk").unwrap_or_else(|c| panic!("{c}"));
+    assert!(d2.until("\"t\":\"frame\"").contains("/9h0d2//2Q=="));
+    assert_eq!(
+        desk.world().frame_clients,
+        1,
+        "one frame client per desktop"
+    );
+
+    // View-only input is refused before any command is built.
+    assert_eq!(d.post(addr, "pointer", "move 1 2").0, 403);
+    assert_eq!(d.post(addr, "keys", "Return").0, 403);
+    assert_eq!(desk.world().input_clients, 0);
+
+    // One lock with the terminal: a terminal viewer sees the desktop take over and is refused.
+    let mut t = Viewer::open(addr, "a1").unwrap_or_else(|c| panic!("{c}"));
+    assert_eq!(d.post(addr, "takeover", "").0, 200);
+    t.until(&format!("\"owner\":\"{}\"", d.id));
+    assert_eq!(t.post(addr, "takeover", "").0, 409);
+    assert_eq!(t.post(addr, "text", "x").0, 403);
+    assert_eq!(d.post(addr, "pointer", "move 10 20").0, 200);
+    assert_eq!(d.post(addr, "pointer", "click 1").0, 200);
+    assert_eq!(d.post(addr, "keys", "ctrl+l Return").0, 200);
+    assert_eq!(d.post(addr, "text", "hi!\n").0, 200);
+    for (action, body, want) in [
+        ("pointer", "move 1 2; reboot", 400),
+        ("pointer", "down 9", 400),
+        ("keys", "$(id)", 400),
+        ("keys", "a\nb", 400),
+        ("text", "\u{1b}[A", 400),
+    ] {
+        assert_eq!(d.post(addr, action, body).0, want, "{action} {body:?}");
+    }
+    let long = "a".repeat(2000);
+    assert_eq!(d.post(addr, "text", &long).0, 413);
+    wait_for("input lines", || desk.input().len() >= 4);
+    assert_eq!(
+        desk.input(),
+        [
+            "move 10 20",
+            "click 1",
+            "key ctrl+l Return",
+            "key h i U0021 Return"
+        ]
+    );
+    // Neither stream's input reaches the other: tmux got nothing.
+    assert!(fake.sent(true).is_empty());
+
+    // A forced terminal take-over ends the desktop's input client and makes it view-only; a
+    // button it held is let go first.
+    assert_eq!(d.post(addr, "pointer", "down 1").0, 200);
+    assert_eq!(t.post(addr, "takeover?force=true", "").0, 200);
+    d.until(&format!("\"owner\":\"{}\"", t.id));
+    wait_for("input client quit", || {
+        desk.input().last().map(String::as_str) == Some("quit")
+    });
+    assert_eq!(desk.input()[4..], ["down 1", "up 1", "quit"]);
+    assert_eq!(d.post(addr, "pointer", "move 1 1").0, 403);
+    assert_eq!(t.post(addr, "text", "ls\n").0, 200);
+    wait_for("terminal input", || fake.sent(true).len() == 1);
+    assert_eq!(t.post(addr, "release", "").0, 200);
+    d.until("\"owner\":null");
+
+    // Viewer ids are per stream: a desktop viewer is unknown to the terminal routes and back.
+    let cross = |v: &Viewer, kind: &str| {
+        let path = format!("/api/v1/agents/a1/{kind}/{}/takeover", v.id);
+        request(
+            addr,
+            "POST",
+            &path,
+            &[&format!("Origin: http://{addr}")],
+            "",
+        )
+        .0
+    };
+    assert_eq!(cross(&d, "term"), 404);
+    assert_eq!(cross(&t, "desk"), 404);
+
+    // Leaving with the lock gives it up; the last viewer gone stops the frame client.
+    assert_eq!(d.post(addr, "takeover", "").0, 200);
+    drop(d);
+    t.until("\"owner\":null");
+    drop(d2);
+    wait_for("frame client quit", || {
+        desk.push(&jpeg(b"tick"));
+        desk.world().frames.is_empty()
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_desk_frame_client_is_quit_while_its_stdout_is_still_read() {
+    let (fake, desk, dir) = (Fake::new(), FakeDesk::default(), tmp("desk-quit"));
+    let addr = serve_desk(&fake, &desk, &dir, owner_keys());
+    let mut d = Viewer::open_kind(addr, TOKEN, "a1", "desk").unwrap_or_else(|c| panic!("{c}"));
+    d.until("\"t\":\"mode\"");
+    wait_for("frame client", || desk.world().frame_clients == 1);
+    drop(d);
+    let mut n = 0u32;
+    wait_for("frame client quit", || {
+        n += 1;
+        desk.push(&jpeg(&n.to_be_bytes()));
+        !desk.world().quit_with_stdout.is_empty()
+    });
+    assert!(
+        desk.world().quit_with_stdout.iter().all(|open| *open),
+        "q reached ffmpeg after its stdout was closed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn desktop_routes_follow_the_viewer_scopes() {
+    use std::os::unix::fs::MetadataExt;
+    let (fake, desk, dir) = (Fake::new(), FakeDesk::default(), tmp("desk-scopes"));
+    let _ = std::fs::create_dir_all(&dir);
+    let me = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
+    let file = TokenFile::new(dir.join("tokens"), me);
+    let make = |name: &str, scopes: &str| {
+        let scopes = Scopes::parse(scopes).unwrap_or_else(|e| panic!("{e}"));
+        file.create(name, scopes, Agents::All, 1, None)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let watch = make("watch", "viewer:read");
+    let jobs = make("jobs", "jobs:read");
+    let mut t = file.list().unwrap_or_else(|e| panic!("{e}"));
+    let _ = t.add(Token::admin("owner", TOKEN));
+    let addr = serve_desk(&fake, &desk, &dir, Keys::new(t));
+    assert_eq!(
+        Viewer::open_kind(addr, &jobs, "a1", "desk").err(),
+        Some(403)
+    );
+    let v = Viewer::open_kind(addr, &watch, "a1", "desk").unwrap_or_else(|c| panic!("{c}"));
+    assert_eq!(
+        v.post(addr, "takeover", "").0,
+        403,
+        "viewer:read cannot take over"
+    );
+    assert_eq!(v.post(addr, "pointer", "move 1 1").0, 403);
+    assert_eq!(
+        v.post_as(addr, TOKEN, "takeover", "").0,
+        404,
+        "another token's viewer"
+    );
+    assert_eq!(v.post(addr, "explode", "").0, 404);
+    let path = format!("/api/v1/agents/a1/desk/{}/takeover", v.id);
+    assert_eq!(request_as(addr, &watch, "GET", &path, &[], "").0, 405);
+    drop(v);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn without_a_desktop_the_stream_is_not_found() {
+    let (fake, dir) = (Fake::new(), tmp("no-desk"));
+    let addr = serve(&fake, &dir, 4, 16);
+    // The page itself is static and needs no token; only the stream answers 404.
+    for (path, want) in [
+        ("/ui/desk/a1", 200),
+        ("/ui/desk.js", 200),
+        ("/ui/desk/A!", 404),
+    ] {
+        let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{e}"));
+        let _ = write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        );
+        let mut raw = String::new();
+        let _ = s.read_to_string(&mut raw);
+        let code: u16 = raw.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+        assert_eq!(code, want, "{path}");
+        if want == 200 {
+            assert!(raw.contains("script-src 'self'"), "{path}: {raw}");
+        }
+    }
+    assert_eq!(
+        Viewer::open_kind(addr, TOKEN, "a1", "desk").err(),
+        Some(404)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -333,6 +333,7 @@
   }
 
   $('agent').textContent = agent;
+  $('other').href = `/ui/desk/${encodeURIComponent(agent)}`;
   document.title = `${agent}: agent viewer`;
   show();
   connect();

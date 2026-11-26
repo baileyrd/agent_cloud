@@ -5,6 +5,8 @@
 # This adds every library the agent needs from the host into the initrd. It also adds the
 # guest network driver (virtio_net and its dependencies, loadable modules on Fedora) so a VM
 # with a network card can configure eth0; without it the shim retries update_interface forever.
+# It also loads virtio_balloon: without it the guest cannot report freed pages, and
+# reclaim_guest_freed_memory = true does nothing (#478, ADR-032).
 # The initrd has no udev and nothing that reads kata-modules.conf, so the modules are also
 # decompressed (busybox insmod cannot read .xz) and insmod'ed by a kata-agent.service drop-in.
 # Idempotent; the original is kept as <initrd>.orig. Re-run after a kernel update regenerates it.
@@ -59,7 +61,7 @@ KO=usr/lib/kata-net
 mkdir -p "$KO" usr/lib/systemd/system/kata-agent.service.d
 dropin=usr/lib/systemd/system/kata-agent.service.d/10-net-modules.conf
 echo "[Service]" > "$dropin"
-for m in failover net_failover virtio_net; do
+for m in failover net_failover virtio_net virtio_balloon; do
     src=$(modinfo -k "$KVER" -n "$m" 2>/dev/null || true)
     case "$src" in /*) ;; *) continue ;; esac
     case "$src" in

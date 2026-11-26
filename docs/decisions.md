@@ -1676,3 +1676,20 @@ what it can reach, and the journal records every use. The tokens file has two wr
 paste it into the wrong place, just as with the CLI.
 **Not now:** token rotation in one step (create then revoke); per-agent backup runs; restore-state over the
 API; showing a backup's file list (a stream cannot be browsed, ADR-021).
+
+## ADR-032: Guests return freed memory through free page reporting
+**Status:** proposed (2026-11-26). Mill Board card #478. Measured in docs/sizing.md, "Guests returning memory".
+**Context:** a guest keeps every page it has ever touched, so a long-lived agent holds its peak until it is
+paused. Kata offers two options: free page reporting (`reclaim_guest_freed_memory`, the balloon's
+`free-page-reporting=on`) and virtio-mem (`enable_virtio_mem`).
+**Decision:** turn on `reclaim_guest_freed_memory = true` in Kata's configuration, and have
+`scripts/fix-kata-initrd.sh` load `virtio_balloon` in the guest, since the shipped initrd lacks it and the
+setting does nothing without it. Leave `enable_virtio_mem = false`.
+**Why:** with both in place, 1.5 GiB freed in a guest was back on the host within 60 s (cgroup 1857 → 377 MiB,
+`/dev/shm` likewise). virtio-mem returned nothing; it resizes RAM only on request.
+**Consequences:** host memory tracks what agents use now, not their peak. Admission still reserves
+`default_memory` per agent (ADR-012), so this adds headroom but not capacity. A later ADR could count the
+returned memory. The balloon has `deflate-on-oom=on`, and Kata never inflates it here. Turning it on: re-run
+`sudo scripts/fix-kata-initrd.sh`, set the key, and new VMs and resumed agents pick it up. Not yet measured:
+the reporting CPU cost under real builds.
+

@@ -594,6 +594,7 @@ mod tests {
     #[test]
     fn restore_picks_the_newest_restorable_or_the_one_named() {
         let ((b, _, dest), asked) = backups_with(IDLE, kept);
+        mount(&dest);
         let a1 = dest.join("a1");
         touch(&a1.join("20261124-033000.full.btrfs"), 1);
         touch(&a1.join("20261125-033000.after-20261124-033000.btrfs"), 1);
@@ -635,12 +636,14 @@ mod tests {
             503,
             "no destination"
         );
+        mount(&dest);
         touch(&dest.join("a1/20261124-033000.full.btrfs"), 1);
         let d = b.restore(&agent("a1"), None);
         assert_eq!(d.reply.status, 409, "{}", d.reply.body);
         assert_eq!(d.audit, " backup=20261124-033000");
         let failed = || Err(RestoreError::Failed("btrfs receive: no space".into()));
         let ((b, _, dest2), _) = backups_with(IDLE, failed);
+        mount(&dest2);
         touch(&dest2.join("a1/20261124-033000.full.btrfs"), 1);
         assert_eq!(b.restore(&agent("a1"), None).reply.status, 500);
         let _ = std::fs::remove_dir_all(dest);

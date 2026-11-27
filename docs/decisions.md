@@ -249,7 +249,8 @@ Origin and bind rules as the rest of the API; since ADR-011 a caller needs a tok
   prompt is in no argv, host or guest (checked live with `/proc/*/cmdline`); `claude` reads it on stdin
   from the file.
 - *Running:* the window runs `claude -p --output-format stream-json --verbose <permission flags>
-  < prompt.txt` through `head -c 16 MiB` (a job whose log passes that is stopped) and `tee stream.jsonl`,
+  < prompt.txt` through a log filter (whole records, redacted, passed on as they arrive, 16 MiB in all; a
+  job that reaches the cap is stopped and fails with reason "log cap reached", #1628) and `tee stream.jsonl`,
   with a readable digest on the terminal, so a human can watch it in the viewer and take over. When
   `claude` exits the runner writes `result.txt` (the `result` event, at most 256 KiB), then `exit_code`
   (via rename), then the marker `.job-<job>.done` in the workspace root. Verified: `claude -p` works

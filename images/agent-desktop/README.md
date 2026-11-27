@@ -7,6 +7,11 @@ in the image's environment, so a job or the terminal viewer's tmux can start `ch
 desktop. The gateway's desktop stream (ADR-006, desktop addendum) uses the image's `ffmpeg` (frames) and
 `xdotool` (take-over input): open `https://<gateway>/ui/desk/<agent>`.
 
+Jobs may run `chromium`, `ffmpeg` and `xdotool` by default (`AC_JOB_ALLOWED_TOOLS`, docs/install.md).
+[`CLAUDE.md`](CLAUDE.md), installed as Claude Code's managed memory at `/etc/claude-code/CLAUDE.md`, tells
+every session how: Chromium on the display (headless Chromium hangs under this policy, see below), a
+screenshot with `ffmpeg -f x11grab -i :0 -frames:v 1 shot.png`, input with `xdotool`.
+
 ## Build and load (on the host)
 
 ```

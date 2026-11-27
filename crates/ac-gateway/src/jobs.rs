@@ -120,10 +120,13 @@ pub fn redact(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
 }
 
 /// Default `AC_JOB_ALLOWED_TOOLS`: read, search and edit files; `git` without push; `ls`, `cat`;
-/// `python3` and `cargo` (both run arbitrary code as the agent user, inside the VM); `sleep`.
+/// `python3` and `cargo` (both run arbitrary code as the agent user, inside the VM); `sleep`; and
+/// the desktop image's `chromium`, `ffmpeg` (screenshots) and `xdotool`. Those three add nothing
+/// `python3` cannot already do, and on the shell image they are not installed.
 pub const DEFAULT_TOOLS: &str = "Read,Glob,Grep,Edit,Write,Bash(git status:*),Bash(git diff:*),\
     Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(ls:*),Bash(cat:*),Bash(python3:*),\
-    Bash(cargo build:*),Bash(cargo test:*),Bash(cargo check:*),Bash(cargo fmt:*),Bash(sleep:*)";
+    Bash(cargo build:*),Bash(cargo test:*),Bash(cargo check:*),Bash(cargo fmt:*),Bash(sleep:*),\
+    Bash(chromium:*),Bash(ffmpeg:*),Bash(xdotool:*)";
 /// Permission modes a job may use without `AC_JOB_UNSAFE=1`.
 const MODES: [&str; 5] = ["acceptEdits", "auto", "dontAsk", "manual", "plan"];
 
@@ -156,8 +159,12 @@ fi
 unset secret
 tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$cred" "$model" "$@""#;
 
-/// The job's window (bash): `claude` reads the prompt on stdin; its log is capped at 16 MiB (a
-/// job that passes it is stopped); the terminal shows a digest. With a credential, its log is
+/// The job's window (bash): `claude` reads the prompt on stdin; its log is capped at 16 MiB, in
+/// whole lines and passed on as each line arrives (a job that passes it is stopped); the terminal
+/// shows a digest. `claude -p` waits for its background tasks after its result, and a GUI app such
+/// as Chromium never ends, so `grace` seconds after the first `result` event a `claude` still
+/// running is sent TERM (its process group: `timeout` makes one), which ends its tasks; the job
+/// then exits 0, or 1 if that result was an error. With a credential, its log is
 /// redacted line by line before it is stored or shown, so the raw secret never reaches the
 /// workspace's `stream.jsonl` or `result.txt` (whole stream-json lines, so no split matches; its
 /// characters need no JSON escaping and only `.` and `/` need escaping for `sed`). The job's credential file goes as
@@ -165,6 +172,7 @@ tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$i
 /// the marker `.job-<id>.done` in the workspace root, which the gateway sees without an exec.
 const RUN: &str = r#"id=$1 cred=$2 model=$3 secs=$4
 shift 4
+grace=10
 d=/workspace/.jobs/$id
 c=/dev/shm/ac-job-$id
 trap 'rm -rf -- "$c"' EXIT
@@ -180,10 +188,26 @@ if [ "$cred" = 1 ]; then
     fi
 fi
 show='fromjson? | if .type == "assistant" then (.message.content[]? | if .type == "text" then .text + "\n" elif .type == "tool_use" then "> " + .name + " " + (.input | tostring | .[0:160]) + "\n" else empty end) elif .type == "result" then "--- " + (.subtype // "result") + "\n" else empty end'
+cap() {
+    jq -nRr --unbuffered 'foreach inputs as $l (0; . + ($l | utf8bytelength) + 1; if . <= 16777216 then $l else halt end)'
+}
+stop_after_result() {
+    until [ -s "$d/claude.pid" ] && grep -F '"type":"result"' "$d/stream.jsonl" 2>/dev/null \
+        | jq -e 'select(.type == "result")' >/dev/null 2>&1; do sleep 1; done
+    sleep "$grace"
+    kill -TERM "$(cat "$d/claude.pid")" 2>/dev/null && : > "$d/stopped"
+}
 printf 'job %s started %s\n' "$id" "$(date -u +%FT%TZ)"
-timeout -k 10 "$secs" claude -p --output-format stream-json --verbose "$@" < "$d/prompt.txt" \
-    | redact | head -c 16777216 | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
+stop_after_result &
+stopper=$!
+{ timeout -k 10 "$secs" claude -p --output-format stream-json --verbose "$@" < "$d/prompt.txt" &
+  echo $! > "$d/claude.pid"; wait $!; } \
+    | redact | cap | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
 rc=${PIPESTATUS[0]}
+kill "$stopper" 2>/dev/null
+if [ -e "$d/stopped" ]; then
+    rc=$(jq -Rr 'fromjson? | select(.type == "result") | if .is_error then 1 else 0 end' "$d/stream.jsonl" | head -n 1)
+fi
 rm -rf -- "$c"
 jq -Rrj 'fromjson? | select(.type == "result") | .result // empty' "$d/stream.jsonl" \
     | head -c 262144 > "$d/result.txt"
@@ -2168,4 +2192,108 @@ fn random() -> [u8; 8] {
         b = (now_ms() ^ (N.fetch_add(1, Ordering::Relaxed) as u64) << 48).to_le_bytes();
     }
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUN;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A fresh directory with a workspace holding job `j1`'s prompt, and a `bin` for a stand-in
+    /// `claude`.
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ac-run-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let made = std::fs::create_dir_all(root.join("ws/.jobs/j1"))
+            .and_then(|()| std::fs::create_dir_all(root.join("bin")))
+            .and_then(|()| std::fs::write(root.join("ws/.jobs/j1/prompt.txt"), "go"));
+        assert!(made.is_ok(), "{made:?}");
+        root
+    }
+
+    /// Run [`RUN`] for job `j1` under bash, with `/workspace` at `root/ws`, `claude` the given
+    /// script and no grace after the result. Returns how long it took and the job's exit code.
+    fn run(root: &Path, claude: &str) -> (Duration, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin/claude");
+        let wrote = std::fs::write(&bin, claude)
+            .and_then(|()| std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)));
+        assert!(wrote.is_ok(), "{wrote:?}");
+        let ws = root.join("ws");
+        let script = RUN
+            .replace("/workspace", &ws.to_string_lossy())
+            .replace("grace=10\n", "grace=0\n");
+        let path = format!(
+            "{}:{}",
+            root.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let start = Instant::now();
+        let out = Command::new("bash")
+            .args(["-c", &script, "ac-job", "j1", "0", "-", "60"])
+            .env("PATH", path)
+            .output();
+        let took = start.elapsed();
+        assert!(
+            matches!(&out, Ok(o) if o.status.success()),
+            "runner failed: {out:?}"
+        );
+        let code = std::fs::read_to_string(ws.join(".jobs/j1/exit_code")).unwrap_or_default();
+        (took, code.trim().to_owned())
+    }
+
+    const RESULT: &str =
+        r#"{"duration_ms":1,"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+
+    #[test]
+    fn a_background_task_does_not_keep_a_finished_job_running() {
+        let root = scratch("bg");
+        // Like `claude -p` with a run_in_background task: the result, then a wait on the task.
+        let claude = format!("#!/bin/bash\ncat >/dev/null\necho '{RESULT}'\nsleep 30 &\nwait\n");
+        let (took, code) = run(&root, &claude);
+        assert!(took < Duration::from_secs(15), "took {took:?}");
+        assert_eq!(code, "0");
+        assert!(root.join("ws/.jobs/j1/stopped").exists());
+        let result = std::fs::read_to_string(root.join("ws/.jobs/j1/result.txt"));
+        assert_eq!(result.ok().as_deref(), Some("done"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_error_result_fails_a_stopped_job() {
+        let root = scratch("err");
+        let error = RESULT.replace(r#""is_error":false"#, r#""is_error":true"#);
+        let claude = format!("#!/bin/bash\ncat >/dev/null\necho '{error}'\nsleep 30 &\nwait\n");
+        let (took, code) = run(&root, &claude);
+        assert!(took < Duration::from_secs(15), "took {took:?}");
+        assert_eq!(code, "1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_job_that_ends_by_itself_keeps_its_exit_code() {
+        let root = scratch("exit");
+        let claude = format!("#!/bin/bash\ncat >/dev/null\necho '{RESULT}'\nexit 3\n");
+        let (_, code) = run(&root, &claude);
+        assert_eq!(code, "3");
+        assert!(!root.join("ws/.jobs/j1/stopped").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_log_reaches_the_stream_while_claude_runs() {
+        let root = scratch("live");
+        // The second line is only written once the first is in stream.jsonl: a buffering cap
+        // (as `head -c` was) would hold the first back and the job would hit its timeout.
+        let claude = "#!/bin/bash\ncat >/dev/null\necho '{\"type\":\"system\"}'\n\
+            for _ in $(seq 50); do grep -q system \"$STREAM\" 2>/dev/null && break; sleep 0.1; done\n\
+            grep -q system \"$STREAM\" || exit 7\n";
+        let stream = root.join("ws/.jobs/j1/stream.jsonl");
+        let claude = claude.replace("$STREAM", &stream.to_string_lossy());
+        let (_, code) = run(&root, &claude);
+        assert_eq!(code, "0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

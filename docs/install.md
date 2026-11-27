@@ -491,7 +491,9 @@ in `gateway.env` (restart the gateway after a change):
 
 - `AC_JOB_PERMISSION_MODE`: `acceptEdits` (default), `auto`, `dontAsk`, `manual` or `plan`;
 - `AC_JOB_ALLOWED_TOOLS`: comma-separated `claude --allowedTools` entries (default: read, search and edit files,
-  `git` without push, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`);
+  `git` without push, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`, and for desktop agents
+  `chromium`, `ffmpeg` and `xdotool`, which the shell image does not have). A job that leaves a background task
+  running (Chromium, say) ends 10 s after `claude` gives its result, and the task ends with it;
 - `AC_JOB_UNSAFE=1`: `--dangerously-skip-permissions` instead. Read [security.md](security.md#task-api) first;
 - `AC_JOB_MODEL_URL`: an `https://` URL (e.g. LEL's gateway, `https://<lel-gateway-host>:<port>`). Jobs that carry
   a credential reach the model there, with the credential as their token (ADR-028 addendum). Its host and port

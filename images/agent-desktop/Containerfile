@@ -30,7 +30,10 @@ COPY xorg.conf /etc/agent-desktop/xorg.conf
 # Chromium reads every file in this directory; root-owned, so the agent cannot loosen it.
 COPY chromium-policy.json /etc/chromium/policies/managed/agent.json
 COPY desktop-session /usr/local/bin/desktop-session
+# Claude Code's managed memory: tells every session (jobs included) how to use the display.
+COPY CLAUDE.md /etc/claude-code/CLAUDE.md
 RUN chmod 0644 /etc/agent-desktop/xorg.conf /etc/chromium/policies/managed/agent.json \
+        /etc/claude-code/CLAUDE.md \
     && chmod 0755 /usr/local/bin/desktop-session
 
 # Jobs and the terminal viewer's tmux inherit DISPLAY, so `chromium` from the shell opens on the desktop.

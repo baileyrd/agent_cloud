@@ -30,7 +30,7 @@
 //! before the gateway is ready: ended jobs queue for [`Jobs::diff_next`], which the gateway runs
 //! on a thread of its own, one compare at a time.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -44,8 +44,8 @@ use ac_domain::health::Pressure;
 use ac_domain::job::{self, Credential, ModelUrl};
 use ac_domain::schedule::{self, Limits, Wait};
 use ac_domain::witness::{self, EgressSource};
-use ac_domain::{AgentId, Job, JobEvent, JobId, JobState, State};
-use ac_ports::{HostLoad, JobStore, SessionStore};
+use ac_domain::{AgentId, ImageRef, Job, JobEvent, JobId, JobState, State};
+use ac_ports::{HostLoad, Images, JobStore, SessionStore};
 use platform::process::Spawner;
 use rusty_json::Value;
 use rusty_sha2::{Hash, Sha256};
@@ -632,23 +632,93 @@ pub fn claude_flags(
         ));
     }
     let mut flags = vec!["--permission-mode".to_owned(), mode.to_owned()];
-    let tools: Vec<&str> = tools
-        .unwrap_or(DEFAULT_TOOLS)
+    let tools = parse_tools("AC_JOB_ALLOWED_TOOLS", tools.unwrap_or(DEFAULT_TOOLS))?;
+    if !tools.is_empty() {
+        flags.push("--allowedTools".to_owned());
+        flags.extend(tools);
+    }
+    Ok(flags)
+}
+
+/// Comma-separated `--allowedTools` entries, trimmed, empty ones dropped; none may look like a
+/// flag or hold a control character. `name` is the setting, for the error.
+fn parse_tools(name: &str, text: &str) -> Result<Vec<String>, String> {
+    let tools: Vec<String> = text
         .split(',')
         .map(str::trim)
         .filter(|t| !t.is_empty())
+        .map(str::to_owned)
         .collect();
-    if let Some(bad) = tools
+    match tools
         .iter()
         .find(|t| t.starts_with('-') || t.chars().any(char::is_control))
     {
-        return Err(format!("AC_JOB_ALLOWED_TOOLS: bad entry {bad:?}"));
+        Some(bad) => Err(format!("{name}: bad entry {bad:?}")),
+        None => Ok(tools),
     }
-    if !tools.is_empty() {
-        flags.push("--allowedTools".to_owned());
-        flags.extend(tools.into_iter().map(str::to_owned));
+}
+
+/// Extra `--allowedTools` entries for jobs of agents on desktop images (#1628), off by default:
+/// `AC_JOB_DESKTOP_TOOLS` (comma-separated, as `AC_JOB_ALLOWED_TOOLS`) and
+/// `AC_JOB_DESKTOP_IMAGES` (comma-separated names from `AC_IMAGES`) go together. An agent gets
+/// the extras only if its recorded image (#1627) is one of those images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopTools {
+    images: BTreeSet<ImageRef>,
+    tools: Vec<String>,
+}
+
+impl DesktopTools {
+    /// From the two settings and the `AC_IMAGES` allowlist. Neither set: `None`. One without
+    /// the other, an empty one, a bad tool or an image name not in the allowlist: an error.
+    pub fn from_settings(
+        tools: Option<&str>,
+        images: Option<&str>,
+        allowlist: &BTreeMap<String, ImageRef>,
+    ) -> Result<Option<Self>, String> {
+        let (tools, images) = match (tools, images) {
+            (None, None) => return Ok(None),
+            (Some(t), Some(i)) => (t, i),
+            _ => return Err(
+                "AC_JOB_DESKTOP_TOOLS and AC_JOB_DESKTOP_IMAGES go together: set both or neither"
+                    .into(),
+            ),
+        };
+        let tools = parse_tools("AC_JOB_DESKTOP_TOOLS", tools)?;
+        if tools.is_empty() {
+            return Err("AC_JOB_DESKTOP_TOOLS: no tools listed".into());
+        }
+        let mut refs = BTreeSet::new();
+        for name in images.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            let image = allowlist.get(name).ok_or_else(|| {
+                format!("AC_JOB_DESKTOP_IMAGES: {name:?} is not an image name in AC_IMAGES")
+            })?;
+            refs.insert(image.clone());
+        }
+        if refs.is_empty() {
+            return Err("AC_JOB_DESKTOP_IMAGES: no images listed".into());
+        }
+        Ok(Some(Self {
+            images: refs,
+            tools,
+        }))
     }
-    Ok(flags)
+
+    /// `flags` for a job of an agent on `image`: with the extras added to `--allowedTools` if
+    /// `image` is a desktop image, else as they are. `--dangerously-skip-permissions` needs none.
+    /// [`claude_flags`] puts `--allowedTools` and its entries last, so they are appended there.
+    pub fn flags(&self, flags: &[String], image: Option<&ImageRef>) -> Vec<String> {
+        let mut out = flags.to_vec();
+        let desktop = image.is_some_and(|i| self.images.contains(i));
+        if !desktop || flags.iter().any(|f| f == "--dangerously-skip-permissions") {
+            return out;
+        }
+        if !flags.iter().any(|f| f == "--allowedTools") {
+            out.push("--allowedTools".to_owned());
+        }
+        out.extend(self.tools.iter().cloned());
+        out
+    }
 }
 
 /// What a job route answers.
@@ -813,6 +883,8 @@ pub struct Jobs {
     model: Option<ModelUrl>,
     dir: PathBuf,
     claude: Vec<String>,
+    /// Extra tools for desktop agents, and where each agent's image is recorded.
+    desktop: Option<(DesktopTools, Arc<dyn Images + Send + Sync>)>,
     notes: Notes,
     clock: Clock,
     limits: Limits,
@@ -923,6 +995,7 @@ impl Jobs {
             model: None,
             dir,
             claude,
+            desktop: None,
             notes: Box::new(|_, _| {}),
             clock: Box::new(now_ms),
             limits: Limits::OPEN,
@@ -1016,6 +1089,27 @@ impl Jobs {
     pub fn streams_open(&self, agent: &AgentId) -> (usize, usize) {
         let seats = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         (seats.values().sum(), seats.get(agent).copied().unwrap_or(0))
+    }
+
+    /// Desktop agents' jobs may also use `tools`' extras; `images` says which agent is on which
+    /// image (#1627).
+    pub fn with_desktop_tools(
+        mut self,
+        tools: DesktopTools,
+        images: Arc<dyn Images + Send + Sync>,
+    ) -> Self {
+        self.desktop = Some((tools, images));
+        self
+    }
+
+    /// `claude`'s flags for a job of `agent`: the operator's, plus the desktop extras if its
+    /// recorded image is a desktop image.
+    fn flags(&self, agent: &AgentId) -> Result<Vec<String>, String> {
+        let Some((tools, images)) = &self.desktop else {
+            return Ok(self.claude.clone());
+        };
+        let image = images.image(agent).map_err(|e| e.to_string())?;
+        Ok(tools.flags(&self.claude, image.as_ref()))
     }
 
     /// Jobs that carry a credential reach the model at `url`, with the credential as their token
@@ -1495,9 +1589,15 @@ impl Jobs {
                 return;
             }
         };
-        let started = std::fs::read(self.job_dir(j).join("prompt.txt"))
-            .map_err(|e| format!("prompt: {e}"))
-            .and_then(|prompt| {
+        let started = self
+            .flags(&j.agent)
+            .map_err(|e| format!("image: {e}"))
+            .and_then(|flags| {
+                std::fs::read(self.job_dir(j).join("prompt.txt"))
+                    .map(|prompt| (flags, prompt))
+                    .map_err(|e| format!("prompt: {e}"))
+            })
+            .and_then(|(flags, prompt)| {
                 self.runner.start(
                     &j.agent,
                     &j.id,
@@ -1505,7 +1605,7 @@ impl Jobs {
                     credential.as_ref(),
                     self.model.as_ref(),
                     j.timeout_secs,
-                    &self.claude,
+                    &flags,
                 )
             });
         if let Err(e) = started {
@@ -2507,6 +2607,76 @@ mod tests {
         mark("capped", "");
         assert_eq!(status(&root), "capped");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn img(s: &str) -> super::ImageRef {
+        super::ImageRef::parse(s).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn allowlist() -> super::BTreeMap<String, super::ImageRef> {
+        [
+            ("desktop", "localhost/agent-desktop:dev"),
+            ("shell", "agent-shell:1"),
+        ]
+        .into_iter()
+        .map(|(n, i)| (n.to_owned(), img(i)))
+        .collect()
+    }
+
+    #[test]
+    fn desktop_tools_are_off_unless_both_settings_are_given() {
+        use super::DesktopTools as D;
+        let list = allowlist();
+        assert_eq!(D::from_settings(None, None, &list), Ok(None));
+        assert!(D::from_settings(Some("Bash(xdotool:*)"), None, &list).is_err());
+        assert!(D::from_settings(None, Some("desktop"), &list).is_err());
+        assert!(D::from_settings(Some(" , "), Some("desktop"), &list).is_err());
+        assert!(D::from_settings(Some("Bash(x:*)"), Some(" ,"), &list).is_err());
+        let bad_tool = D::from_settings(
+            Some("Read,--dangerously-skip-permissions"),
+            Some("desktop"),
+            &list,
+        );
+        assert!(bad_tool.is_err());
+        let unknown = D::from_settings(Some("Bash(x:*)"), Some("desktop,gpu"), &list);
+        assert!(unknown.is_err_and(|e| e.contains("\"gpu\"")));
+    }
+
+    #[test]
+    fn only_agents_on_a_desktop_image_get_the_extras() {
+        use super::{claude_flags, DesktopTools};
+        let tools = DesktopTools::from_settings(
+            Some("Bash(chromium:*), Bash(ffmpeg:*)"),
+            Some("desktop"),
+            &allowlist(),
+        );
+        let Ok(Some(tools)) = tools else {
+            panic!("{tools:?}")
+        };
+        let base = claude_flags(None, Some("Read"), false).unwrap_or_default();
+        let desktop = img("localhost/agent-desktop:dev");
+        let with: Vec<String> = ["--permission-mode", "acceptEdits", "--allowedTools", "Read"]
+            .iter()
+            .chain(&["Bash(chromium:*)", "Bash(ffmpeg:*)"])
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(tools.flags(&base, Some(&desktop)), with);
+        assert_eq!(tools.flags(&base, Some(&img("agent-shell:1"))), base);
+        assert_eq!(
+            tools.flags(&base, None),
+            base,
+            "no record: the default image"
+        );
+        // An empty operator list still gets an --allowedTools for the extras.
+        let bare = claude_flags(None, Some(""), false).unwrap_or_default();
+        let got = tools.flags(&bare, Some(&desktop));
+        assert_eq!(
+            got[2..],
+            ["--allowedTools", "Bash(chromium:*)", "Bash(ffmpeg:*)"]
+        );
+        // Unsafe mode needs no list and gets none.
+        let unsafe_flags = claude_flags(None, None, true).unwrap_or_default();
+        assert_eq!(tools.flags(&unsafe_flags, Some(&desktop)), unsafe_flags);
     }
 
     #[test]

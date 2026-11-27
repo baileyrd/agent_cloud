@@ -23,7 +23,7 @@ use ac_gateway::tokens::{self, Agents, Keys, Scopes, Token, TokenFile, Tokens};
 use ac_gateway::viewer::Hub;
 use ac_gateway::web::App;
 use ac_gateway::{Api, Busy};
-use ac_ports::{HostLoad, JobStore, PortError, Runtime, SessionStore};
+use ac_ports::{HostLoad, Images, JobStore, PortError, Runtime, SessionStore};
 use ac_store::EngineStore;
 use platform::process::ExitStatus;
 use platform_mock::MockSpawner;
@@ -1329,6 +1329,59 @@ fn cancel_queued_running_and_finished() {
     assert_eq!(r.fake.w().kills, std::slice::from_ref(&running));
     assert_eq!(cancel(&running).0, 409);
     assert_eq!(cancel("0000000000000000").0, 404);
+}
+
+/// Agent a1 on the desktop image; every other agent without a record.
+struct DesktopA1;
+
+impl Images for DesktopA1 {
+    fn image(&self, id: &AgentId) -> Result<Option<ac_domain::ImageRef>, PortError> {
+        Ok((id.as_str() == "a1").then(desktop_image))
+    }
+    fn set_image(&self, _: &AgentId, _: Option<&ac_domain::ImageRef>) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+fn desktop_image() -> ac_domain::ImageRef {
+    ac_domain::ImageRef::parse("localhost/agent-desktop:dev").unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn desktop_tools_reach_only_jobs_of_desktop_agents() {
+    let allowlist = [("desktop".to_owned(), desktop_image())]
+        .into_iter()
+        .collect();
+    let tools =
+        jobs::DesktopTools::from_settings(Some("Bash(xdotool:*)"), Some("desktop"), &allowlist);
+    let Ok(Some(tools)) = tools else {
+        panic!("{tools:?}")
+    };
+    let (store, root) = registry();
+    let r = build_with(store, Fake::default(), root, None, |j| {
+        j.with_desktop_tools(tools, Arc::new(DesktopA1))
+    });
+    let on_desktop = r.ok("a1", "a");
+    let on_shell = r.ok("a2", "b");
+    r.jobs.tick();
+    let starts = r.fake.w().starts.clone();
+    let flags = |job: &str| {
+        starts
+            .iter()
+            .find(|s| s.0 == job)
+            .map(|s| s.3.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        flags(&on_desktop).last().map(String::as_str),
+        Some("Bash(xdotool:*)")
+    );
+    assert!(
+        !flags(&on_shell).iter().any(|f| f.contains("xdotool")),
+        "{:?}",
+        flags(&on_shell)
+    );
+    assert!(!flags(&on_shell).is_empty(), "both started");
 }
 
 #[test]

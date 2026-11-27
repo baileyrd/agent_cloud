@@ -30,7 +30,16 @@ else
     bad "xrandr failed: $out"
     gx xlog 'tail -20 "$HOME/.local/share/xorg/Xorg.log"' || true
 fi
-runs_as_agent() { gx "ps-$1" "ps -o user= -C $1" | grep -qx agent && ok "$1 runs as agent" || bad "$1 is not running as agent"; }
+# xfce4-session starts xfwm4 and the rest a few seconds after it comes up, so a check run right after a
+# create or resume polls for up to 30 s before it fails (#1633).
+runs_as_agent() {
+    local n
+    for n in $(seq 15); do
+        gx "ps-$1-$n" "ps -o user= -C $1" | grep -qx agent && { ok "$1 runs as agent"; return; }
+        sleep 2
+    done
+    bad "$1 is not running as agent after 30 s"
+}
 
 echo "== session"
 gx ps 'ps -eo user,rss,comm' | grep -E 'Xorg|xfce4-session|xfwm4' || true

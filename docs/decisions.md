@@ -283,8 +283,7 @@ Origin and bind rules as the rest of the API; since ADR-011 a caller needs a tok
 - *Permissions:* a headless `claude` cannot ask. `AC_JOB_PERMISSION_MODE` (default `acceptEdits`; also
   `auto`, `dontAsk`, `manual`, `plan`) and `AC_JOB_ALLOWED_TOOLS` (comma-separated; default `Read`, `Glob`,
   `Grep`, `Edit`, `Write` and `Bash` patterns for `git status|diff|log|add|commit`, `ls`, `cat`,
-  `python3`, `cargo build|test|check|fmt`, `sleep`, and the desktop image's `chromium`, `ffmpeg`,
-  `xdotool`) become flags. `bypassPermissions` /
+  `python3`, `cargo build|test|check|fmt`, `sleep`) become flags. `bypassPermissions` /
   `--dangerously-skip-permissions` only with `AC_JOB_UNSAFE=1`. See security.md for what that allows.
 - *Limits and retention:* prompt <= 64 KiB (413 beyond); per agent the last 20 finished jobs are kept
   (registry records and host copies), and the workspace keeps the last 5 `.jobs/<job>` directories, each

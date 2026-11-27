@@ -168,9 +168,7 @@ agents: it cannot pause, destroy, watch or take over anything, nor learn which o
 egress allowlist. A headless `claude` cannot ask for approval, so the gateway passes the operator's choice:
 - default `AC_JOB_PERMISSION_MODE=acceptEdits` with the default `AC_JOB_ALLOWED_TOOLS`: read and search any
   file the agent user can read; create and edit files in `/workspace`; `git status|diff|log|add|commit`
-  (not `push`); `ls`, `cat`, `sleep`; `python3` and `cargo build|test|check|fmt`; on a desktop agent
-  `chromium` (under its managed policy), `ffmpeg` (screenshots) and `xdotool` (its own display), none of
-  which reach further than `python3` does. `acceptEdits` also
+  (not `push`); `ls`, `cat`, `sleep`; `python3` and `cargo build|test|check|fmt`. `acceptEdits` also
   approves Claude Code's common filesystem commands inside `/workspace` on its own (a job ran `rm -f` on a
   workspace file, 2026-10-21). Other commands are denied and the job carries on without them (a job's
   `curl` was refused and listed under `permission_denials` in its stream log).

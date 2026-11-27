@@ -120,13 +120,10 @@ pub fn redact(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
 }
 
 /// Default `AC_JOB_ALLOWED_TOOLS`: read, search and edit files; `git` without push; `ls`, `cat`;
-/// `python3` and `cargo` (both run arbitrary code as the agent user, inside the VM); `sleep`; and
-/// the desktop image's `chromium`, `ffmpeg` (screenshots) and `xdotool`. Those three add nothing
-/// `python3` cannot already do, and on the shell image they are not installed.
+/// `python3` and `cargo` (both run arbitrary code as the agent user, inside the VM); `sleep`.
 pub const DEFAULT_TOOLS: &str = "Read,Glob,Grep,Edit,Write,Bash(git status:*),Bash(git diff:*),\
     Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(ls:*),Bash(cat:*),Bash(python3:*),\
-    Bash(cargo build:*),Bash(cargo test:*),Bash(cargo check:*),Bash(cargo fmt:*),Bash(sleep:*),\
-    Bash(chromium:*),Bash(ffmpeg:*),Bash(xdotool:*)";
+    Bash(cargo build:*),Bash(cargo test:*),Bash(cargo check:*),Bash(cargo fmt:*),Bash(sleep:*)";
 /// Permission modes a job may use without `AC_JOB_UNSAFE=1`.
 const MODES: [&str; 5] = ["acceptEdits", "auto", "dontAsk", "manual", "plan"];
 

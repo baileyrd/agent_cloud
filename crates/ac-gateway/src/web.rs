@@ -387,12 +387,15 @@ impl<R: Runtime, S: SessionStore> App<R, S> {
             return;
         };
         let mut line = format!("audit token={} action={action}", token.name);
-        let key = match action {
-            "create" => Some("egress_profiles"),
-            "egress" => Some("profiles"),
-            _ => None,
-        };
-        let mut profiles = key.map(|k| crate::profiles_in(body, k));
+        let mut profiles = (action == "egress").then(|| crate::profiles_in(body, "profiles"));
+        if action == "create" {
+            if let Ok(c) = crate::Create::parse(body) {
+                if let Some(image) = &c.image {
+                    line.push_str(&format!(" image={}", shown(image)));
+                }
+                profiles = Some(Ok(c.profiles));
+            }
+        }
         if action == "fork" {
             if let Ok(f) = crate::Fork::parse(body) {
                 line.push_str(&format!(" to={}", f.to));

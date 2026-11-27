@@ -83,6 +83,13 @@ The Xorg config is [images/agent-desktop/xorg.conf](../images/agent-desktop/xorg
 policy [images/agent-desktop/chromium-policy.json](../images/agent-desktop/chromium-policy.json), installed
 at `/etc/chromium/policies/managed/agent.json`. DevTools are off in it (decided; see the image's README).
 
+An agent keeps the image it was created from: `ac-ctl create` and an API create record it in
+`$AC_DATA/state/images`, and every resume and fork boots from it, whatever `AC_IMAGE` says. With
+the gateway running, allowlist the desktop image in `gateway.env`
+(`AC_IMAGES=desktop=localhost/agent-desktop:dev`) and create with `{"image":"desktop"}` instead of
+stopping the gateway for `ac-ctl`. An agent created before this record existed boots on `AC_IMAGE`:
+destroy it (the workspace stays) and create it again with its image.
+
 **Checkpoint:** `scripts/desktop-smoke.sh` ends with `PASS`: `xrandr` shows `DUMMY0`; Xorg, xfce4-session and
 xfwm4 run as `agent`; chrome://policy shows the managed policies in effect; and guest used memory and the sandbox
 cgroup's `memory.current` are both at most 2 GiB at idle.

@@ -153,6 +153,12 @@ pub const ROUTES: &[Rule] = &[
                 false,
                 "Egress profiles to attach before boot; needs scope egress:write.",
             ),
+            arg(
+                "image",
+                Kind::Text,
+                false,
+                "An image name from the operator's allowlist (such as desktop); kept on resume.",
+            ),
         ],
     }),
     offer(rule("DELETE", A, S(AgentsWrite), Some("destroy")), Tool {

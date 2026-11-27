@@ -6,7 +6,8 @@
 //! starts (a failure to store it fails the boot), revoked before it stops and whenever a start
 //! fails, forgotten on purge, and swept by the reconcile for agents without a VM. With
 //! [`Fleet::with_snapshots`], workspaces can be checkpointed, restored and forked (ADR-018), and a
-//! purge deletes the agent's checkpoints too.
+//! purge deletes the agent's checkpoints too. With [`Fleet::with_images`], an agent's image is
+//! recorded at create and reused by every resume and fork (card #1627); a purge forgets it.
 //!
 //! A create can run in three steps so the slow VM boot needs no lock: [`Fleet::reserve`] (checks,
 //! admission, credential, record `Creating`), [`Reserved::boot`] (the runtime alone), and
@@ -18,10 +19,10 @@ use std::sync::Arc;
 
 use ac_domain::checkpoint::{self, Op};
 use ac_domain::{
-    capacity, AgentId, Checkpoint, CheckpointId, Command, Label, ProfileName, Refusal, Shortfall,
-    State, TransitionError,
+    capacity, AgentId, Checkpoint, CheckpointId, Command, ImageRef, Label, ProfileName, Refusal,
+    Shortfall, State, TransitionError,
 };
-use ac_ports::{Boot, Capacity, Egress, PortError, Runtime, SessionStore, Snapshots};
+use ac_ports::{Boot, Capacity, Egress, Images, PortError, Runtime, SessionStore, Snapshots};
 
 /// Why a fleet operation failed.
 #[derive(Debug)]
@@ -40,6 +41,8 @@ pub enum FleetError {
     NoCheckpoint(AgentId, CheckpointId),
     /// The fleet was built without [`Fleet::with_snapshots`].
     SnapshotsOff,
+    /// A create named an image, but the fleet was built without [`Fleet::with_images`].
+    ImagesOff,
     /// The runtime or store failed; state is left as last persisted.
     Port(PortError),
 }
@@ -54,6 +57,7 @@ impl fmt::Display for FleetError {
             Self::Refused(e) => e.fmt(f),
             Self::NoCheckpoint(id, cp) => write!(f, "agent {id} has no checkpoint {cp}"),
             Self::SnapshotsOff => f.write_str("checkpoints are off"),
+            Self::ImagesOff => f.write_str("per-agent images are off"),
             Self::Port(e) => e.fmt(f),
         }
     }
@@ -141,6 +145,7 @@ pub struct Fleet<R, S> {
     admission: Option<Admission>,
     egress: Option<Arc<dyn Egress + Send + Sync>>,
     snapshots: Option<Snapshotting>,
+    images: Option<Arc<dyn Images + Send + Sync>>,
 }
 
 impl<R: Runtime, S: SessionStore> Fleet<R, S> {
@@ -152,7 +157,16 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
             admission: None,
             egress: None,
             snapshots: None,
+            images: None,
         }
+    }
+
+    /// Record each agent's image in `images` at create, and boot every resume and fork from it.
+    /// Without it, every boot uses the runtime's default image and a create naming one is
+    /// refused ([`FleetError::ImagesOff`]).
+    pub fn with_images(mut self, images: Arc<dyn Images + Send + Sync>) -> Self {
+        self.images = Some(images);
+        self
     }
 
     /// Checkpoint, restore and fork workspaces through `port`, keeping at most `max` checkpoints
@@ -207,17 +221,19 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     /// (retry with `create`, or clear it with `destroy`)
     /// (visible and destroyable) rather than silently forgotten.
     pub fn create(&self, id: &AgentId) -> Result<State, FleetError> {
-        self.create_attached(id, None)
+        self.create_attached(id, None, None)
     }
 
     /// [`Self::create`], attaching `profiles` (when given) in the same write as the credential,
-    /// before the VM starts.
+    /// before the VM starts, and booting from `image` (`None`: the runtime's default), which
+    /// every later resume reuses.
     pub fn create_attached(
         &self,
         id: &AgentId,
         profiles: Option<&[ProfileName]>,
+        image: Option<&ImageRef>,
     ) -> Result<State, FleetError> {
-        let reserved = self.reserve(id, profiles)?;
+        let reserved = self.reserve(id, profiles, image)?;
         let booted = reserved.boot();
         self.commit(&reserved, booted)
     }
@@ -225,17 +241,22 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     /// The fast first step of [`Self::create_attached`]: refuse a running or paused id, admit the
     /// guest, issue its credential and record it `Creating`. A destroyed id can be reused, and one
     /// stuck in `Creating` (a previous create failed) is retried; the caller keeps a second
-    /// create of an id whose reservation is still booting out.
+    /// create of an id whose reservation is still booting out. `image` is recorded (`None`
+    /// removes an earlier record, so the agent boots on the default).
     pub fn reserve(
         &self,
         id: &AgentId,
         profiles: Option<&[ProfileName]>,
+        image: Option<&ImageRef>,
     ) -> Result<Reserved<R>, FleetError> {
         if matches!(self.store.state(id)?, Some(State::Running | State::Paused)) {
             return Err(FleetError::AlreadyExists(id.clone()));
         }
+        if image.is_some() && self.images.is_none() {
+            return Err(FleetError::ImagesOff);
+        }
         self.admit(id)?;
-        self.stage(id, profiles)
+        self.stage(id, profiles, image)
     }
 
     /// The last step: a booted reservation becomes `Running`; a failed boot revokes its
@@ -249,13 +270,17 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         self.persist(&reserved.id, State::Creating, Command::Ready)
     }
 
-    /// Issue `id`'s credential and record it `Creating`.
+    /// Record `id`'s image, issue its credential and record it `Creating`.
     fn stage(
         &self,
         id: &AgentId,
         profiles: Option<&[ProfileName]>,
+        image: Option<&ImageRef>,
     ) -> Result<Reserved<R>, FleetError> {
-        let boot = self.issue(id, profiles)?;
+        if let Some(images) = &self.images {
+            images.set_image(id, image)?;
+        }
+        let boot = self.issue(id, profiles)?.with_image(image.cloned());
         self.store.set_state(id, State::Creating)?;
         Ok(Reserved {
             id: id.clone(),
@@ -270,8 +295,9 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         &self,
         id: &AgentId,
         profiles: Option<&[ProfileName]>,
+        image: Option<&ImageRef>,
     ) -> Result<State, FleetError> {
-        let reserved = self.stage(id, profiles)?;
+        let reserved = self.stage(id, profiles, image)?;
         let booted = reserved.boot();
         self.commit(&reserved, booted)
     }
@@ -284,7 +310,7 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         })
     }
 
-    /// Start a paused agent.
+    /// Start a paused agent, on the image recorded at its create.
     pub fn resume(&self, id: &AgentId) -> Result<State, FleetError> {
         let from = self
             .store
@@ -292,7 +318,7 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
             .ok_or_else(|| FleetError::NotFound(id.clone()))?;
         from.apply(Command::Resume)?;
         self.admit(id)?;
-        let boot = self.issue(id, None)?;
+        let boot = self.issue(id, None)?.with_image(self.image(id)?);
         self.step(id, Command::Resume, |r| {
             self.started(id, r.resume(id, &boot))
         })
@@ -317,10 +343,13 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         Ok(state)
     }
 
-    /// `id`'s workspace is gone: delete its checkpoints and forget its egress line.
+    /// `id`'s workspace is gone: delete its checkpoints and forget its image and egress line.
     fn purged(&self, id: &AgentId) -> Result<(), PortError> {
         if let Some(s) = &self.snapshots {
             s.port.purge(id)?;
+        }
+        if let Some(images) = &self.images {
+            images.set_image(id, None)?;
         }
         self.forget(id)
     }
@@ -363,8 +392,8 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
     }
 
     /// Create agent `to` on a writable snapshot of `from`'s workspace, or of its checkpoint `cp`,
-    /// attaching `profiles` like a create. Nothing but files comes from `from`: not its egress
-    /// profiles, not its jobs. A failed boot leaves `to` `Creating` on its forked workspace.
+    /// attaching `profiles` like a create. Besides files, only `from`'s image comes along (so a
+    /// fork of a desktop agent is one): not its egress profiles, not its jobs. A failed boot leaves `to` `Creating` on its forked workspace.
     pub fn fork(
         &self,
         from: &AgentId,
@@ -379,8 +408,9 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
         }
         checkpoint::check_fork_target(to, self.store.state(to)?, s.port.volume(to)?)?;
         self.admit(to)?;
+        let image = self.image(from)?;
         s.port.fork(from, cp, to)?;
-        self.boot_new(to, profiles)
+        self.boot_new(to, profiles, image.as_ref())
     }
 
     /// Turn `id`'s plain-directory workspace into a subvolume. Its VM must be stopped.
@@ -446,6 +476,14 @@ impl<R: Runtime, S: SessionStore> Fleet<R, S> {
             e.sweep(&live)?;
         }
         Ok(changed)
+    }
+
+    /// `id`'s recorded image; `None` without a record or without [`Self::with_images`].
+    pub fn image(&self, id: &AgentId) -> Result<Option<ImageRef>, FleetError> {
+        match &self.images {
+            Some(i) => Ok(i.image(id)?),
+            None => Ok(None),
+        }
     }
 
     /// A new credential for `id`'s boot; without egress, the image's settings.
@@ -827,7 +865,7 @@ mod tests {
         let (fleet, egress) = with_egress(&rt, None);
         let rust = [ProfileName::parse("rust").unwrap_or_else(|e| panic!("{e}"))];
         assert!(matches!(
-            fleet.create_attached(&id(), Some(&rust)),
+            fleet.create_attached(&id(), Some(&rust), None),
             Ok(State::Running)
         ));
         assert!(matches!(fleet.pause(&id()), Ok(State::Paused)));
@@ -1273,5 +1311,99 @@ mod tests {
         assert!(snaps.calls().is_empty());
         let _ = fleet.destroy(&id(), true);
         assert_eq!(snaps.calls(), ["purge a1"]);
+    }
+
+    /// An in-memory image record.
+    #[derive(Default)]
+    struct FakeImages(std::sync::Mutex<HashMap<String, ImageRef>>);
+
+    impl Images for FakeImages {
+        fn image(&self, id: &AgentId) -> Result<Option<ImageRef>, PortError> {
+            let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(m.get(id.as_str()).cloned())
+        }
+        fn set_image(&self, id: &AgentId, image: Option<&ImageRef>) -> Result<(), PortError> {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            match image {
+                Some(i) => m.insert(id.to_string(), i.clone()),
+                None => m.remove(id.as_str()),
+            };
+            Ok(())
+        }
+    }
+
+    fn desktop() -> ImageRef {
+        ImageRef::parse("agent-desktop:latest").unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn booted_images(rt: &FakeRuntime) -> Vec<Option<ImageRef>> {
+        rt.boots
+            .borrow()
+            .iter()
+            .map(|b| b.image().cloned())
+            .collect()
+    }
+
+    #[test]
+    fn a_desktop_agent_resumes_and_forks_on_its_own_image() {
+        let rt = FakeRuntime::default();
+        let snaps = FakeSnaps::with(&[("d1", Volume::Subvolume)]);
+        let images = Arc::new(FakeImages::default());
+        let fleet = snap_fleet(&rt, &snaps, &[]).with_images(images);
+        let d1 = agent("d1");
+        assert!(matches!(
+            fleet.create_attached(&d1, None, Some(&desktop())),
+            Ok(State::Running)
+        ));
+        assert!(matches!(fleet.pause(&d1), Ok(State::Paused)));
+        assert!(matches!(fleet.resume(&d1), Ok(State::Running)));
+        let d2 = agent("d2");
+        assert!(matches!(
+            fleet.fork(&d1, None, &d2, None),
+            Ok(State::Running)
+        ));
+        assert!(matches!(fleet.create(&id()), Ok(State::Running)));
+        assert_eq!(
+            booted_images(&rt),
+            [Some(desktop()), Some(desktop()), Some(desktop()), None],
+            "create, resume, fork, then a plain create on the default"
+        );
+        assert_eq!(fleet.image(&d2).ok().flatten(), Some(desktop()));
+        assert_eq!(fleet.image(&id()).ok().flatten(), None);
+    }
+
+    #[test]
+    fn a_plain_re_create_drops_the_image_and_a_purge_forgets_it() {
+        let rt = FakeRuntime::default();
+        let snaps = FakeSnaps::with(&[]);
+        let fleet = snap_fleet(&rt, &snaps, &[]).with_images(Arc::new(FakeImages::default()));
+        let d1 = agent("d1");
+        let _ = fleet.create_attached(&d1, None, Some(&desktop()));
+        assert!(matches!(fleet.destroy(&d1, false), Ok(State::Destroyed)));
+        assert_eq!(
+            fleet.image(&d1).ok().flatten(),
+            Some(desktop()),
+            "destroy keeps it"
+        );
+        assert!(matches!(fleet.create(&d1), Ok(State::Running)));
+        assert_eq!(
+            fleet.image(&d1).ok().flatten(),
+            None,
+            "a create without one is the default"
+        );
+        let _ = fleet.destroy(&d1, false);
+        let _ = fleet.create_attached(&d1, None, Some(&desktop()));
+        assert!(matches!(fleet.destroy(&d1, true), Ok(State::Destroyed)));
+        assert_eq!(fleet.image(&d1).ok().flatten(), None);
+    }
+
+    #[test]
+    fn naming_an_image_without_a_record_is_refused_before_anything_happens() {
+        let rt = FakeRuntime::default();
+        let fleet = Fleet::new(&rt, FakeStore::default());
+        let r = fleet.create_attached(&id(), None, Some(&desktop()));
+        assert!(matches!(r, Err(FleetError::ImagesOff)));
+        assert_eq!(fleet.state(&id()).ok().flatten(), None);
+        assert!(rt.calls.borrow().is_empty());
     }
 }

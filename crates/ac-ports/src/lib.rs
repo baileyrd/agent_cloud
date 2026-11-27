@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ac_domain::health::{ExecClient, Pressure};
-use ac_domain::{AgentId, Checkpoint, CheckpointId, Job, JobId, Label, ProfileName, State, Volume};
+use ac_domain::{
+    AgentId, Checkpoint, CheckpointId, ImageRef, Job, JobId, Label, ProfileName, State, Volume,
+};
 
 /// Adapter failure with context; adapters map their own errors into this.
 #[derive(Debug)]
@@ -25,15 +27,27 @@ impl fmt::Display for PortError {
 
 impl std::error::Error for PortError {}
 
-/// What one boot of an agent's VM gets besides its image: the environment that carries its proxy
-/// credential (ADR-016), overriding the image's credential-less proxy variables. `Debug` shows
-/// the names only, never a value.
+/// What one boot of an agent's VM gets: the environment that carries its proxy credential
+/// (ADR-016), overriding the image's credential-less proxy variables, and the agent's recorded
+/// image (`None`: the runtime's default). `Debug` shows the env names only, never a value.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Boot {
     env: Vec<(String, String)>,
+    image: Option<ImageRef>,
 }
 
 impl Boot {
+    /// Boot from `image` instead of the runtime's default; `None` keeps the default.
+    pub fn with_image(mut self, image: Option<ImageRef>) -> Self {
+        self.image = image;
+        self
+    }
+
+    /// The image to boot from; `None`: the runtime's default.
+    pub fn image(&self) -> Option<&ImageRef> {
+        self.image.as_ref()
+    }
+
     /// Add `name=value` to the environment.
     pub fn with_env(mut self, name: &str, value: String) -> Self {
         self.env.push((name.to_owned(), value));
@@ -49,7 +63,7 @@ impl Boot {
 impl fmt::Debug for Boot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
-        write!(f, "Boot {{ env: {names:?} }}")
+        write!(f, "Boot {{ env: {names:?}, image: {:?} }}", self.image)
     }
 }
 
@@ -161,6 +175,14 @@ pub trait SessionStore {
     fn list(&self) -> Result<Vec<(AgentId, State)>, PortError>;
 }
 
+/// Each agent's recorded image (card #1627): set at create, read by every resume and fork.
+pub trait Images {
+    /// `id`'s image; `None`: no record, so the runtime's default.
+    fn image(&self, id: &AgentId) -> Result<Option<ImageRef>, PortError>;
+    /// Record `id`'s image; `None` removes the record.
+    fn set_image(&self, id: &AgentId, image: Option<&ImageRef>) -> Result<(), PortError>;
+}
+
 /// Durable record of jobs (ADR-010): states, times, exit codes. Agent-written output is not kept
 /// here.
 pub trait JobStore {
@@ -210,7 +232,10 @@ mod tests {
     fn boot_debug_shows_names_not_values() {
         let boot =
             Boot::default().with_env("HTTPS_PROXY", "http://a1:s3cr3t@10.89.0.1:3128".into());
-        assert_eq!(format!("{boot:?}"), r#"Boot { env: ["HTTPS_PROXY"] }"#);
+        assert_eq!(
+            format!("{boot:?}"),
+            r#"Boot { env: ["HTTPS_PROXY"], image: None }"#
+        );
         assert_eq!(boot.env()[0].1, "http://a1:s3cr3t@10.89.0.1:3128");
     }
 }

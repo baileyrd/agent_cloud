@@ -1,5 +1,5 @@
 //! Control-plane state backups (ADR-021 addendum): `ac-ctl backup` copies the agent list the
-//! gateway mirrors, the tokens file and the egress agents file to `<dest>/_state/<id>/` with a
+//! gateway mirrors, the image record beside it, the tokens file and the egress agents file to `<dest>/_state/<id>/` with a
 //! manifest, and `ac-ctl restore-state` puts them back into a data directory with no agents.
 //! The rules (names, formats, checks) are `ac_domain::state`; this is the file I/O.
 
@@ -8,7 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use ac_domain::backup::{next_id, BackupId};
-use ac_domain::state::{self, Entry, AGENTS, MANIFEST, TOKENS};
+use ac_domain::state::{self, Entry, AGENTS, IMAGES, MANIFEST, TOKENS};
 use ac_ports::SessionStore;
 use ac_store::mirror::Mirrored;
 use ac_store::EngineStore;
@@ -41,6 +41,7 @@ impl Paths {
     pub fn source(&self, name: &str) -> PathBuf {
         match name {
             AGENTS => ac_store::mirror::path(&self.data),
+            IMAGES => ac_store::images::path(&self.data),
             TOKENS => self.tokens.clone(),
             _ => self.egress.clone(),
         }
@@ -339,6 +340,10 @@ mod tests {
             agents(&to.data),
             [(a("a1"), State::Running), (a("a2"), State::Paused)]
         );
+        assert!(
+            !ac_store::images::path(&to.data).exists(),
+            "none backed up, none made"
+        );
         for (x, y) in [(&from.tokens, &to.tokens), (&from.egress, &to.egress)] {
             assert_eq!(std::fs::read(x).ok(), std::fs::read(y).ok());
         }
@@ -443,6 +448,25 @@ mod tests {
         let other = BackupId::parse("20200101-000000").unwrap_or_else(|e| panic!("{e}"));
         let e = restore(&to, &dest, Some(&other)).err().unwrap_or_default();
         assert!(e.contains("no state backup 20200101-000000"), "{e}");
+        for d in [src, dst, dest] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn the_image_record_is_backed_up_and_restored() {
+        let (src, dst, dest) = (tmp("src"), tmp("dst"), tmp("dest"));
+        let from = host(&src, true);
+        let images = ac_store::images::path(&from.data);
+        let record = "a2 localhost/agent-desktop:dev\n";
+        let _ = std::fs::write(&images, record);
+        let saved = save(&from, &dest, 7, 1_795_000_000).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(saved.files, [AGENTS, TOKENS, EGRESS, IMAGES]);
+        let to = clean(&dst);
+        let said = restore(&to, &dest, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(said.contains("images"), "{said}");
+        let back = std::fs::read_to_string(ac_store::images::path(&to.data));
+        assert_eq!(back.ok().as_deref(), Some(record));
         for d in [src, dst, dest] {
             let _ = std::fs::remove_dir_all(d);
         }

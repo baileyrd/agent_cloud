@@ -3,7 +3,10 @@
 //!
 //! Env: `AC_TOKENS` (the tokens file, default /etc/agent-cloud/tokens: owned by the gateway's
 //! user, mode 0600; re-read on SIGHUP and when it changes, checked each second),
-//! `AC_BIND` (default 127.0.0.1:8780), `AC_IMAGE` (required),
+//! `AC_BIND` (default 127.0.0.1:8780), `AC_IMAGE` (required: what an agent boots from when its
+//! create named no image), `AC_IMAGES` (comma-separated `<name>=<image>` a create may name, such
+//! as `desktop=docker.io/library/agent-desktop:latest`; card #1627, recorded per agent in
+//! `$AC_DATA/state/images` and reused on resume and fork),
 //! `AC_DATA` (default /var/lib/agent-cloud), `AC_CTR`, `AC_NAMESPACE`,
 //! `AC_UID` (workspace owner, default 1000), `AC_NETWORK=1` (attach agents to CNI),
 //! `AC_ALLOW_PUBLIC_BIND=1` to override the private-address check, `AC_TAILSCALE_SERVE=1` (behind
@@ -96,6 +99,7 @@ use ac_gateway::viewer::Hub;
 use ac_gateway::watchdog::Watchdog;
 use ac_gateway::web::App;
 use ac_gateway::{bind, Api, Unhealthy};
+use ac_store::images::ImageFile;
 use ac_store::mirror::Mirrored;
 use ac_store::EngineStore;
 use platform::events::{SignalEvent, SignalSource};
@@ -408,6 +412,8 @@ fn run() -> Result<(), String> {
     let tokens = load_tokens(&mut file)?;
     let keys = Keys::new(tokens);
     let image = std::env::var("AC_IMAGE").map_err(|_| "AC_IMAGE is required")?;
+    let allowed_images = ac_domain::image::parse_allowlist(&env("AC_IMAGES", ""))
+        .map_err(|e| format!("AC_IMAGES: {e}"))?;
     let addr: SocketAddr = env("AC_BIND", "127.0.0.1:8780")
         .parse()
         .map_err(|e| format!("AC_BIND: {e}"))?;
@@ -479,7 +485,8 @@ fn run() -> Result<(), String> {
     }
     let mut fleet = Fleet::new(runtime, registry)
         .with_admission(Box::new(capacity), margin)
-        .with_snapshots(Arc::new(snapshots), checkpoint_max()?);
+        .with_snapshots(Arc::new(snapshots), checkpoint_max()?)
+        .with_images(Arc::new(ImageFile::new(ac_store::images::path(&data))));
     let egress = match networked {
         true => Some(Arc::new(egress_store()?)),
         false => None,
@@ -551,6 +558,7 @@ fn run() -> Result<(), String> {
     jobs.startup();
     let unhealthy = Unhealthy::default();
     let mut api = Api::new(fleet)
+        .with_images(allowed_images)
         .with_unhealthy(Arc::clone(&unhealthy))
         .with_jobs(jobs.clone());
     if let Some(e) = egress {

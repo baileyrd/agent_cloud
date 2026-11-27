@@ -69,7 +69,8 @@ figure to use.**
 | Disk: a1 / a2 after a few days of use | 38 / 28 MiB | 1 |
 
 **Guest memory is never returned.** Memory a guest has touched stays allocated on the host until the VM stops,
-because there is no balloon, free page reporting or virtio-mem (`enable_virtio_mem = false`). The guest's page
+because there is no balloon, free page reporting or virtio-mem (`enable_virtio_mem = false`; ADR-032 proposes
+free page reporting, measured below). The guest's page
 cache counts as touched. A long-running agent therefore tends toward `default_memory` plus ~150 MiB. Pause
 (which stops the VM) and resume reset it.
 
@@ -555,6 +556,33 @@ Measured on BaileyServ 2026-11-26 (main e1822aa plus the #472 fixes), agent d1, 
 
 Both memory figures stay under the 2048 MiB target with Chromium open.
 
+## Guests returning memory (card #478; 2026-11-26)
+
+Each run used a fresh agent (agent-shell, 2048 MiB guest, 2 vCPU, `memory.max` 2560 MiB). In the guest,
+python3 touched 1500 MiB page by page and freed it. The figures are the sandbox cgroup's `memory.current`, the
+QEMU RSS and `/dev/shm` used. The guest's own used memory was 215–231 MiB at every sample after the free.
+
+| Kata setting | Before | Just after | +60 s | +300 s |
+|---|---|---|---|---|
+| Neither (today's default) | 362 / 403 / 1873 | 1860 / 1890 / 3361 | 1860 / 1891 / 3361 | 1860 / 1891 / 3361 |
+| `reclaim_guest_freed_memory = true`, initrd as shipped | 366 / 407 / 1877 | 1873 / 1903 / 3374 | 1873 / 1903 / 3374 | 1873 / 1903 / 3374 |
+| `reclaim_guest_freed_memory = true` + `virtio_balloon` loaded in the guest | 359 / 399 / 1869 | 1857 / 1888 / 3358 | **377 / 413 / 1883** | 377 / 413 / 1883 |
+| `enable_virtio_mem = true` | 365 / – / 1875 | 1878 / – / 3377 | 1878 / – / 3378 | 1878 / – / 3378 |
+
+(cgroup / QEMU RSS / `/dev/shm` used, all in MiB; the virtio-mem run's RSS sample read the wrong process.)
+
+- Free page reporting works, but only with the guest's balloon driver. The Kata initrd ships without
+  `virtio_balloon`, so QEMU gets `free-page-reporting=on` and the guest never binds the device (virtio device
+  0x0005 has no driver). With the module insmod'ed, about 1480 MiB came back to the host within 60 s. It came
+  back from the cgroup and from `/dev/shm` alike: QEMU punches holes in the shared file.
+- virtio-mem returns nothing on its own: it resizes guest RAM only when the host asks, and it does not report
+  freed pages.
+- Dropping the guest's page cache (`drop_caches`) changed nothing in any run.
+- Admission (ADR-012) still charges each agent its full `default_memory` against `/dev/shm`, so it stays
+  correct and conservative. The memory that comes back is headroom it does not count. `memory.max`
+  (ADR-023) is unchanged, and charges fall when pages are reported, so an agent is less likely to reach it.
+- Not measured: the CPU cost of reporting under a real build, or a long-running build agent over hours.
+
 ## Not measured
 
 - Any SSD or NVMe disk; everything here is one rotational disk.
@@ -571,8 +599,7 @@ Both memory figures stay under the 2048 MiB target with Chromium open.
 - N=8. The staircase stopped at N=6, as `--max-n 6` intended, and the N=6 load already failed.
 - The proxy under real model traffic. Only 6 concurrent HEAD requests went through it, and its CPU was
   sampled at 2 s granularity.
-- Free page reporting, virtio-mem. The `/dev/shm` resize and admission were checked live (ADR-012), but the
-  staircase was not re-run with them.
+- The staircase re-run with free page reporting on (measured on its own above, #478).
 - A create while the load runs at N = 2–4; it was measured only at N=1 and N=6.
 
 ## Requirements that still hold

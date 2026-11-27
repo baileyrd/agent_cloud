@@ -1332,7 +1332,7 @@ fn cancel_queued_running_and_finished() {
 }
 
 #[test]
-fn vanished_runner_bad_exit_code_and_failed_start_fail_the_job() {
+fn vanished_runner_bad_exit_code_log_failures_and_failed_start_fail_the_job() {
     let r = rig();
     let gone = r.ok("a1", "a");
     r.jobs.tick();
@@ -1349,6 +1349,20 @@ fn vanished_runner_bad_exit_code_and_failed_start_fail_the_job() {
         field(&r.get("a1", &garbled), "reason"),
         "unreadable exit code"
     );
+    let capped = r.ok("a1", "d");
+    r.jobs.tick();
+    r.fake.set(&capped, Probe::Capped);
+    r.tick();
+    let j = r.get("a1", &capped);
+    assert_eq!(field(&j, "state"), "failed");
+    assert_eq!(field(&j, "reason"), jobs::CAPPED);
+    let unlogged = r.ok("a1", "e");
+    r.jobs.tick();
+    r.fake.set(&unlogged, Probe::LogFailed);
+    r.tick();
+    let j = r.get("a1", &unlogged);
+    assert_eq!(field(&j, "state"), "failed");
+    assert_eq!(field(&j, "reason"), jobs::LOG_FAILED);
     r.fake.w().start_fails = true;
     let unstarted = r.ok("a1", "c");
     r.jobs.tick();

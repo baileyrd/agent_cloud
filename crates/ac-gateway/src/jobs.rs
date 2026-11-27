@@ -156,34 +156,92 @@ fi
 unset secret
 tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$id" "$cred" "$model" "$@""#;
 
-/// The job's window (bash): `claude` reads the prompt on stdin; its log is capped at 16 MiB (a
-/// job that passes it is stopped); the terminal shows a digest. With a credential, its log is
-/// redacted line by line before it is stored or shown, so the raw secret never reaches the
-/// workspace's `stream.jsonl` or `result.txt` (whole stream-json lines, so no split matches; its
-/// characters need no JSON escaping and only `.` and `/` need escaping for `sed`). The job's credential file goes as
+/// The job's window (bash): `claude` reads the prompt on stdin; the terminal shows a digest of its
+/// log. The log goes through `filter` (below) on its way to `stream.jsonl`: whole records, each
+/// passed on as it arrives, redacted first, at most 16 MiB in all. A job that reaches the cap is
+/// stopped and marked `capped`, which [`STATUS`] reports in place of its exit code. A filter that
+/// fails (does not start, or aborts) leaves its exit status in `logfailed`: the log is then not
+/// to be trusted, so that job fails too, whatever `claude` exited with (`capped` still wins).
+/// `claude -p` waits for its background tasks after its result, and a GUI app such as Chromium
+/// never ends, so `grace` seconds after the first `result` event a `claude` still
+/// running is sent TERM (its process group: `timeout` makes one), which ends its tasks; the job
+/// then exits 0, or 1 if that result was an error. A capped job's `claude`, or one whose filter failed, is sent TERM at once. With a credential, the raw secret never
+/// reaches the workspace's `stream.jsonl` or `result.txt`. The job's credential file goes as
 /// soon as `claude` exits, before the job reports that it ended (and on any exit of the window). `exit_code` is written last, then
 /// the marker `.job-<id>.done` in the workspace root, which the gateway sees without an exec.
+///
+/// `filter`, the log's filter (Python, run with `-I`, so nothing from the agent's environment or home
+/// is imported). argv: the byte cap, the credential file (empty for none), the marker to create
+/// when the cap is reached. It reads its input as it comes, splits it into newline-ended records
+/// and writes each whole record at once, with the credential replaced by [`REDACTED`]: a secret
+/// can never be split across writes, and a partial record is never published. The record still
+/// arriving is held to what is left of the cap (plus one 64 KiB read), checked after every read,
+/// so memory stays bounded whatever claude writes, newline or not. A record that would pass the cap is dropped, the marker is created and the filter
+/// exits; `claude` then gets SIGPIPE. No single quotes: it sits in a single-quoted shell string.
 const RUN: &str = r#"id=$1 cred=$2 model=$3 secs=$4
 shift 4
+grace=10
 d=/workspace/.jobs/$id
 c=/dev/shm/ac-job-$id
 trap 'rm -rf -- "$c"' EXIT
-redact() { cat; }
+credfile=
 if [ "$cred" = 1 ]; then
     export AC_JOB_CREDENTIAL_FILE=$c/credential
-    pat=$(sed 's/[./]/\\&/g' "$c/credential")
-    redact() { sed -u "s/$pat/[credential redacted]/g"; }
+    credfile=$c/credential
     if [ "$model" != - ]; then
         export ANTHROPIC_BASE_URL="$model"
         ANTHROPIC_AUTH_TOKEN=$(cat "$c/credential")
         export ANTHROPIC_AUTH_TOKEN
     fi
 fi
+filter='import os, sys
+cap, cred, mark = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+secret = open(cred, "rb").read() if cred else b""
+left, pending = cap, b""
+def put(rec):
+    global left
+    if secret:
+        rec = rec.replace(secret, b"[credential redacted]")
+    if len(rec) > left:
+        full()
+    left -= len(rec)
+    while rec:
+        rec = rec[os.write(1, rec):]
+def full():
+    open(mark, "w").close()
+    sys.exit(0)
+while True:
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    pending += chunk
+    *recs, pending = pending.split(b"\n")
+    for r in recs:
+        put(r + b"\n")
+    if len(pending) > left:
+        full()
+if pending:
+    put(pending)'
 show='fromjson? | if .type == "assistant" then (.message.content[]? | if .type == "text" then .text + "\n" elif .type == "tool_use" then "> " + .name + " " + (.input | tostring | .[0:160]) + "\n" else empty end) elif .type == "result" then "--- " + (.subtype // "result") + "\n" else empty end'
+stop_after_result() {
+    until [ -s "$d/claude.pid" ] && { [ -e "$d/capped" ] || [ -e "$d/logfailed" ] \
+        || grep -F '"type":"result"' "$d/stream.jsonl" 2>/dev/null \
+        | jq -e 'select(.type == "result")' >/dev/null 2>&1; }; do sleep 1; done
+    [ -e "$d/capped" ] || [ -e "$d/logfailed" ] || sleep "$grace"
+    kill -TERM "$(cat "$d/claude.pid")" 2>/dev/null && : > "$d/stopped"
+}
 printf 'job %s started %s\n' "$id" "$(date -u +%FT%TZ)"
-timeout -k 10 "$secs" claude -p --output-format stream-json --verbose "$@" < "$d/prompt.txt" \
-    | redact | head -c 16777216 | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
+stop_after_result &
+stopper=$!
+{ timeout -k 10 "$secs" claude -p --output-format stream-json --verbose "$@" < "$d/prompt.txt" &
+  echo $! > "$d/claude.pid"; wait $!; } \
+    | { python3 -I -c "$filter" 16777216 "$credfile" "$d/capped"; r=$?
+        [ "$r" = 0 ] || printf '%s\n' "$r" > "$d/logfailed"; } | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
 rc=${PIPESTATUS[0]}
+kill "$stopper" 2>/dev/null
+if [ -e "$d/stopped" ]; then
+    rc=$(jq -Rr 'fromjson? | select(.type == "result") | if .is_error then 1 else 0 end' "$d/stream.jsonl" | head -n 1)
+fi
 rm -rf -- "$c"
 jq -Rrj 'fromjson? | select(.type == "result") | .result // empty' "$d/stream.jsonl" \
     | head -c 262144 > "$d/result.txt"
@@ -192,13 +250,15 @@ mv "$d/exit_code.tmp" "$d/exit_code"
 : > "/workspace/.job-$id.done"
 printf '\njob %s ended: exit %s\n' "$id" "$rc""#;
 
-/// Whether a job runs: its window's pane is alive (`running`), else its exit code (`exit N`),
-/// else `gone`. Liveness first: the runner writes `exit_code` before it exits. The window is found
+/// Whether a job runs: its window's pane is alive (`running`), else `capped` if its log reached
+/// the cap, else `logfailed` if its log filter failed, else its exit code (`exit N`), else `gone`. Liveness first: the runner writes `exit_code` before it exits. The window is found
 /// by name in `list-windows`: `display -t` falls back to the current pane when the target is
 /// missing, so it would report the agent's own shell.
 const STATUS: &str = r#"id=$1
 dead=$(tmux list-windows -t main -F '#{window_name} #{pane_dead}' 2>/dev/null | sed -n "s/^job-$id //p" | head -n 1)
 if [ "$dead" = 0 ]; then echo running; exit 0; fi
+if [ -e "/workspace/.jobs/$id/capped" ]; then echo capped; exit 0; fi
+if [ -e "/workspace/.jobs/$id/logfailed" ]; then echo logfailed; exit 0; fi
 f=/workspace/.jobs/$id/exit_code
 if [ -f "$f" ]; then printf 'exit %s\n' "$(head -c 12 "$f" | tr -dc 0-9-)"; exit 0; fi
 echo gone"#;
@@ -234,11 +294,22 @@ done
 echo "alive:$left"
 exit 1"#;
 
+/// A capped job's reason: its log reached the 16 MiB cap, so it was stopped and its log is cut
+/// short.
+pub const CAPPED: &str = "log cap reached: stopped at 16 MiB of output, log cut short";
+/// The reason of a job whose log filter failed: its log may be incomplete or unredacted, so it
+/// was stopped.
+pub const LOG_FAILED: &str = "log filter failed: stopped, log incomplete";
+
 /// What a status probe found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Probe {
     /// The job's window is alive.
     Running,
+    /// Its log reached the cap: it was stopped and its log is cut short, whatever it exited with.
+    Capped,
+    /// Its log filter failed: it was stopped and its log is not to be trusted.
+    LogFailed,
     /// It exited; `None` if its exit code was unreadable.
     Exited(Option<i32>),
     /// Its window is gone and it left no exit code.
@@ -251,6 +322,8 @@ pub fn parse_probe(out: &[u8]) -> Result<Probe, String> {
     match text.trim() {
         "running" => Ok(Probe::Running),
         "gone" => Ok(Probe::Gone),
+        "capped" => Ok(Probe::Capped),
+        "logfailed" => Ok(Probe::LogFailed),
         line => match line.strip_prefix("exit") {
             Some(code) => Ok(Probe::Exited(code.trim().parse().ok())),
             None => Err(format!("unexpected status {line:?}")),
@@ -1380,6 +1453,8 @@ impl Jobs {
             }
             Ok(Probe::Exited(Some(code))) => (JobEvent::Exit(code), None),
             Ok(Probe::Exited(None)) => (JobEvent::Fail, Some("unreadable exit code")),
+            Ok(Probe::Capped) => (JobEvent::Fail, Some(CAPPED)),
+            Ok(Probe::LogFailed) => (JobEvent::Fail, Some(LOG_FAILED)),
             Ok(Probe::Gone) => {
                 // The window went without the runner's own cleanup: remove the credential file.
                 if let Err(e) = self.runner.kill(&j.agent, &j.id) {
@@ -2168,4 +2243,275 @@ fn random() -> [u8; 8] {
         b = (now_ms() ^ (N.fetch_add(1, Ordering::Relaxed) as u64) << 48).to_le_bytes();
     }
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_probe, Probe, REDACTED, RUN, STATUS};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A fresh directory with a workspace holding job `j1`'s prompt, a `bin` for a stand-in
+    /// `claude` and a `shm` for its credential.
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ac-run-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let made = std::fs::create_dir_all(root.join("ws/.jobs/j1"))
+            .and_then(|()| std::fs::create_dir_all(root.join("bin")))
+            .and_then(|()| std::fs::create_dir_all(root.join("shm/ac-job-j1")))
+            .and_then(|()| std::fs::write(root.join("ws/.jobs/j1/prompt.txt"), "go"));
+        assert!(made.is_ok(), "{made:?}");
+        root
+    }
+
+    /// What a run left.
+    struct Ran {
+        took: Duration,
+        code: String,
+        stream: String,
+        capped: bool,
+        stopped: bool,
+        /// The log filter's exit status, if it failed.
+        logfailed: Option<String>,
+    }
+
+    /// Put an executable `name` with this script in `root/bin`, ahead of the real one on PATH.
+    fn stub(root: &Path, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin").join(name);
+        let wrote = std::fs::write(&bin, script)
+            .and_then(|()| std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)));
+        assert!(wrote.is_ok(), "{wrote:?}");
+    }
+
+    /// Run [`RUN`] for job `j1` under bash, with `/workspace` at `root/ws`, `/dev/shm` at
+    /// `root/shm`, `claude` the given script, no grace after the result and a log cap of `cap`
+    /// bytes. With `secret`, the job carries it as its credential.
+    fn run(root: &Path, claude: &str, cap: usize, secret: Option<&str>) -> Ran {
+        stub(root, "claude", claude);
+        if let Some(s) = secret {
+            let wrote = std::fs::write(root.join("shm/ac-job-j1/credential"), s);
+            assert!(wrote.is_ok(), "{wrote:?}");
+        }
+        let ws = root.join("ws");
+        let script = RUN
+            .replace("/workspace", &ws.to_string_lossy())
+            .replace("/dev/shm", &root.join("shm").to_string_lossy())
+            .replace("grace=10\n", "grace=0\n")
+            .replace(" 16777216 ", &format!(" {cap} "));
+        let path = format!(
+            "{}:{}",
+            root.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let cred = if secret.is_some() { "1" } else { "0" };
+        let start = Instant::now();
+        let out = Command::new("bash")
+            .args(["-c", &script, "ac-job", "j1", cred, "-", "60"])
+            .env("PATH", path)
+            .output();
+        let took = start.elapsed();
+        assert!(
+            matches!(&out, Ok(o) if o.status.success()),
+            "runner failed: {out:?}"
+        );
+        let d = ws.join(".jobs/j1");
+        let read = |f: &str| std::fs::read_to_string(d.join(f)).unwrap_or_default();
+        Ran {
+            took,
+            code: read("exit_code").trim().to_owned(),
+            stream: read("stream.jsonl"),
+            capped: d.join("capped").exists(),
+            stopped: d.join("stopped").exists(),
+            logfailed: std::fs::read_to_string(d.join("logfailed"))
+                .ok()
+                .map(|s| s.trim().to_owned()),
+        }
+    }
+
+    const RESULT: &str =
+        r#"{"duration_ms":1,"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+    /// A stand-in `claude` that prints `body` (shell), then waits on a background task.
+    fn waits_after(body: &str) -> String {
+        format!("#!/bin/bash\ncat >/dev/null\n{body}\nsleep 30 &\nwait\n")
+    }
+    /// Big enough for every log below.
+    const ROOMY: usize = 1 << 20;
+
+    #[test]
+    fn a_background_task_does_not_keep_a_finished_job_running() {
+        let root = scratch("bg");
+        let ran = run(
+            &root,
+            &waits_after(&format!("echo '{RESULT}'")),
+            ROOMY,
+            None,
+        );
+        assert!(ran.took < Duration::from_secs(15), "took {:?}", ran.took);
+        assert_eq!(ran.code, "0");
+        assert!(ran.stopped && !ran.capped);
+        let result = std::fs::read_to_string(root.join("ws/.jobs/j1/result.txt"));
+        assert_eq!(result.ok().as_deref(), Some("done"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_error_result_fails_a_stopped_job() {
+        let root = scratch("err");
+        let error = RESULT.replace(r#""is_error":false"#, r#""is_error":true"#);
+        let ran = run(&root, &waits_after(&format!("echo '{error}'")), ROOMY, None);
+        assert!(ran.took < Duration::from_secs(15), "took {:?}", ran.took);
+        assert_eq!(ran.code, "1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_job_that_ends_by_itself_keeps_its_exit_code() {
+        let root = scratch("exit");
+        let claude = format!("#!/bin/bash\ncat >/dev/null\necho '{RESULT}'\nexit 3\n");
+        let ran = run(&root, &claude, ROOMY, None);
+        assert_eq!(ran.code, "3");
+        assert!(!ran.stopped && !ran.capped);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_log_reaches_the_stream_while_claude_runs() {
+        let root = scratch("live");
+        // The second line is only written once the first is in stream.jsonl: a buffering cap
+        // (as `head -c` was) would hold the first back and the job would fail.
+        let stream = root.join("ws/.jobs/j1/stream.jsonl");
+        let claude = "#!/bin/bash\ncat >/dev/null\necho '{\"type\":\"system\"}'\n\
+            for _ in $(seq 50); do grep -q system \"$STREAM\" 2>/dev/null && break; sleep 0.1; done\n\
+            grep -q system \"$STREAM\" || exit 7\n"
+            .replace("$STREAM", &stream.to_string_lossy());
+        let ran = run(&root, &claude, ROOMY, None);
+        assert_eq!(ran.code, "0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_log_of_exactly_the_cap_is_kept_whole() {
+        let root = scratch("exact");
+        // Two records of 10 bytes each (newline included), cap 20.
+        let claude = "#!/bin/bash\ncat >/dev/null\necho 123456789\necho abcdefghi\n";
+        let ran = run(&root, claude, 20, None);
+        assert_eq!(ran.stream, "123456789\nabcdefghi\n");
+        assert!(!ran.capped);
+        assert_eq!(ran.code, "0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_record_past_the_cap_is_dropped_and_the_job_is_capped_and_stopped() {
+        let root = scratch("over");
+        // 10 + 11 bytes against a cap of 20: the second record is never published, and the
+        // job, still waiting on its task, is stopped at once rather than at its timeout.
+        let ran = run(
+            &root,
+            &waits_after("echo 123456789\necho abcdefghij"),
+            20,
+            None,
+        );
+        assert_eq!(ran.stream, "123456789\n");
+        assert!(ran.capped);
+        assert!(ran.took < Duration::from_secs(15), "took {:?}", ran.took);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_record_without_an_end_is_bounded_while_it_arrives() {
+        let root = scratch("endless");
+        // 4 KiB with no newline, then a long wait: the filter gives up as soon as the pending
+        // record passes the cap, without waiting for its end, and publishes none of it.
+        let ran = run(
+            &root,
+            &waits_after("head -c 4096 /dev/zero | tr '\\0' x"),
+            1000,
+            None,
+        );
+        assert_eq!(ran.stream, "");
+        assert!(ran.capped);
+        assert!(ran.took < Duration::from_secs(15), "took {:?}", ran.took);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_credential_is_redacted_even_when_it_arrives_in_pieces() {
+        let root = scratch("redact");
+        let secret = "sk-test.4/2";
+        // The secret is split across two writes, a moment apart.
+        let body =
+            format!("printf '{{\"t\":\"sk-te'\nsleep 0.3\nprintf 'st.4/2\"}}\\n'\necho '{RESULT}'");
+        let claude = format!("#!/bin/bash\ncat >/dev/null\n{body}\n");
+        let ran = run(&root, &claude, ROOMY, Some(secret));
+        let redacted = String::from_utf8_lossy(REDACTED);
+        assert!(!ran.stream.contains(secret), "{}", ran.stream);
+        assert!(
+            ran.stream
+                .starts_with(&format!("{{\"t\":\"{redacted}\"}}\n")),
+            "{}",
+            ran.stream
+        );
+        assert_eq!(ran.code, "0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_filter_that_cannot_start_fails_the_job_and_stops_claude() {
+        let root = scratch("nofilter");
+        stub(&root, "python3", "#!/bin/sh\nexit 127\n");
+        // claude writes nothing and waits: only the runner can end it.
+        let ran = run(&root, &waits_after("true"), ROOMY, None);
+        assert_eq!(ran.logfailed.as_deref(), Some("127"));
+        assert_eq!(ran.stream, "");
+        assert!(ran.took < Duration::from_secs(15), "took {:?}", ran.took);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_filter_that_aborts_fails_a_job_that_exits_0() {
+        let root = scratch("abort");
+        // Passes one record on, then fails as on an I/O error; claude itself exits 0.
+        stub(&root, "python3", "#!/bin/sh\nhead -n 1\nexit 1\n");
+        let claude = format!("#!/bin/bash\ncat >/dev/null\necho one\necho '{RESULT}'\n");
+        let ran = run(&root, &claude, ROOMY, None);
+        assert_eq!(ran.logfailed.as_deref(), Some("1"));
+        assert_eq!(ran.stream, "one\n");
+        assert!(!ran.capped);
+        assert_eq!(status(&root), "logfailed", "not the exit code {}", ran.code);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// [`STATUS`] for job `j1` under bash, with `/workspace` at `root/ws` and no tmux window.
+    fn status(root: &Path) -> String {
+        let script = STATUS.replace("/workspace", &root.join("ws").to_string_lossy());
+        let out = Command::new("bash")
+            .args(["-c", &script, "ac-job-status", "j1"])
+            .env("PATH", "/usr/bin:/bin")
+            .output();
+        let text = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+        text.unwrap_or_default()
+    }
+
+    #[test]
+    fn the_cap_wins_over_a_failed_filter_and_both_over_the_exit_code() {
+        let root = scratch("status");
+        let d = root.join("ws/.jobs/j1");
+        let mark = |f: &str, text: &str| assert!(std::fs::write(d.join(f), text).is_ok());
+        mark("exit_code", "0\n");
+        assert_eq!(status(&root), "exit 0");
+        mark("logfailed", "1\n");
+        assert_eq!(status(&root), "logfailed");
+        mark("capped", "");
+        assert_eq!(status(&root), "capped");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn log_outcomes_are_probed_as_such() {
+        assert_eq!(parse_probe(b"capped\n"), Ok(Probe::Capped));
+        assert_eq!(parse_probe(b"logfailed\n"), Ok(Probe::LogFailed));
+    }
 }

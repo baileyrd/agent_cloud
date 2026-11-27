@@ -128,9 +128,9 @@ items below in scope (R5). This file records what shipped and how it was verifie
 - [x] Each job's changed paths in the agent's history, from btrfs snapshots at its start and end (ADR-019;
   verified on BaileyServ 2026-11-24: create, edit, rename and delete listed exactly, a cancelled job listed too,
   no snapshots left behind)
-- [ ] Each ended job's witness record (state, times, exit, changed paths, egress decisions) and its SHA-256,
-  from outside the VM, through REST and MCP (ADR-029 proposed, #1065). Live check reported passing on BaileyServ
-  2026-11-27 (job 48c9d5719e92e6e5: egress counts matched the proxy's journal, digest recomputed); awaits acceptance
+- [x] Each ended job's witness record (state, times, exit, changed paths, egress decisions) and its SHA-256,
+  from outside the VM, through REST and MCP (ADR-029 accepted 2026-11-27, #1065; live check on BaileyServ: job
+  48c9d5719e92e6e5's egress counts matched the proxy's journal, digest recomputed)
 - [ ] Web UI for agents and jobs: static in-repo pages over the existing API, six slices (ADR-030 accepted 2026-11-25, #516). All six slices: the agents page at `/ui/` with the host's capacity, and each agent's page (checkpoints, restore, fork, egress, viewer links) and jobs page.
 - [ ] Launch contract for untrusted agents ([launch-contract.md](launch-contract.md), #1066): the gateway calls,
   token, failures; tested end to end over HTTP with fakes; `scripts/untrusted-run.sh` for the host (#1067).

@@ -29,6 +29,9 @@ sudo scripts/desktop-smoke.sh d1   # X on DUMMY0, Xfce up, Chromium runs under t
   needs to automate a browser uses its own (Playwright's bundled Chromium, say) in `/workspace`, which this
   policy does not cover. To debug the agent's browsing by hand, build a dev image with the value set to `1`.
 - **No accounts or sync:** sign-in, sync, the password manager, autofill, guest mode and new profiles are off.
+- **Blank start:** startup, home and new tab all open `about:blank` (`RestoreOnStartup: 4` with
+  `RestoreOnStartupURLs`, `HomepageLocation`, `NewTabPageLocation`), not Fedora's start page, which the
+  egress proxy refuses, and Chromium never restores the last session's tabs.
 - **Quiet:** no metrics reports, no default-browser prompt, nothing left running in the background, no
   microphone or camera.
 

@@ -17,5 +17,10 @@
   "MetricsReportingEnabled": false,
   "DefaultBrowserSettingEnabled": false,
   "BackgroundModeEnabled": false,
-  "BookmarkBarEnabled": false
+  "BookmarkBarEnabled": false,
+  "RestoreOnStartup": 4,
+  "RestoreOnStartupURLs": ["about:blank"],
+  "HomepageLocation": "about:blank",
+  "HomepageIsNewTabPage": false,
+  "NewTabPageLocation": "about:blank"
 }

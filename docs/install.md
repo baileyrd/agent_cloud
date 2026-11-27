@@ -501,6 +501,10 @@ in `gateway.env` (restart the gateway after a change):
   `git` without push, `ls`, `cat`, `python3`, `cargo build|test|check|fmt`, `sleep`);
   a job that leaves a background task running (Chromium, say) ends 10 s after `claude` gives its result, and the
   task ends with it;
+- `AC_JOB_DESKTOP_TOOLS` with `AC_JOB_DESKTOP_IMAGES` (both unset by default; set both or neither): extra
+  `--allowedTools` entries, such as `Bash(chromium:*),Bash(ffmpeg:*),Bash(xdotool:*)`, for jobs of agents whose
+  recorded image is one of the listed `AC_IMAGES` names (e.g. `desktop`). Other agents' jobs are unaffected;
+  the gateway refuses to start on a name not in `AC_IMAGES`;
 - `AC_JOB_UNSAFE=1`: `--dangerously-skip-permissions` instead. Read [security.md](security.md#task-api) first;
 - `AC_JOB_MODEL_URL`: an `https://` URL (e.g. LEL's gateway, `https://<lel-gateway-host>:<port>`). Jobs that carry
   a credential reach the model there, with the credential as their token (ADR-028 addendum). Its host and port

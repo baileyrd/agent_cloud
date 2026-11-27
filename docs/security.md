@@ -175,6 +175,11 @@ egress allowlist. A headless `claude` cannot ask for approval, so the gateway pa
 - `python3` and `cargo` run arbitrary code (a `-c` argument, a build script), so with the default list a
   job can in effect do anything the agent user can do inside its VM. Drop them for jobs that only read and
   edit, if you want the list to mean more.
+- `AC_JOB_DESKTOP_TOOLS` (opt-in, with `AC_JOB_DESKTOP_IMAGES`) widens the list for desktop agents only:
+  `chromium` runs under its managed policy (no extensions, no DevTools or remote debugging), `ffmpeg` can
+  read and write any file the agent user can (it grabs the screen with `x11grab`), and `xdotool` drives the
+  agent's own display, including while the owner has taken it over. None of them reach past the VM or the
+  egress allowlist, and with `python3` in the list they add little a job could not already do.
 - `AC_JOB_UNSAFE=1` passes `--dangerously-skip-permissions`: no list at all. Tradeoff: the VM, the egress
   allowlist and the isolation between agents are the boundary in every mode; the permission list is a
   second layer that stops a confused or prompt-injected job from casually running commands outside it.

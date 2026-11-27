@@ -18,6 +18,8 @@
 //! span, 90), `AC_BUSY_LOAD_PER_CORE` (1.0), `AC_BUSY_IO_SOME` (20), `AC_BUSY_CPU_SOME` (50). Jobs (ADR-010):
 //! `AC_JOB_PERMISSION_MODE` (default `acceptEdits`), `AC_JOB_ALLOWED_TOOLS` (comma-separated,
 //! default [`jobs::DEFAULT_TOOLS`]), `AC_JOB_UNSAFE=1` (`--dangerously-skip-permissions` instead),
+//! `AC_JOB_DESKTOP_TOOLS` with `AC_JOB_DESKTOP_IMAGES` (extra tools for agents on those `AC_IMAGES`
+//! names only; both unset by default, see [`jobs::DesktopTools`]),
 //! `AC_JOB_MODEL_URL` (an `https://` URL: jobs that carry a credential reach the model there, with
 //! the credential as their token; ADR-028 addendum. Unset, every job uses the agent's own login).
 //! Job start gate (ADR-013; defaults in [`Limits::for_cores`]): `AC_MAX_RUNNING_JOBS` (host-wide,
@@ -462,6 +464,11 @@ fn run() -> Result<(), String> {
         std::env::var("AC_JOB_ALLOWED_TOOLS").ok().as_deref(),
         env("AC_JOB_UNSAFE", "") == "1",
     )?;
+    let desktop_tools = jobs::DesktopTools::from_settings(
+        std::env::var("AC_JOB_DESKTOP_TOOLS").ok().as_deref(),
+        std::env::var("AC_JOB_DESKTOP_IMAGES").ok().as_deref(),
+        &allowed_images,
+    )?;
     let model = model_url()?;
     let margin = env_mib("AC_SHM_MARGIN_MIB")?.unwrap_or(512);
     let gate = limits()?;
@@ -483,10 +490,11 @@ fn run() -> Result<(), String> {
     if let Err(e) = registry.sync() {
         eprintln!("ac-gateway: {e}; backups will not have the agent list until it is written");
     }
+    let images = Arc::new(ImageFile::new(ac_store::images::path(&data)));
     let mut fleet = Fleet::new(runtime, registry)
         .with_admission(Box::new(capacity), margin)
         .with_snapshots(Arc::new(snapshots), checkpoint_max()?)
-        .with_images(Arc::new(ImageFile::new(ac_store::images::path(&data))));
+        .with_images(Arc::clone(&images) as Arc<dyn ac_ports::Images + Send + Sync>);
     let egress = match networked {
         true => Some(Arc::new(egress_store()?)),
         false => None,
@@ -553,6 +561,10 @@ fn run() -> Result<(), String> {
             url.as_str()
         );
         jobs = jobs.with_model_url(url);
+    }
+    if let Some(tools) = desktop_tools {
+        eprintln!("ac-gateway: jobs: desktop agents get AC_JOB_DESKTOP_TOOLS");
+        jobs = jobs.with_desktop_tools(tools, images);
     }
     let jobs = Arc::new(jobs);
     jobs.startup();

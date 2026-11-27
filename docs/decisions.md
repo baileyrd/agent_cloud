@@ -1455,10 +1455,11 @@ workspace and lets the agent reach the model API directly.
 the credential itself in argv; the runner exports both variables only then.
 
 ## ADR-029: A job's witness record, from outside the VM
-**Status:** accepted (2026-11-27, Nano). Mill Board card #1065 (LEL D101). Verified on BaileyServ 2026-11-27:
-a job on d1 that called the model and tried example.com gave `egress journal 3` (api.anthropic.com:443 allow 2,
-platform.claude.com:443 allow 1, example.com:443 deny 1), the same rows and counts as the proxy's journal for
-the window, and the SHA-256 recomputed from the record matched.
+**Status:** proposed (2026-11-25). Mill Board card #1065 (LEL D101). Live check on BaileyServ 2026-11-27, as
+reported by the Remote Control session that ran it: job `48c9d5719e92e6e5` on d1 called the model and tried
+example.com. Its record gave `egress journal 3` (`api.anthropic.com:443` allow 2, `platform.claude.com:443` allow 1,
+`example.com:443` deny 1), the same rows and counts as the proxy's journal for the window, and SHA-256
+`ba2449cb757fbf42179df8b9715ff2d32dc722c47de2784a9c7fb3f06b57136f` recomputed from the record. Acceptance awaits Nano.
 **Context:** LEL's BBP claim needs evidence about a job that the agent cannot forge. The gateway already holds
 facts the guest cannot write: the job's registry record (ADR-010), the paths it changed from btrfs snapshots
 (ADR-019), and the egress proxy's decision for every request its agent made (ADR-007, ADR-016). Nothing gathered

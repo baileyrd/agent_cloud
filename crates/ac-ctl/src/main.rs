@@ -9,6 +9,8 @@
 //! `AC_SHM_LIMIT_MIB` apply here too, and so do the per-agent limits `AC_AGENT_CPUS`,
 //! `AC_AGENT_MEMORY_MIB` and `AC_AGENT_DISK_GIB`, ADR-023). `doctor`: 0 all ok, 1 warnings, 4
 //! errors found (2: bad usage, or it could not run). `tune`: 0 shown or applied, 1 refused or failed.
+//! `create` records `--image` as the agent's image (card #1627): every later resume or fork, here
+//! or through the gateway, boots from it whatever `--image` or `AC_IMAGE` says then.
 
 mod args;
 mod backup;
@@ -28,9 +30,10 @@ use ac_ctr::facts::{collect, kata_sandboxes, HostRead, LinuxHost, Paths, Scope};
 use ac_ctr::{CtrConfig, CtrRuntime, Network};
 use ac_domain::tune::edit::stamp;
 use ac_domain::tune::{recommend, HostFacts};
-use ac_domain::AgentLimits;
+use ac_domain::{AgentLimits, ImageRef};
 use ac_fleet::{Fleet, FleetError};
 use ac_ports::PortError;
+use ac_store::images::ImageFile;
 use ac_store::mirror::Mirrored;
 use ac_store::EngineStore;
 use args::{Action, Cli, Command, Doctor, Job, Snap, Tune, USAGE};
@@ -147,9 +150,12 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     if let Err(e) = store.sync() {
         eprintln!("ac-ctl: {e}");
     }
+    let image = ImageRef::parse(&cli.image)?;
+    let images = std::sync::Arc::new(ImageFile::new(ac_store::images::path(&cli.data)));
     let fleet = Fleet::new(CtrRuntime::new(LinuxSpawner, cfg), store)
         .with_admission(Box::new(capacity), margin)
-        .with_snapshots(snapshots, max);
+        .with_snapshots(snapshots, max)
+        .with_images(images);
     let (action, id) = match &cli.job {
         Job::Agent(action, id) => (*action, id),
         Job::Snap(op) => return Ok(snap(&fleet, op)?),
@@ -166,7 +172,7 @@ fn run(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
         }
     };
     let state = match action {
-        Action::Create => fleet.create(id)?,
+        Action::Create => fleet.create_attached(id, None, Some(&image))?,
         Action::Pause => fleet.pause(id)?,
         Action::Resume => fleet.resume(id)?,
         Action::Destroy { purge } => fleet.destroy(id, purge)?,

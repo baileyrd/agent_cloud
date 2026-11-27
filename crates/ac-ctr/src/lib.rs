@@ -111,7 +111,7 @@ pub struct CtrConfig {
     pub ctr_bin: String,
     /// containerd namespace holding agent containers.
     pub namespace: String,
-    /// Image every agent boots from.
+    /// Image an agent boots from when its [`Boot`] names none (no recorded image).
     pub image: String,
     /// Parent directory of per-agent workspace volumes. On btrfs each new one is a subvolume
     /// (ADR-018).
@@ -898,7 +898,8 @@ impl<S: Spawner> CtrRuntime<S> {
         if let Some(file) = &env_file {
             args.extend(["--env-file".to_owned(), file.0.display().to_string()]);
         }
-        args.extend([self.cfg.image.clone(), id.to_string()]);
+        let image = boot.image().map_or(self.cfg.image.as_str(), |i| i.as_str());
+        args.extend([image.to_owned(), id.to_string()]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         // `env_file` is removed when this returns, whatever `ctr` did.
         self.ctr(op, &os(&args))
@@ -1673,8 +1674,28 @@ mod tests {
         );
         let run = &argv(&log)[8];
         assert_eq!(run[2..4], ["run", "-d"]);
+        assert_eq!(
+            run[run.len() - 2..],
+            ["agent:latest", "a1"],
+            "no image named: the default"
+        );
         let src = format!("src={}", root.join("a1").display());
         assert!(run.iter().any(|a| a.contains(&src)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_boot_naming_an_image_runs_it_instead_of_the_default() {
+        let (rt, log, root) = rt_net(ExitStatus::Code(0), ExitStatus::Code(0));
+        let _ = std::fs::create_dir_all(root.join("a1"));
+        let desktop =
+            ac_domain::ImageRef::parse("agent-desktop:latest").unwrap_or_else(|e| panic!("{e}"));
+        assert!(rt
+            .resume(&id(), &Boot::default().with_image(Some(desktop)))
+            .is_ok());
+        let run = &argv(&log)[8];
+        assert_eq!(run[run.len() - 2..], ["agent-desktop:latest", "a1"]);
+        assert!(!run.iter().any(|a| a == "agent:latest"), "{run:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -42,7 +42,7 @@ impl<S: SessionStore> Mirrored<S> {
     }
 }
 
-fn make_private_dir(dir: &Path) -> Result<(), PortError> {
+pub(crate) fn make_private_dir(dir: &Path) -> Result<(), PortError> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new()
         .recursive(true)

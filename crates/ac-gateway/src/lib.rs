@@ -25,6 +25,10 @@
 //! next request). A create may carry `{"egress_profiles":[...]}`, which needs `egress:write` too.
 //! The API attaches only profiles that exist; it never defines hosts.
 //!
+//! Images (card #1627): a create may carry `{"image":"<name>"}`, a name from the operator's
+//! allowlist ([`Api::with_images`], `AC_IMAGES`); without one the agent boots on `AC_IMAGE`. The
+//! agent's image is recorded, so every resume and fork boots from it. An unknown name is 400.
+//!
 //! MCP (ADR-017): `POST /api/v1/mcp` serves these routes, and the job and history ones, as tools
 //! ([`mcp`]).
 //!
@@ -50,10 +54,10 @@ pub mod viewer;
 pub mod watchdog;
 pub mod web;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use ac_domain::{AgentId, CheckpointId, Label, ProfileName, Shortfall, State};
+use ac_domain::{AgentId, CheckpointId, ImageRef, Label, ProfileName, Shortfall, State};
 use ac_fleet::{Fleet, FleetError, Reserved};
 use ac_ports::{PortError, Runtime, SessionStore};
 use egress::Profiles;
@@ -191,6 +195,7 @@ pub struct Api<R, S> {
     jobs: Arc<dyn Busy>,
     egress: Option<Arc<dyn Profiles>>,
     booting: Booting,
+    images: BTreeMap<String, ImageRef>,
 }
 
 impl<R: Runtime, S: SessionStore> Api<R, S> {
@@ -202,7 +207,15 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
             jobs: Arc::new(NoJobs),
             egress: None,
             booting: Booting::default(),
+            images: BTreeMap::new(),
         }
+    }
+
+    /// Let a create name one of `images` (name to image); the fleet records it. Empty: a create
+    /// naming any image is refused.
+    pub fn with_images(mut self, images: BTreeMap<String, ImageRef>) -> Self {
+        self.images = images;
+        self
     }
 
     /// Serve the egress routes from `profiles` (the fleet issues the credentials).
@@ -445,7 +458,8 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         body: &[u8],
         may_attach: bool,
     ) -> Result<Creation<R>, Reply> {
-        let profiles = profiles_in(body, "egress_profiles")?;
+        let Create { profiles, image } = Create::parse(body)?;
+        let image = image.map(|name| self.allowed_image(&name)).transpose()?;
         if let Some(p) = &profiles {
             if !p.is_empty() && !may_attach {
                 return Err(error(
@@ -462,12 +476,28 @@ impl<R: Runtime, S: SessionStore> Api<R, S> {
         self.jobs.settle(id);
         let reserved = self
             .fleet
-            .reserve(id, profiles.as_deref())
+            .reserve(id, profiles.as_deref(), image)
             .map_err(|e| map_error(&e))?;
         set.insert(id.clone());
         Ok(Creation {
             reserved,
             booting: Arc::clone(&self.booting),
+        })
+    }
+
+    /// The image allowlisted as `name`; 400 naming the allowed ones otherwise.
+    fn allowed_image(&self, name: &str) -> Result<&ImageRef, Reply> {
+        self.images.get(name).ok_or_else(|| {
+            let names: Vec<&str> = self.images.keys().map(String::as_str).collect();
+            let allowed = match names.is_empty() {
+                true => "none (AC_IMAGES is empty)".to_owned(),
+                false => names.join(", "),
+            };
+            let name: String = name.chars().take(40).collect();
+            error(
+                400,
+                &format!("image {name:?} is not allowed; allowed: {allowed}"),
+            )
         })
     }
 
@@ -797,6 +827,28 @@ fn no_egress() -> Reply {
     error(404, "egress profiles are off (AC_NETWORK is not 1)")
 }
 
+/// A create's body: `{"egress_profiles"?,"image"?}`; empty is fine.
+#[derive(Debug)]
+pub struct Create {
+    /// Profiles to attach before boot.
+    pub profiles: Option<Vec<ProfileName>>,
+    /// The allowlisted image name to boot from; `None`: the default image.
+    pub image: Option<String>,
+}
+
+impl Create {
+    /// Parse a create's body; the image name is checked against the allowlist later.
+    pub fn parse(body: &[u8]) -> Result<Self, Reply> {
+        let value = members(body, &["egress_profiles", "image"])?;
+        let profiles = match &value {
+            Some(v) => profile_list(v, "egress_profiles")?,
+            None => None,
+        };
+        let image = text(value.as_ref(), "image")?.map(str::to_owned);
+        Ok(Self { profiles, image })
+    }
+}
+
 /// A fork's body: `{"id","checkpoint"?,"egress_profiles"?}`.
 #[derive(Debug)]
 pub struct Fork {
@@ -953,6 +1005,7 @@ impl<R, S> Api<R, S> {
 fn map_error(e: &FleetError) -> Reply {
     let status = match e {
         FleetError::NotFound(_) | FleetError::NoCheckpoint(..) | FleetError::SnapshotsOff => 404,
+        FleetError::ImagesOff => 400,
         FleetError::AlreadyExists(_) | FleetError::Illegal(_) | FleetError::Refused(_) => 409,
         FleetError::NoCapacity(s) => return no_capacity(s),
         FleetError::Port(_) => 500,
@@ -1374,6 +1427,53 @@ mod tests {
             assert!(reply.contains(want), "{body:?}: {reply}");
         }
         assert!(e.of("a1").is_empty());
+    }
+
+    #[test]
+    fn a_desktop_agent_created_over_the_api_resumes_on_its_desktop_image() {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ac-gw-images-{}-{n}", std::process::id()));
+        let file = Arc::new(ac_store::images::ImageFile::new(ac_store::images::path(
+            &dir,
+        )));
+        let desktop = ImageRef::parse("agent-desktop:latest").unwrap_or_else(|e| panic!("{e}"));
+        let allow = BTreeMap::from([("desktop".to_owned(), desktop.clone())]);
+        let a = Api::new(Fleet::new(Rt { fail: false }, Store::default()).with_images(file))
+            .with_images(allow);
+        let (status, reply) = send(&a, "POST", "/api/v1/agents/d0", r#"{"image":"gpu"}"#, false);
+        assert_eq!(status, 400, "{reply}");
+        assert!(reply.contains("allowed: desktop"), "{reply}");
+        assert_eq!(
+            call(&a, "GET", "/api/v1/agents/d0").0,
+            404,
+            "nothing created"
+        );
+        let body = r#"{"image":"desktop"}"#;
+        assert_eq!(send(&a, "POST", "/api/v1/agents/d1", body, false).0, 201);
+        assert_eq!(call(&a, "POST", "/api/v1/agents/d1/pause").0, 200);
+        assert_eq!(call(&a, "POST", "/api/v1/agents/d1/resume").0, 200);
+        let image = |id: &str| {
+            a.fleet
+                .image(&AgentId::parse(id).unwrap_or_else(|e| panic!("{e}")))
+        };
+        assert_eq!(image("d1").ok().flatten(), Some(desktop));
+        assert_eq!(call(&a, "POST", "/api/v1/agents/a1").0, 201);
+        assert_eq!(image("a1").ok().flatten(), None, "no image named: AC_IMAGE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn naming_an_image_without_an_allowlist_is_refused() {
+        let (status, reply) = send(
+            &api(false),
+            "POST",
+            "/api/v1/agents/d1",
+            r#"{"image":"desktop"}"#,
+            false,
+        );
+        assert_eq!(status, 400, "{reply}");
+        assert!(reply.contains("AC_IMAGES is empty"), "{reply}");
     }
 
     #[test]

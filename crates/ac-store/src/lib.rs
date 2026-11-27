@@ -11,6 +11,7 @@
 //!
 //! Holds only bounded registry data; unbounded history belongs in `ac-history`.
 
+pub mod images;
 mod jobs;
 pub mod mirror;
 

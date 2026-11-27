@@ -1,6 +1,7 @@
 //! Control-plane state backups (ADR-021 addendum) as pure rules. Next to the workspaces, a
 //! backup keeps what a lost host needs to come back with the same agents and tokens: the agent
-//! list with each agent's state, the token digests file and the egress agents file. A state
+//! list with each agent's state, the token digests file, the egress agents file and each agent's
+//! recorded image. A state
 //! backup is a directory `<dest>/_state/<id>/` holding those files (the ones the host has) and a
 //! `MANIFEST` with each file's size and SHA-256. These rules name the files and read and write the
 //! agent list and the manifest; hashing and file I/O are the caller's.
@@ -18,10 +19,13 @@ pub const AGENTS: &str = "agents";
 pub const TOKENS: &str = "tokens";
 /// The egress agents file (ADR-016).
 pub const EGRESS: &str = "egress-agents";
+/// Each agent's recorded image (card #1627). Older backups lack it; their agents boot on the
+/// host's default image.
+pub const IMAGES: &str = "images";
 /// The manifest.
 pub const MANIFEST: &str = "MANIFEST";
 /// Every file a state backup may hold besides the manifest.
-pub const FILES: [&str; 3] = [AGENTS, TOKENS, EGRESS];
+pub const FILES: [&str; 4] = [AGENTS, TOKENS, EGRESS, IMAGES];
 
 /// Why a state backup could not be read or restored.
 #[derive(Debug, Clone, PartialEq, Eq)]

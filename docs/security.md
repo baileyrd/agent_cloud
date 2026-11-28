@@ -221,7 +221,8 @@ holds no long-lived secret:
 - *Redacted* in the guest before `claude`'s log is stored in the workspace or shown in the window, and again
   by the gateway in the collected result, stream log and live stream. Every job's `claude` runs with
   `--no-session-persistence`, so Claude Code keeps no session transcript (tool results included) in
-  `/workspace/.claude/projects` (#1637). Limits: an agent can still leak it
+  `/workspace/.claude/projects` (#1637). This only prevents new transcripts: ones written by jobs before
+  the fix stay in that directory and in checkpoints and backups taken since, until removed by hand. Limits: an agent can still leak it
   encoded or split, or a tool's truncation can show part of it. Treat the credential as readable by the job, which is the point: mint it
   short-lived and scoped to the one task.
 - *Model access* (ADR-028 addendum): with `AC_JOB_MODEL_URL` set, a job with a credential runs `claude` with

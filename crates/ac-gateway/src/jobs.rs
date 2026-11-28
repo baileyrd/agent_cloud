@@ -169,6 +169,10 @@ tmux new-window -d -t main: -n "job-$id" -c /workspace bash -c "$run" ac-job "$i
 /// reaches the workspace's `stream.jsonl` or `result.txt`. The job's credential file goes as
 /// soon as `claude` exits, before the job reports that it ended (and on any exit of the window). `exit_code` is written last, then
 /// the marker `.job-<id>.done` in the workspace root, which the gateway sees without an exec.
+/// `claude` runs with `--no-session-persistence`: with `CLAUDE_CONFIG_DIR=/workspace/.claude` it
+/// would otherwise keep the whole session, tool results and so a credential it read included, in
+/// `.claude/projects` in the workspace, and so in checkpoints and backups (#1637). No job resumes
+/// a session, so nothing is lost.
 ///
 /// `filter`, the log's filter (Python, run with `-I`, so nothing from the agent's environment or home
 /// is imported). argv: the byte cap, the credential file (empty for none), the marker to create
@@ -233,7 +237,7 @@ stop_after_result() {
 printf 'job %s started %s\n' "$id" "$(date -u +%FT%TZ)"
 stop_after_result &
 stopper=$!
-{ timeout -k 10 "$secs" claude -p --output-format stream-json --verbose "$@" < "$d/prompt.txt" &
+{ timeout -k 10 "$secs" claude -p --no-session-persistence --output-format stream-json --verbose "$@" < "$d/prompt.txt" &
   echo $! > "$d/claude.pid"; wait $!; } \
     | { python3 -I -c "$filter" 16777216 "$credfile" "$d/capped"; r=$?
         [ "$r" = 0 ] || printf '%s\n' "$r" > "$d/logfailed"; } | tee "$d/stream.jsonl" | jq -Rrj --unbuffered "$show"
@@ -2555,6 +2559,45 @@ mod tests {
             ran.stream
         );
         assert_eq!(ran.code, "0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file under `dir`, recursively.
+    fn files(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .flat_map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => files(&e.path()),
+                _ => vec![e.path()],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claude_keeps_no_session_transcript_in_the_workspace() {
+        let root = scratch("nosession");
+        let secret = "sk-test.1637";
+        // Like Claude Code with CLAUDE_CONFIG_DIR=/workspace/.claude: unless told not to, it keeps
+        // the session, tool results (here, the credential it read) included, in .claude/projects.
+        let transcript = root.join("ws/.claude/projects/-workspace");
+        let claude = format!(
+            "#!/bin/bash\ncat >/dev/null\n\
+             case \" $* \" in *' --no-session-persistence '*) ;; \
+             *) mkdir -p {t} && cat \"$AC_JOB_CREDENTIAL_FILE\" > {t}/s.jsonl ;; esac\n\
+             echo '{RESULT}'\n",
+            t = transcript.display()
+        );
+        let ran = run(&root, &claude, ROOMY, Some(secret));
+        assert_eq!(ran.code, "0");
+        assert!(!transcript.exists(), "a session transcript was kept");
+        let leaked: Vec<PathBuf> = files(&root.join("ws"))
+            .into_iter()
+            .filter(|f| std::fs::read_to_string(f).is_ok_and(|text| text.contains(secret)))
+            .collect();
+        assert!(leaked.is_empty(), "the credential is in {leaked:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
